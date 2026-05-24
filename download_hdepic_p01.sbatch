@@ -4,7 +4,7 @@
 #SBATCH -t 06:00:00
 #SBATCH --mem=16G
 #SBATCH --partition=cs
-#SBATCH --account=torch_pr_111_general
+#SBATCH --account=YOUR_SLURM_ACCOUNT
 #SBATCH -o /scratch/ll5914/logs/hdepic_p01_download_%j.out
 #SBATCH -e /scratch/ll5914/logs/hdepic_p01_download_%j.err
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=vjepa2_hdepic
-#SBATCH --account=torch_pr_674_tandon_advanced
+#SBATCH --account=YOUR_SLURM_ACCOUNT
 #SBATCH --partition=a100_tandon
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
@@ -8,7 +8,7 @@
 #SBATCH --time=00:30:00
 #SBATCH --output=/scratch/ll5914/logs/vjepa2_hdepic_%j.out
 
-echo "=== V-JEPA 2 HD-EPIC P01 第一个场景 ==="
+echo "=== V-JEPA 2 HD-EPIC P01 第一个场�?==="
 echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $SLURMD_NODENAME"
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader)"

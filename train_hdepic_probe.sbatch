@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=hdepic_train
-#SBATCH --account=torch_pr_674_tandon_advanced
+#SBATCH --account=YOUR_SLURM_ACCOUNT
 #SBATCH --partition=a100_tandon
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8

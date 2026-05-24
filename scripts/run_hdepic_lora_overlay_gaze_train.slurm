@@ -1,0 +1,28 @@
+#!/bin/bash
+#SBATCH --job-name=VJEPA2-EXP__hdepic_lora_ogaze
+#SBATCH --account=YOUR_SLURM_ACCOUNT
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=128GB
+#SBATCH --time=24:00:00
+#SBATCH --output=/scratch/yh6416/VJEPA2-EXP/logs/hdepic_lora_overlay_gaze_%j.out
+#SBATCH --error=/scratch/yh6416/VJEPA2-EXP/logs/hdepic_lora_overlay_gaze_%j.err
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=YOUR_EMAIL@example.com
+
+set -euo pipefail
+
+PROJECT_ROOT="${PROJECT_ROOT:-/scratch/yh6416/VJEPA2-EXP}"
+SIGMA="${SIGMA:-96}"
+
+export PROJECT_ROOT SIGMA
+export GAZE_MODE=overlay_video
+export GAZE_VIDEO_ROOT="${GAZE_VIDEO_ROOT:-${PROJECT_ROOT}/data/hdepic_vjepa_videos_gaze_sigma${SIGMA}}"
+export LORA_TAG="${LORA_TAG:-hdepic-lora-overlay-gaze-sigma${SIGMA}}"
+export CONFIG_PATH="${CONFIG_PATH:-${PROJECT_ROOT}/configs/generated/hdepic_lora_overlay_gaze_sigma${SIGMA}.yaml}"
+export OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs/hdepic_lora_action_anticipation}"
+export RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-0}"
+
+bash "${PROJECT_ROOT}/scripts/run_hdepic_lora_probe.slurm"

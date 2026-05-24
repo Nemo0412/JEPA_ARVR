@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=hdepic_gaze_e
-#SBATCH --account=torch_pr_674_tandon_advanced
+#SBATCH --account=YOUR_SLURM_ACCOUNT
 #SBATCH --partition=a100_tandon
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
@@ -9,7 +9,7 @@
 #SBATCH --output=/scratch/ll5914/logs/hdepic_gaze_infer_%j.out
 
 export PYTHONUNBUFFERED=1
-# 可选：仅 smoke 测试前 N 条
+# 可选：�?smoke 测试�?N �?
 # export HDEPIC_GAZE_EVAL_MAX=32
 # export HDEPIC_GAZE_BATCH=2
 

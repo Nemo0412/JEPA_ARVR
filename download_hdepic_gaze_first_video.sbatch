@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=hdepic_gaze1
-#SBATCH --account=torch_pr_111_general
+#SBATCH --account=YOUR_SLURM_ACCOUNT
 #SBATCH --partition=cs
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
@@ -15,13 +15,13 @@ ROOT="/scratch/ll5914/datasets"
 SCRIPT_DIR="/scratch/ll5914/datasets/HD-EPIC/hd-epic-downloader"
 
 echo "HD-EPIC slam-gaze（单视频 gaze 包）: ${VID}"
-echo "输出根目录: ${ROOT}/HD-EPIC/"
+echo "输出根目�? ${ROOT}/HD-EPIC/"
 echo "Start: $(date)"
 echo ""
 
 cd "${SCRIPT_DIR}"
 
-# 仅 slam-gaze；--video-id 时 manifest 里与该 id 匹配的文件（约 1 个 zip）
+# �?slam-gaze�?-video-id �?manifest 里与�?id 匹配的文件（�?1 �?zip�?
 python3 hd-epic-downloader.py "${ROOT}" --slam-gaze --video-id "${VID}"
 
 echo ""
