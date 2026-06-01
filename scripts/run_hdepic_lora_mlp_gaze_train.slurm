@@ -1,16 +1,16 @@
 #!/bin/bash
 #SBATCH --job-name=VJEPA2-EXP__hdepic_lora_mlp_gaze
-#SBATCH --account=YOUR_SLURM_ACCOUNT
+#SBATCH --account=torch_pr_674_tandon_advanced
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=128GB
 #SBATCH --time=24:00:00
-#SBATCH --output=/scratch/yh6416/VJEPA2-EXP/logs/hdepic_lora_mlp_gaze_%j.out
-#SBATCH --error=/scratch/yh6416/VJEPA2-EXP/logs/hdepic_lora_mlp_gaze_%j.err
+#SBATCH --output=/path/to/VJEPA2-EXP/logs/hdepic_lora_mlp_gaze_%j.out
+#SBATCH --error=/path/to/VJEPA2-EXP/logs/hdepic_lora_mlp_gaze_%j.err
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=YOUR_EMAIL@example.com
+#SBATCH --mail-user=<email>
 
 set -euo pipefail
 
@@ -19,7 +19,7 @@ set -euo pipefail
 # but no temporal modeling -- isolates whether the trajectory encoding (vs.
 # merely having gaze as a separate modality) contributes the gain.
 
-PROJECT_ROOT="${PROJECT_ROOT:-/scratch/yh6416/VJEPA2-EXP}"
+PROJECT_ROOT="${PROJECT_ROOT:-/path/to/VJEPA2-EXP}"
 
 export PROJECT_ROOT
 export GAZE_MODE=mlp_fuse

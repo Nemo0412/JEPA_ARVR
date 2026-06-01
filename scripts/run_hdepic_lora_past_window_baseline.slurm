@@ -1,16 +1,16 @@
 #!/bin/bash
 #SBATCH --job-name=VJEPA2-EXP__hdepic_lora_past_window
-#SBATCH --account=YOUR_SLURM_ACCOUNT
+#SBATCH --account=torch_pr_674_tandon_advanced
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=128GB
 #SBATCH --time=24:00:00
-#SBATCH --output=/scratch/yh6416/VJEPA2-EXP/logs/hdepic_lora_past_window_%j.out
-#SBATCH --error=/scratch/yh6416/VJEPA2-EXP/logs/hdepic_lora_past_window_%j.err
+#SBATCH --output=/path/to/VJEPA2-EXP/logs/hdepic_lora_past_window_%j.out
+#SBATCH --error=/path/to/VJEPA2-EXP/logs/hdepic_lora_past_window_%j.err
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=YOUR_EMAIL@example.com
+#SBATCH --mail-user=<email>
 
 set -euo pipefail
 
@@ -20,7 +20,7 @@ set -euo pipefail
 # horizon. Binary-map overlay is intentionally excluded because that branch is
 # an early/mostly-original-video preprocessing baseline.
 
-PROJECT_ROOT="${PROJECT_ROOT:-/scratch/yh6416/VJEPA2-EXP}"
+PROJECT_ROOT="${PROJECT_ROOT:-/path/to/VJEPA2-EXP}"
 VJEPA_ROOT="${VJEPA_ROOT:-${PROJECT_ROOT}/vjepa2}"
 SIF="${SIF:-/share/apps/images/cuda12.1.1-cudnn8.9.0-devel-ubuntu22.04.2.sif}"
 OVERLAY="${OVERLAY:-${PROJECT_ROOT}/overlay-15GB-500K.ext3}"
@@ -33,6 +33,7 @@ CONFIG_DIR="${CONFIG_DIR:-${PROJECT_ROOT}/configs/generated/past_window_baseline
 CHECKPOINT="${CHECKPOINT:-${PROJECT_ROOT}/checkpoints/vitg-384.pt}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs/hdepic_lora_action_anticipation}"
 LORA_PRETRAINED_PROBE="${LORA_PRETRAINED_PROBE:-${PROJECT_ROOT}/outputs/ek100_vitg384_probe/action_anticipation_frozen/ek100-vitg16-384/latest.pt}"
+TOKEN_SOURCE_TAG="${TOKEN_SOURCE_TAG:-hdepic-lora-token-gaze-clipbal-h100-bs2-w12-m640}"
 
 METHODS="${METHODS:-clean overlay token rnn mlp}"
 PREDICTION_HORIZONS="${PREDICTION_HORIZONS:-1 3.5}"
@@ -43,12 +44,14 @@ LORA_RANK="${LORA_RANK:-8}"
 LORA_ALPHA="${LORA_ALPHA:-16}"
 LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
 PREDICTION_DUMP="${PREDICTION_DUMP:-0}"
+LORA_VAL_METRIC_SCOPE="${LORA_VAL_METRIC_SCOPE:-native}"
 
 GAZE_ROOT="${GAZE_ROOT:-${PROJECT_ROOT}/data/raw/HD-EPIC/SLAM-and-Gaze}"
 GAZE_EXTRACT_ROOT="${GAZE_EXTRACT_ROOT:-${PROJECT_ROOT}/outputs/hdepic_gaze_token_gate/extracted}"
 GAZE_SYNC_ROOT="${GAZE_SYNC_ROOT:-${PROJECT_ROOT}/data/raw/HD-EPIC/HD-EPIC/Videos}"
 GAZE_GATE_GAMMA="${GAZE_GATE_GAMMA:-0.7}"
 GAZE_GATE_SIGMA_PX="${GAZE_GATE_SIGMA_PX:-40}"
+GAZE_LEARNABLE_GATE="${GAZE_LEARNABLE_GATE:-1}"
 GAZE_RNN_HIDDEN_DIM="${GAZE_RNN_HIDDEN_DIM:-256}"
 GAZE_RNN_NUM_LAYERS="${GAZE_RNN_NUM_LAYERS:-2}"
 GAZE_RNN_NUM_TOKENS="${GAZE_RNN_NUM_TOKENS:-64}"
@@ -61,9 +64,9 @@ GAZE_HIDDEN_DUMP="${GAZE_HIDDEN_DUMP:-0}"
 mkdir -p "${PROJECT_ROOT}/logs" "${CONFIG_DIR}"
 
 export PROJECT_ROOT VJEPA_ROOT SIF OVERLAY ENV_NAME
-export ADAPTED_ANNOTATIONS_DIR ADAPTED_VIDEO_ROOT GAZE_OVERLAY_VIDEO_ROOT CONFIG_DIR CHECKPOINT OUTPUT_DIR LORA_PRETRAINED_PROBE
-export METHODS PREDICTION_HORIZONS LABEL_HORIZONS EVAL_BATCH_SIZE EVAL_NUM_WORKERS LORA_RANK LORA_ALPHA LORA_DROPOUT PREDICTION_DUMP
-export GAZE_ROOT GAZE_EXTRACT_ROOT GAZE_SYNC_ROOT GAZE_GATE_GAMMA GAZE_GATE_SIGMA_PX
+export ADAPTED_ANNOTATIONS_DIR ADAPTED_VIDEO_ROOT GAZE_OVERLAY_VIDEO_ROOT CONFIG_DIR CHECKPOINT OUTPUT_DIR LORA_PRETRAINED_PROBE TOKEN_SOURCE_TAG
+export METHODS PREDICTION_HORIZONS LABEL_HORIZONS EVAL_BATCH_SIZE EVAL_NUM_WORKERS LORA_RANK LORA_ALPHA LORA_DROPOUT PREDICTION_DUMP LORA_VAL_METRIC_SCOPE
+export GAZE_ROOT GAZE_EXTRACT_ROOT GAZE_SYNC_ROOT GAZE_GATE_GAMMA GAZE_GATE_SIGMA_PX GAZE_LEARNABLE_GATE
 export GAZE_RNN_HIDDEN_DIM GAZE_RNN_NUM_LAYERS GAZE_RNN_NUM_TOKENS GAZE_RNN_DROPOUT GAZE_RNN_BIDIR GAZE_RNN_TRAJ_LEN GAZE_LR_MULT GAZE_HIDDEN_DUMP
 
 payload=$(cat <<'BASH'
@@ -100,7 +103,7 @@ method_cfg = {
         "video_root": os.environ["GAZE_OVERLAY_VIDEO_ROOT"],
     },
     "token": {
-        "source_tag": "hdepic-lora-token-gaze-clipbal-h100-bs2-w12-m640",
+        "source_tag": os.environ["TOKEN_SOURCE_TAG"],
         "gaze_mode": "token_gate",
         "video_root": os.environ["ADAPTED_VIDEO_ROOT"],
     },
@@ -178,6 +181,7 @@ for method in methods:
                 "train_heads": True,
                 "pretrained_probe": os.environ["LORA_PRETRAINED_PROBE"],
                 "align_reference_metrics": True,
+                "val_metric_scope": os.environ.get("LORA_VAL_METRIC_SCOPE", "native"),
                 "past_window_baseline": {
                     "enabled": True,
                     "prediction_horizon_sec": float(pred_h),
@@ -191,6 +195,7 @@ for method in methods:
                     "sync_root": os.environ["GAZE_SYNC_ROOT"],
                     "gamma": float(os.environ["GAZE_GATE_GAMMA"]),
                     "sigma_px": float(os.environ["GAZE_GATE_SIGMA_PX"]),
+                    "learnable_gate": os.environ.get("GAZE_LEARNABLE_GATE", "1") == "1",
                     "use_motion": m["gaze_mode"] == "token_gate",
                     "traj_len": int(os.environ["GAZE_RNN_TRAJ_LEN"]),
                     "rnn": {

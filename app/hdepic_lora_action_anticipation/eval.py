@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 from pathlib import Path
 
@@ -6,6 +7,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
 
 from evals.action_anticipation_frozen.models import AttentiveClassifier
 from src.utils.checkpoint_loader import robust_checkpoint_loader
@@ -29,13 +31,41 @@ from app.hdepic_lora_action_anticipation.binary_input_adapter import (
 from app.hdepic_lora_action_anticipation.gaze_rnn import (
     GazeFusedAttentiveClassifier,
     GazeHiddenDump,
+    GazeTrajectoryEncoder,
     GazeTrajectoryLoader,
+    PoseTrajectoryLoader,
     attach_gaze_encoder_to_classifier,
+    attach_pose_encoder_to_classifier,
     gaze_encoder_param_names,
+)
+from app.hdepic_lora_action_anticipation.pose_slam import feature_dim_for_set
+from app.hdepic_lora_action_anticipation.encoder_output_gaze_adapter import (
+    EncoderOutputGazeAdapter,
+    EncoderOutputGazeAdaptedModel,
+    train_one_epoch_with_encoder_output_gaze,
+    trainable_encoder_output_gaze_params,
+    validate_with_encoder_output_gaze,
 )
 
 logger = logging.getLogger(__name__)
 logging.raiseExceptions = False
+
+
+def _unwrap_ddp(module: nn.Module) -> nn.Module:
+    return module.module if isinstance(module, DistributedDataParallel) else module
+
+
+def _wrap_trainable_model_for_ddp(model: nn.Module) -> nn.Module:
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        kwargs = {}
+        if torch.cuda.is_available():
+            kwargs = {"device_ids": [torch.cuda.current_device()], "output_device": torch.cuda.current_device()}
+        logger.info("Wrapping trainable LoRA side model with DDP for world_size=%d", dist.get_world_size())
+        wrapped = DistributedDataParallel(model, **kwargs)
+        if hasattr(model, "embed_dim"):
+            wrapped.embed_dim = model.embed_dim
+        return wrapped
+    return model
 
 
 def _parse_past_window_curriculum(past_window_cfg: dict):
@@ -73,6 +103,17 @@ def _parse_past_window_curriculum(past_window_cfg: dict):
     if parsed[-1]["until_epoch"] is not None:
         logger.warning("Last curriculum stage has until_epoch=%s; it will repeat after that epoch", parsed[-1]["until_epoch"])
     return parsed
+
+
+def _as_time_pair(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        if len(value) != 2:
+            raise ValueError(f"Expected a two-value time range, got {value}")
+        return (float(value[0]), float(value[1]))
+    v = float(value)
+    return (v, v)
 
 
 class Top3AccuracyRecallAt5:
@@ -206,9 +247,11 @@ def _freeze_for_lora(classifier: AttentiveClassifier, train_heads: bool):
         for name, param in classifier.named_parameters():
             if name.startswith(("verb_classifier.", "noun_classifier.", "action_classifier.")):
                 param.requires_grad = True
-    if isinstance(classifier, GazeFusedAttentiveClassifier) and classifier.gaze_encoder is not None:
-        for param in classifier.gaze_encoder.parameters():
-            param.requires_grad = True
+    if isinstance(classifier, GazeFusedAttentiveClassifier):
+        for enc in (classifier.gaze_encoder, classifier.pose_encoder):
+            if enc is not None:
+                for param in enc.parameters():
+                    param.requires_grad = True
 
 
 def _log_trainable_params(classifier: nn.Module):
@@ -218,17 +261,28 @@ def _log_trainable_params(classifier: nn.Module):
     logger.info("LoRA classifier trainable params: %d / %d (%.2f%%)", trainable, total, pct)
 
 
-def _make_lora_init_classifier(lora_cfg, traj_mode: str | None = None, rnn_cfg: dict | None = None):
+def _make_lora_init_classifier(
+    lora_cfg,
+    traj_mode: str | None = None,
+    rnn_cfg: dict | None = None,
+    token_gate: GazeTokenGate | None = None,
+):
     rank = int(lora_cfg.get("rank", 8))
     alpha = float(lora_cfg.get("alpha", 16.0))
     dropout = float(lora_cfg.get("dropout", 0.05))
     train_heads = bool(lora_cfg.get("train_heads", True))
     pretrained_probe = lora_cfg.get("pretrained_probe", None)
-    use_gaze_fusion = traj_mode in {"rnn_fuse", "mlp_fuse"}
+    use_gaze_fusion = traj_mode in {"rnn_fuse", "mlp_fuse", "pose_rnn_fuse", "multimodal_rnn_fuse"}
+    use_gaze_branch = traj_mode in {"rnn_fuse", "mlp_fuse", "multimodal_rnn_fuse"}
+    use_pose_branch = traj_mode in {"pose_rnn_fuse", "multimodal_rnn_fuse"}
     rnn_cfg = dict(rnn_cfg or {})
+    pose_cfg = dict(lora_cfg.get("gaze", {}).get("pose", {}))
+    if use_pose_branch:
+        feature_set = str(pose_cfg.get("feature_set", "pose_6d"))
+        rnn_cfg.setdefault("input_dim", feature_dim_for_set(feature_set))
     if traj_mode == "mlp_fuse":
         rnn_cfg["mode_impl"] = "mlp"
-    elif traj_mode == "rnn_fuse":
+    elif traj_mode in {"rnn_fuse", "pose_rnn_fuse", "multimodal_rnn_fuse"}:
         rnn_cfg.setdefault("mode_impl", "rnn")
 
     def init_classifier(
@@ -243,7 +297,7 @@ def _make_lora_init_classifier(lora_cfg, traj_mode: str | None = None, rnn_cfg: 
     ):
         cls = GazeFusedAttentiveClassifier if use_gaze_fusion else AttentiveClassifier
         classifiers = []
-        for _ in range(num_classifiers):
+        for head_idx in range(num_classifiers):
             classifier = cls(
                 verb_classes=verb_classes,
                 noun_classes=noun_classes,
@@ -256,20 +310,46 @@ def _make_lora_init_classifier(lora_cfg, traj_mode: str | None = None, rnn_cfg: 
             _load_pooler_from_probe(classifier, pretrained_probe)
             replaced = _replace_linears_with_lora(classifier.pooler, rank=rank, alpha=alpha, dropout=dropout)
             if use_gaze_fusion:
-                attach_gaze_encoder_to_classifier(classifier, embed_dim=embed_dim, rnn_cfg=rnn_cfg)
+                if use_gaze_branch:
+                    attach_gaze_encoder_to_classifier(classifier, embed_dim=embed_dim, rnn_cfg={**rnn_cfg, "input_dim": 3})
+                if use_pose_branch:
+                    attach_pose_encoder_to_classifier(classifier, embed_dim=embed_dim, rnn_cfg=rnn_cfg)
             _freeze_for_lora(classifier, train_heads=train_heads)
+            if token_gate is not None and head_idx == 0:
+                classifier.gaze_token_gate = token_gate
+                for param in classifier.gaze_token_gate.parameters():
+                    param.requires_grad = bool(getattr(classifier.gaze_token_gate, "learnable_gate", False))
+                logger.info(
+                    "Attached %s GazeTokenGate to classifier head 0: gamma_init=%.4f trainable_params=%d",
+                    "learnable" if getattr(classifier.gaze_token_gate, "learnable_gate", False) else "fixed",
+                    float(classifier.gaze_token_gate.current_gamma().detach().float().cpu()),
+                    sum(p.numel() for p in classifier.gaze_token_gate.parameters() if p.requires_grad),
+                )
             logger.info("Inserted LoRA into %d pooler Linear layers", len(replaced))
             if use_gaze_fusion:
-                enc = classifier.gaze_encoder
-                logger.info(
-                    "Attached Gaze%sEncoder: hidden=%d, layers=%d, bidir=%s, num_tokens=%d",
-                    rnn_cfg.get("mode_impl", "rnn").upper(),
-                    int(rnn_cfg.get("hidden_dim", 256)),
-                    int(rnn_cfg.get("num_layers", 2)),
-                    bool(rnn_cfg.get("bidirectional", True)),
-                    enc.num_tokens,
-                )
-                if bool(rnn_cfg.get("use_video_tokens", False)):
+                if classifier.gaze_encoder is not None:
+                    enc = classifier.gaze_encoder
+                    logger.info(
+                        "Attached Gaze%sEncoder: hidden=%d, layers=%d, bidir=%s, num_tokens=%d, input_dim=%d",
+                        rnn_cfg.get("mode_impl", "rnn").upper(),
+                        int(rnn_cfg.get("hidden_dim", 256)),
+                        int(rnn_cfg.get("num_layers", 2)),
+                        bool(rnn_cfg.get("bidirectional", True)),
+                        enc.num_tokens,
+                        int(enc.gaze_input_dim),
+                    )
+                if classifier.pose_encoder is not None:
+                    enc = classifier.pose_encoder
+                    logger.info(
+                        "Attached Pose%sEncoder: hidden=%d, layers=%d, bidir=%s, num_tokens=%d, input_dim=%d",
+                        rnn_cfg.get("mode_impl", "rnn").upper(),
+                        int(rnn_cfg.get("hidden_dim", 256)),
+                        int(rnn_cfg.get("num_layers", 2)),
+                        bool(rnn_cfg.get("bidirectional", True)),
+                        enc.num_tokens,
+                        int(enc.gaze_input_dim),
+                    )
+                if use_gaze_branch and bool(rnn_cfg.get("use_video_tokens", False)):
                     logger.info(
                         "Gaze encoder video-token conditioning enabled: fusion=%s, video_proj_dim=%d, local_radius=(t=%d,s=%d), residual_alpha_init=%.4f",
                         str(rnn_cfg.get("video_fusion", "nearest_concat")),
@@ -287,6 +367,44 @@ def _make_lora_init_classifier(lora_cfg, traj_mode: str | None = None, rnn_cfg: 
     return init_classifier
 
 
+def _patch_load_checkpoint_for_learnable_token_gate(base_eval):
+    def load_checkpoint(device, r_path, classifiers, opt, scaler, val_only=False):
+        logger.info(f"read-path: {r_path}")
+        checkpoint = robust_checkpoint_loader(r_path, map_location=torch.device("cpu"))
+        messages = []
+        for classifier, state in zip(classifiers, checkpoint["classifiers"]):
+            try:
+                messages.append(classifier.load_state_dict(state))
+            except RuntimeError as exc:
+                msg = classifier.load_state_dict(state, strict=False)
+                logger.warning(
+                    "Loaded classifier checkpoint with strict=False for learnable token gate compatibility: %s; msg=%s",
+                    exc,
+                    msg,
+                )
+                messages.append(msg)
+
+        if val_only:
+            logger.info(f"loaded pretrained classifier from epoch with msg: {messages}")
+            return classifiers, opt, scaler, 0
+
+        epoch = checkpoint["epoch"]
+        logger.info(f"loaded pretrained classifier from epoch {epoch} with msg: {messages}")
+        try:
+            [o.load_state_dict(c) for o, c in zip(opt, checkpoint["opt"])]
+            if scaler is not None:
+                [s.load_state_dict(c) for s, c in zip(scaler, checkpoint["scaler"])]
+            logger.info(f"loaded optimizers from epoch {epoch}")
+        except ValueError as exc:
+            logger.warning(
+                "Skipping optimizer/scaler restore after adding learnable token gate because state shapes changed: %s",
+                exc,
+            )
+        return classifiers, opt, scaler, epoch
+
+    base_eval.load_checkpoint = load_checkpoint
+
+
 def main(args_eval, resume_preempt=False):
     lora_cfg = args_eval.get("experiment", {}).get("lora", {})
     if not lora_cfg.get("enabled", True):
@@ -300,9 +418,52 @@ def main(args_eval, resume_preempt=False):
 
     gaze_cfg = dict(lora_cfg.get("gaze", {}))
     pred_dump_cfg = dict(lora_cfg.get("prediction_dump", {}))
+    data_cfg = args_eval.get("experiment", {}).get("data", {})
+
+    downsample_factor = float(
+        data_cfg.get(
+            "video_downsample_factor",
+            lora_cfg.get("video_downsample_factor", 1.0),
+        )
+        or 1.0
+    )
+    if downsample_factor < 1.0:
+        raise ValueError(f"video_downsample_factor must be >= 1, got {downsample_factor}")
+    if not math.isclose(downsample_factor, 1.0):
+        raw_fps = float(data_cfg.get("frames_per_second"))
+        if raw_fps <= 0:
+            raise ValueError("experiment.data.frames_per_second must be positive when video_downsample_factor is enabled")
+        semantic_fps = raw_fps
+        scaled_fps = raw_fps / downsample_factor
+        data_cfg["video_downsample_factor"] = downsample_factor
+        data_cfg["frames_per_second"] = scaled_fps
+        logger.info(
+            "Applied video downsample factor %.3fx: model fps stays %.3f, dataloader fps becomes %.3f; "
+            "sample horizons stay in real seconds and model mask horizons are divided by the factor",
+            downsample_factor,
+            semantic_fps,
+            scaled_fps,
+        )
+
+        original_init_module = base_eval.init_module
+
+        def init_module_with_video_downsample(*args, **kwargs):
+            kwargs["frames_per_second"] = semantic_fps
+            return original_init_module(*args, **kwargs)
+
+        base_eval.init_module = init_module_with_video_downsample
+
+    val_metric_scope = str(os.environ.get("LORA_VAL_METRIC_SCOPE", lora_cfg.get("val_metric_scope", "native"))).lower()
+    if val_metric_scope not in {"native", "filtered"}:
+        raise ValueError(f"Unsupported lora.val_metric_scope={val_metric_scope!r}; expected native or filtered")
+    logger.info(
+        "Validation metric scope: %s (%s)",
+        val_metric_scope,
+        "upstream V-JEPA2 native/unfiltered" if val_metric_scope == "native" else "filtered to val split valid classes",
+    )
     gaze_mode = str(gaze_cfg.get("mode", "none")).lower()
     binary_input_adapter_enabled = gaze_mode == "binary_input_adapter"
-    data_cfg = args_eval.get("experiment", {}).get("data", {})
+    encoder_output_inject_enabled = gaze_mode == "encoder_output_inject"
     past_window_cfg = dict(lora_cfg.get("past_window_baseline", {}))
     model_anticipation_time_sec = None
     drop_incomplete_history = False
@@ -310,6 +471,8 @@ def main(args_eval, resume_preempt=False):
     if past_window_cfg.get("enabled", False):
         pred_h = float(past_window_cfg["prediction_horizon_sec"])
         label_h = float(past_window_cfg["label_horizon_sec"])
+        if not math.isclose(downsample_factor, 1.0):
+            pred_h = pred_h / downsample_factor
         model_anticipation_time_sec = (pred_h, pred_h)
         drop_incomplete_history = bool(past_window_cfg.get("drop_incomplete_history", True))
         past_window_apply_to_train = bool(past_window_cfg.get("apply_to_train", False))
@@ -325,8 +488,19 @@ def main(args_eval, resume_preempt=False):
     else:
         past_window_apply_to_train = False
 
+    if model_anticipation_time_sec is None and not math.isclose(downsample_factor, 1.0):
+        val_h = _as_time_pair(data_cfg.get("anticipation_time_sec"))
+        if val_h is None:
+            raise ValueError("video_downsample_factor requires experiment.data.anticipation_time_sec for validation")
+        model_anticipation_time_sec = tuple(x / downsample_factor for x in val_h)
+        logger.info(
+            "Video-downsample validation: real sample horizon=%s sec, model mask horizon=%s sec",
+            val_h,
+            model_anticipation_time_sec,
+        )
+
     clip_balanced = bool(data_cfg.get("clip_balanced", True))
-    if gaze_mode in {"rnn_fuse", "mlp_fuse", "binary_input_adapter"} and bool(gaze_cfg.get("use_motion", False)):
+    if gaze_mode in {"rnn_fuse", "mlp_fuse", "binary_input_adapter", "encoder_output_inject"} and bool(gaze_cfg.get("use_motion", False)):
         # The token_gate motion path is unused when mode != token_gate, but warn so the
         # ablation matrix stays interpretable.
         logger.warning("gaze.use_motion=true is ignored when mode=%s (token_gate path is disabled)", gaze_mode)
@@ -335,17 +509,56 @@ def main(args_eval, resume_preempt=False):
     gaze_cfg.setdefault("patch_size", args_eval.get("model_kwargs", {}).get("pretrain_kwargs", {}).get("encoder", {}).get("patch_size", 16))
     gaze_cfg.setdefault("tubelet_size", args_eval.get("model_kwargs", {}).get("pretrain_kwargs", {}).get("encoder", {}).get("tubelet_size", 2))
     if binary_input_adapter_enabled:
-        disable_train_aug_env = os.environ.get("BINARY_INPUT_ADAPTER_DISABLE_TRAIN_AUG")
-        gaze_cfg["disable_train_aug"] = (
-            disable_train_aug_env.lower() in {"1", "true", "yes", "on"}
-            if disable_train_aug_env is not None
-            else True
+        aug_aware_env = os.environ.get("BINARY_INPUT_ADAPTER_AUG_AWARE")
+        aug_aware = (
+            aug_aware_env.lower() in {"1", "true", "yes", "on"}
+            if aug_aware_env is not None
+            else bool(gaze_cfg.get("aug_aware", False))
         )
-    traj_mode = gaze_mode if gaze_mode in {"rnn_fuse", "mlp_fuse"} else None
+        gaze_cfg["aug_aware"] = aug_aware
+        if aug_aware:
+            # Aug-aware joint transform replays V-JEPA2 training aug on RGB while
+            # synchronizing the geometric ops (RRC + flip + center-crop) onto the
+            # binary gaze map. The legacy disable_train_aug switch is bypassed in
+            # this path because aug is handled inside the joint transform.
+            gaze_cfg["disable_train_aug"] = False
+            gaze_cfg.setdefault("random_resize_scale", list(data_cfg.get("random_resize_scale", [0.08, 1.0])))
+            gaze_cfg.setdefault("auto_augment", bool(data_cfg.get("auto_augment", True)))
+            gaze_cfg.setdefault("reprob", float(data_cfg.get("reprob", 0.25)))
+        else:
+            disable_train_aug_env = os.environ.get("BINARY_INPUT_ADAPTER_DISABLE_TRAIN_AUG")
+            gaze_cfg["disable_train_aug"] = (
+                disable_train_aug_env.lower() in {"1", "true", "yes", "on"}
+                if disable_train_aug_env is not None
+                else True
+            )
+    traj_mode = gaze_mode if gaze_mode in {"rnn_fuse", "mlp_fuse", "pose_rnn_fuse", "multimodal_rnn_fuse"} else None
     rnn_cfg = dict(gaze_cfg.get("rnn", {}))
-    needs_metadata = gaze_mode in {"token_gate", "rnn_fuse", "mlp_fuse", "binary_input_adapter"} or bool(pred_dump_cfg.get("enabled", False))
+    pose_cfg = dict(gaze_cfg.get("pose", {}))
+    if traj_mode == "pose_rnn_fuse":
+        rnn_cfg["use_video_tokens"] = False
+    if traj_mode == "multimodal_rnn_fuse":
+        rnn_cfg["use_video_tokens"] = False
+    needs_metadata = gaze_mode in {
+        "token_gate",
+        "rnn_fuse",
+        "mlp_fuse",
+        "pose_rnn_fuse",
+        "multimodal_rnn_fuse",
+        "binary_input_adapter",
+        "encoder_output_inject",
+    } or bool(pred_dump_cfg.get("enabled", False))
+    debug_subset_path = os.environ.get("DEBUG_SUBSET_PATH", "").strip() or None
+    if debug_subset_path:
+        logger.warning(
+            "DEBUG_SUBSET_PATH=%s — this is a debug-only run; DO NOT report these metrics as final results.",
+            debug_subset_path,
+        )
     traj_loader = None
+    pose_loader = None
     hidden_dump = None
+    local_validate_patched = False
+    token_gate_module = None
     if needs_metadata:
         logger.info("Using clip-balanced metadata-aware HD-EPIC dataloader for gaze/prediction dump hooks")
         patch_metadata_dataloader(
@@ -355,11 +568,14 @@ def main(args_eval, resume_preempt=False):
             train_label_horizon_schedule=train_label_horizon_schedule,
             emit_binary_map=binary_input_adapter_enabled,
             binary_map_cfg=gaze_cfg if binary_input_adapter_enabled else None,
+            debug_subset_path=debug_subset_path,
         )
 
         rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", 0)))
 
         gate = GazeTokenGate(gaze_cfg)
+        if gaze_mode == "token_gate":
+            token_gate_module = gate
         folder = Path(args_eval.get("folder", "."))
         tag = args_eval.get("tag")
         run_dir = folder / "action_anticipation_frozen" / tag if tag else folder / "action_anticipation_frozen"
@@ -378,8 +594,9 @@ def main(args_eval, resume_preempt=False):
                 base_eval, map_builder, **kwargs
             )
             base_eval.validate = lambda **kwargs: validate_with_binary_input_adapter(
-                base_eval, map_builder, dumper, **kwargs
+                base_eval, map_builder, dumper, val_metric_scope=val_metric_scope, **kwargs
             )
+            local_validate_patched = True
             if args_eval.get("resume_checkpoint", False) and not bool(args_eval.get("val_only", False)):
                 logger.warning(
                     "binary_input_adapter disables training resume_checkpoint to avoid classifier-only adapter mismatch; "
@@ -387,23 +604,54 @@ def main(args_eval, resume_preempt=False):
                 )
                 args_eval["resume_checkpoint"] = False
 
-        elif traj_mode is not None:
+        elif encoder_output_inject_enabled:
+            logger.info(
+                "Enabling encoder_output_inject: zero-init cross-attn adapter between encoder output and predictor input"
+            )
+            # Force gaze-only branch (no video-token conditioning); B8 keeps the
+            # architectural axis isolated from B2's video-conditioned RNN gaze.
+            rnn_cfg["use_video_tokens"] = False
             traj_loader = GazeTrajectoryLoader(gaze_cfg, gate=gate)
+            _patch_init_module_for_encoder_output_gaze(base_eval, gaze_cfg, rnn_cfg)
+            _patch_opt_for_encoder_output_gaze(base_eval, gaze_cfg, rnn_cfg)
+            base_eval.train_one_epoch = lambda **kwargs: train_one_epoch_with_encoder_output_gaze(
+                base_eval, traj_loader, **kwargs
+            )
+            base_eval.validate = lambda **kwargs: validate_with_encoder_output_gaze(
+                base_eval, dumper, traj_loader, val_metric_scope=val_metric_scope, **kwargs
+            )
+            local_validate_patched = True
+
+        elif traj_mode is not None:
+            gate_for_pose = gate
+            if traj_mode in {"pose_rnn_fuse", "multimodal_rnn_fuse"}:
+                pose_loader = PoseTrajectoryLoader(gaze_cfg, gate=gate_for_pose)
+            if traj_mode in {"rnn_fuse", "mlp_fuse", "multimodal_rnn_fuse"}:
+                traj_loader = GazeTrajectoryLoader(gaze_cfg, gate=gate)
             hidden_dump = GazeHiddenDump(dict(gaze_cfg.get("hidden_dump", {})), run_dir, rank)
 
             base_eval.train_one_epoch = lambda **kwargs: train_one_epoch_with_gaze(
-                base_eval, gate, traj_loader=traj_loader, **kwargs
+                base_eval, gate, traj_loader=traj_loader, pose_loader=pose_loader, **kwargs
             )
             base_eval.validate = lambda **kwargs: validate_with_gaze(
-                base_eval, gate, dumper, traj_loader=traj_loader, hidden_dump=hidden_dump, **kwargs
+                base_eval,
+                gate,
+                dumper,
+                traj_loader=traj_loader,
+                pose_loader=pose_loader,
+                hidden_dump=hidden_dump,
+                val_metric_scope=val_metric_scope,
+                **kwargs,
             )
+            local_validate_patched = True
         elif gaze_mode == "token_gate" or bool(pred_dump_cfg.get("enabled", False)):
             base_eval.train_one_epoch = lambda **kwargs: train_one_epoch_with_gaze(
                 base_eval, gate, traj_loader=traj_loader, **kwargs
             )
             base_eval.validate = lambda **kwargs: validate_with_gaze(
-                base_eval, gate, dumper, traj_loader=traj_loader, hidden_dump=hidden_dump, **kwargs
+                base_eval, gate, dumper, traj_loader=traj_loader, hidden_dump=hidden_dump, val_metric_scope=val_metric_scope, **kwargs
             )
+            local_validate_patched = True
     elif clip_balanced:
         logger.info("Using clip-balanced HD-EPIC dataloader")
         patch_clip_balanced_dataloader(
@@ -411,9 +659,23 @@ def main(args_eval, resume_preempt=False):
             drop_incomplete_history=drop_incomplete_history,
             apply_to_train=past_window_apply_to_train,
             train_label_horizon_schedule=train_label_horizon_schedule,
+            debug_subset_path=debug_subset_path,
+        )
+    if val_metric_scope == "filtered" and not local_validate_patched:
+        raise ValueError(
+            "LORA_VAL_METRIC_SCOPE=filtered requires a project-local validate wrapper "
+            "(gaze/prediction_dump/binary_input_adapter/encoder_output_inject). "
+            "The upstream V-JEPA2 validate path is native/unfiltered and does not pass valid_classes."
         )
 
-    base_eval.init_classifier = _make_lora_init_classifier(lora_cfg, traj_mode=traj_mode, rnn_cfg=rnn_cfg)
+    base_eval.init_classifier = _make_lora_init_classifier(
+        lora_cfg,
+        traj_mode=traj_mode,
+        rnn_cfg=rnn_cfg,
+        token_gate=token_gate_module if getattr(token_gate_module, "learnable_gate", False) else None,
+    )
+    if getattr(token_gate_module, "learnable_gate", False):
+        _patch_load_checkpoint_for_learnable_token_gate(base_eval)
     if traj_mode is not None:
         _patch_opt_for_gaze_encoder(base_eval, gaze_lr_mult=float(rnn_cfg.get("gaze_lr_mult", 5.0)))
     return base_eval.main(args_eval=args_eval, resume_preempt=resume_preempt)
@@ -430,6 +692,7 @@ def _patch_init_module_for_binary_input_adapter(base_eval, gaze_cfg: dict):
             scale=float(cfg.get("scale", 1.0)),
             temporal_kernel=int(cfg.get("temporal_kernel", 1)),
             binary_center=float(cfg.get("binary_center", 0.0)),
+            residual_clamp=float(cfg.get("residual_clamp", 1.0)),
         ).to(next(model.parameters()).device)
         adapter_ckpt = cfg.get("load_checkpoint_path")
         if adapter_ckpt:
@@ -449,6 +712,7 @@ def _patch_init_module_for_binary_input_adapter(base_eval, gaze_cfg: dict):
                 logger.info("Enabled predictor activation checkpointing for binary_input_adapter")
         trainable = sum(p.numel() for p in wrapped.input_adapter.parameters() if p.requires_grad)
         logger.info("Attached BinaryMapInputAdapter: trainable_params=%d cfg=%s", trainable, cfg)
+        wrapped = _wrap_trainable_model_for_ddp(wrapped)
         base_eval._binary_input_adapter_model = wrapped
         return wrapped
 
@@ -590,5 +854,121 @@ def _patch_opt_for_gaze_encoder(base_eval, gaze_lr_mult: float):
             wd_schedulers.append(CosineWDSchedule(optimizers[-1], T_max=int(num_epochs * iterations_per_epoch)))
             scalers.append(torch.cuda.amp.GradScaler() if use_bfloat16 else None)
         return optimizers, scalers, schedulers, wd_schedulers
+
+    base_eval.init_opt = init_opt
+
+
+def _patch_init_module_for_encoder_output_gaze(base_eval, gaze_cfg: dict, rnn_cfg: dict):
+    original_init_module = base_eval.init_module
+    adapter_cfg = dict(gaze_cfg.get("encoder_output_adapter", {}))
+    rnn_cfg = dict(rnn_cfg)
+    rnn_cfg["use_video_tokens"] = False
+
+    def init_module_with_encoder_output_gaze(*args, **kwargs):
+        model = original_init_module(*args, **kwargs)
+        device = next(model.parameters()).device
+        embed_dim = int(model.embed_dim)
+        adapter = EncoderOutputGazeAdapter(
+            embed_dim=embed_dim,
+            num_heads=int(adapter_cfg.get("num_heads", 4)),
+            dropout=float(adapter_cfg.get("dropout", 0.0)),
+        ).to(device)
+        gaze_encoder = GazeTrajectoryEncoder(
+            embed_dim=embed_dim,
+            mode=str(rnn_cfg.get("mode_impl", "rnn")),
+            input_dim=int(rnn_cfg.get("input_dim", 3)),
+            hidden_dim=int(rnn_cfg.get("hidden_dim", 256)),
+            num_layers=int(rnn_cfg.get("num_layers", 2)),
+            bidirectional=bool(rnn_cfg.get("bidirectional", True)),
+            dropout=float(rnn_cfg.get("dropout", 0.1)),
+            num_tokens=int(rnn_cfg.get("num_tokens", 64)),
+            modality_embed_std=float(rnn_cfg.get("modality_embed_std", 0.02)),
+            video_feat_dim=0,
+            video_proj_dim=int(rnn_cfg.get("video_proj_dim", 128)),
+            video_fusion=str(rnn_cfg.get("video_fusion", "nearest_concat")),
+            residual_alpha_init=float(rnn_cfg.get("residual_alpha_init", 0.01)),
+        ).to(device)
+        wrapped = EncoderOutputGazeAdaptedModel(model, adapter, gaze_encoder)
+        wrapped.embed_dim = model.embed_dim
+        for param in wrapped.base_model.parameters():
+            param.requires_grad = False
+        for param in wrapped.adapter.parameters():
+            param.requires_grad = True
+        for param in wrapped.gaze_encoder.parameters():
+            param.requires_grad = True
+        adapter_n = sum(p.numel() for p in wrapped.adapter.parameters() if p.requires_grad)
+        gaze_n = sum(p.numel() for p in wrapped.gaze_encoder.parameters() if p.requires_grad)
+        logger.info(
+            "Attached EncoderOutputGazeAdapter: embed_dim=%d, num_heads=%d, gaze_num_tokens=%d, "
+            "adapter_params=%d, gaze_params=%d",
+            embed_dim,
+            int(adapter_cfg.get("num_heads", 4)),
+            int(rnn_cfg.get("num_tokens", 64)),
+            adapter_n,
+            gaze_n,
+        )
+        wrapped = _wrap_trainable_model_for_ddp(wrapped)
+        base_eval._encoder_output_gaze_model = wrapped
+        return wrapped
+
+    base_eval.init_module = init_module_with_encoder_output_gaze
+
+
+def _patch_opt_for_encoder_output_gaze(base_eval, gaze_cfg: dict, rnn_cfg: dict):
+    from evals.action_anticipation_frozen.utils import CosineWDSchedule, WarmupCosineLRSchedule
+
+    adapter_cfg = dict(gaze_cfg.get("encoder_output_adapter", {}))
+    lr_mult = float(adapter_cfg.get("lr_mult", 0.05))
+    wd = float(adapter_cfg.get("weight_decay", 0.0001))
+
+    def init_opt(classifiers, iterations_per_epoch, opt_kwargs, num_epochs, use_bfloat16=False):
+        if not classifiers:
+            raise ValueError("encoder_output_inject requires at least one classifier")
+        model = getattr(base_eval, "_encoder_output_gaze_model", None)
+        if model is None:
+            raise RuntimeError("encoder_output_inject model was not registered before init_opt")
+        gaze_adapter_params = trainable_encoder_output_gaze_params(model)
+        param_groups = []
+        classifier_param_count = 0
+        first_kwargs = opt_kwargs[0]
+        for classifier, kwargs in zip(classifiers, opt_kwargs):
+            base_params = [p for p in classifier.parameters() if p.requires_grad]
+            classifier_param_count += sum(p.numel() for p in base_params)
+            warmup_steps = int((kwargs.get("warmup") or 0.0) * iterations_per_epoch)
+            param_groups.append(
+                {
+                    "params": base_params,
+                    "mc_warmup_steps": warmup_steps,
+                    "mc_start_lr": kwargs.get("start_lr"),
+                    "mc_ref_lr": kwargs.get("ref_lr"),
+                    "mc_final_lr": kwargs.get("final_lr"),
+                    "mc_ref_wd": kwargs.get("ref_wd"),
+                    "mc_final_wd": kwargs.get("final_wd"),
+                }
+            )
+        adapter_warmup_steps = int((first_kwargs.get("warmup") or 0.0) * iterations_per_epoch)
+        param_groups.append(
+            {
+                "params": gaze_adapter_params,
+                "mc_warmup_steps": adapter_warmup_steps,
+                "mc_start_lr": (first_kwargs.get("start_lr") or 0.0) * lr_mult,
+                "mc_ref_lr": (first_kwargs.get("ref_lr") or 0.0) * lr_mult,
+                "mc_final_lr": (first_kwargs.get("final_lr") or 0.0) * lr_mult,
+                "mc_ref_wd": wd,
+                "mc_final_wd": wd,
+            }
+        )
+        logger.info(
+            "Optimizer split: classifiers=%d params across %d heads, encoder_output_gaze=%d params, lr_mult=%.3f",
+            classifier_param_count,
+            len(classifiers),
+            sum(p.numel() for p in gaze_adapter_params),
+            lr_mult,
+        )
+        optimizer = torch.optim.AdamW(param_groups)
+        scheduler = WarmupCosineLRSchedule(optimizer, T_max=int(num_epochs * iterations_per_epoch))
+        wd_scheduler = CosineWDSchedule(optimizer, T_max=int(num_epochs * iterations_per_epoch))
+        scaler = torch.cuda.amp.GradScaler() if use_bfloat16 else None
+        return [optimizer], [scaler], [scheduler], [wd_scheduler]
 
     base_eval.init_opt = init_opt

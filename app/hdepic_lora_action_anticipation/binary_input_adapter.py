@@ -11,11 +11,16 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from app.hdepic_lora_action_anticipation.binary_map_utils import normalize_map_type, rasterize_gaze_disk
 from app.hdepic_lora_action_anticipation.gaze import GazeTokenGate
 from app.hdepic_lora_action_anticipation.gaze import labels_from_udata
 from src.utils.logging import AverageMeter
 
 logger = logging.getLogger(__name__)
+
+
+def unwrap_ddp(module: nn.Module) -> nn.Module:
+    return module.module if hasattr(module, "module") else module
 
 
 class BinaryMapInputAdapter(nn.Module):
@@ -31,10 +36,12 @@ class BinaryMapInputAdapter(nn.Module):
         scale: float = 1.0,
         temporal_kernel: int = 1,
         binary_center: float = 0.0,
+        residual_clamp: float = 1.0,
     ):
         super().__init__()
         self.scale = float(scale)
         self.binary_center = float(binary_center)
+        self.residual_clamp = float(residual_clamp)
         tk = int(temporal_kernel)
         if tk not in {1, 3}:
             raise ValueError(f"Unsupported temporal_kernel={temporal_kernel}; expected 1 or 3")
@@ -52,7 +59,10 @@ class BinaryMapInputAdapter(nn.Module):
     def forward(self, rgb: torch.Tensor, binary_map: torch.Tensor) -> torch.Tensor:
         binary_map = binary_map.to(dtype=rgb.dtype, device=rgb.device) - self.binary_center
         x = torch.cat([rgb, binary_map], dim=1)
-        return rgb + self.scale * self.net(x)
+        residual = self.scale * self.net(x)
+        if self.residual_clamp > 0:
+            residual = residual.clamp(-self.residual_clamp, self.residual_clamp)
+        return rgb + residual
 
 
 class BinaryInputAdaptedModel(nn.Module):
@@ -67,7 +77,10 @@ class BinaryInputAdaptedModel(nn.Module):
     def forward(self, clips: torch.Tensor, anticipation_times: torch.Tensor, binary_map: torch.Tensor | None = None):
         if binary_map is not None:
             clips = self.input_adapter(clips, binary_map)
-        return self.base_model(clips, anticipation_times)
+        tokens = self.base_model(clips, anticipation_times)
+        if torch.is_tensor(tokens) and not torch.isfinite(tokens).all():
+            return None
+        return tokens
 
 
 class BinaryGazeMapBuilder:
@@ -77,6 +90,7 @@ class BinaryGazeMapBuilder:
         self.cfg = dict(cfg)
         self.crop_size = int(cfg.get("crop_size", 384))
         self.radius_px = float(cfg.get("binary_radius_px", cfg.get("binary_radius", 64.0)))
+        self.map_type = normalize_map_type(cfg.get("binary_map_type", cfg.get("map_type", "binary")))
         self.fallback_full_frame = bool(cfg.get("fallback_full_frame", False))
         self.force_zero_map = bool(cfg.get("force_zero_map", False))
         self.adapter_checkpoint_path = cfg.get("adapter_checkpoint_path")
@@ -105,7 +119,15 @@ class BinaryGazeMapBuilder:
             xy_t = torch.as_tensor(xy[:nframes], device=clips.device, dtype=torch.float32)
             x = xy_t[:, 0].view(nframes, 1, 1) * (width - 1) / max(1, self.crop_size - 1)
             y = xy_t[:, 1].view(nframes, 1, 1) * (height - 1) / max(1, self.crop_size - 1)
-            maps[idx, 0, :nframes] = (((xx - x) ** 2 + (yy - y) ** 2) <= radius2).to(maps.dtype)
+            maps[idx, 0, :nframes] = rasterize_gaze_disk(
+                xx,
+                yy,
+                x,
+                y,
+                radius2**0.5,
+                map_type=self.map_type,
+                dtype=maps.dtype,
+            )
         return maps
 
     def _grid(self, device: torch.device, height: int, width: int):
@@ -137,20 +159,57 @@ class BinaryGazeMapBuilder:
 
 
 def binary_input_adapter_param_names(model: nn.Module) -> set[str]:
+    model = unwrap_ddp(model)
     return {f"input_adapter.{name}" for name, _ in model.input_adapter.named_parameters()}
 
 
 def trainable_binary_input_adapter_params(model: nn.Module):
+    model = unwrap_ddp(model)
     return [param for param in model.input_adapter.parameters() if param.requires_grad]
 
 
 def normalize_binary_input_adapter_grads(model: nn.Module, divisor: int):
+    model = unwrap_ddp(model)
     if divisor <= 1:
         return
     scale = 1.0 / float(divisor)
     for param in model.input_adapter.parameters():
         if param.grad is not None:
             param.grad.mul_(scale)
+
+
+def _classifier_grads_finite(classifier: nn.Module) -> bool:
+    for param in classifier.parameters():
+        if param.grad is None:
+            continue
+        if not torch.isfinite(param.grad).all():
+            return False
+    return True
+
+
+def _zero_classifier_grads(classifier: nn.Module) -> None:
+    for param in classifier.parameters():
+        if param.grad is not None:
+            param.grad.detach_()
+            param.grad.zero_()
+
+
+def _adapter_grads_finite(model: nn.Module) -> bool:
+    model = unwrap_ddp(model)
+    for param in model.input_adapter.parameters():
+        if param.grad is None:
+            continue
+        if not torch.isfinite(param.grad).all():
+            return False
+    return True
+
+
+def _zero_adapter_grads(model: nn.Module) -> None:
+    model = unwrap_ddp(model)
+    for param in model.input_adapter.parameters():
+        if param.grad is not None:
+            param.grad.detach_()
+            param.grad.zero_()
 
 
 def train_one_epoch_with_binary_input_adapter(
@@ -173,8 +232,9 @@ def train_one_epoch_with_binary_input_adapter(
     criterion,
 ):
     _data_loader = iter(data_loader)
-    model.base_model.eval()
-    model.input_adapter.train(mode=True)
+    model_inner = unwrap_ddp(model)
+    model_inner.base_model.eval()
+    model_inner.input_adapter.train(mode=True)
     for c in classifiers:
         c.train(mode=True)
     if action_is_verb_noun:
@@ -212,7 +272,12 @@ def train_one_epoch_with_binary_input_adapter(
             if binary_map is None:
                 binary_map = map_builder.build(clips, metadata)
             tokens = model(clips, anticipation_times, binary_map=binary_map)
-            outputs = [c(tokens) for c in classifiers]
+            if tokens is None:
+                logger.warning("Skipping binary_input_adapter optimizer step because encoder output is non-finite at itr=%d", itr)
+                optimizer[0].zero_grad()
+                continue
+            tokens_proxy = tokens.detach().requires_grad_(True)
+            outputs = [c(tokens_proxy) for c in classifiers]
 
         if action_is_verb_noun:
             loss = [
@@ -224,19 +289,60 @@ def train_one_epoch_with_binary_input_adapter(
         else:
             loss = [criterion(o["action"], labels["action"]) for o in outputs]
 
-        total_loss = sum(loss)
-        if not torch.isfinite(total_loss.detach()):
-            logger.warning("Skipping binary_input_adapter optimizer step because loss is non-finite: %s", float(total_loss.detach().float()))
+        tokens_grad_accum = torch.zeros_like(tokens_proxy)
+        healthy_heads = 0
+        adapter_param_names = binary_input_adapter_param_names(model)
+        for head_idx, (l, c) in enumerate(zip(loss, classifiers)):
+            if not torch.isfinite(l.detach()):
+                logger.warning(
+                    "Skipping per-head contribution because loss is non-finite: head=%d loss=%s",
+                    head_idx,
+                    float(l.detach().float()),
+                )
+                _zero_classifier_grads(c)
+                continue
+            if tokens_proxy.grad is not None:
+                tokens_proxy.grad.zero_()
+            scaled = scaler[0].scale(l) if use_bfloat16 else l
+            scaled.backward(retain_graph=(head_idx < len(loss) - 1))
+            head_token_grad = tokens_proxy.grad
+            if head_token_grad is None or not torch.isfinite(head_token_grad).all():
+                logger.warning(
+                    "Discarding head %d gradient contribution because tokens grad is non-finite",
+                    head_idx,
+                )
+                _zero_classifier_grads(c)
+                continue
+            head_param_ok = _classifier_grads_finite(c)
+            if not head_param_ok:
+                logger.warning(
+                    "Discarding head %d gradient contribution because head param grads are non-finite",
+                    head_idx,
+                )
+                _zero_classifier_grads(c)
+                continue
+            tokens_grad_accum.add_(head_token_grad)
+            healthy_heads += 1
+
+        if healthy_heads == 0:
+            logger.warning("All %d heads produced non-finite grads at itr=%d; skipping optimizer step", len(loss), itr)
             optimizer[0].zero_grad()
+            if use_bfloat16:
+                scaler[0].update()
             continue
+
+        tokens_grad_accum.mul_(1.0 / float(healthy_heads))
+        tokens.backward(gradient=tokens_grad_accum)
+
+        adapter_ok = _adapter_grads_finite(model)
+        if not adapter_ok:
+            logger.warning("Discarding adapter step at itr=%d because adapter grads are non-finite after token backward", itr)
+            _zero_adapter_grads(model)
+
         if use_bfloat16:
-            scaler[0].scale(total_loss).backward()
-            normalize_binary_input_adapter_grads(model, len(loss))
             scaler[0].step(optimizer[0])
             scaler[0].update()
         else:
-            total_loss.backward()
-            normalize_binary_input_adapter_grads(model, len(loss))
             optimizer[0].step()
         optimizer[0].zero_grad()
 
@@ -248,7 +354,7 @@ def train_one_epoch_with_binary_input_adapter(
         if itr % 10 == 0 or itr == ipe - 1:
             if action_is_verb_noun:
                 logger.info(
-                    "[%5d] acc (v/n): %.1f%% (%.1f%% %.1f%%) recall (v/n): %.1f%% (%.1f%% %.1f%%) [mem: %.2e] [data: %.1f ms]",
+                    "[%5d] acc (v/n): %.1f%% (%.1f%% %.1f%%) recall (v/n): %.1f%% (%.1f%% %.1f%%) healthy_heads=%d/%d adapter_ok=%s [mem: %.2e] [data: %.1f ms]",
                     itr,
                     max(a["accuracy"] for a in action_metrics),
                     max(v["accuracy"] for v in verb_metrics),
@@ -256,6 +362,9 @@ def train_one_epoch_with_binary_input_adapter(
                     max(a["recall"] for a in action_metrics),
                     max(v["recall"] for v in verb_metrics),
                     max(n["recall"] for n in noun_metrics),
+                    healthy_heads,
+                    len(loss),
+                    adapter_ok,
                     torch.cuda.max_memory_allocated() / 1024.0**2,
                     data_elapsed_time_meter.avg,
                 )
@@ -290,11 +399,19 @@ def validate_with_binary_input_adapter(
     verb_classes,
     action_classes,
     criterion,
+    val_metric_scope: str = "native",
 ):
-    logger.info("Running val with binary input adapter...")
+    metric_scope = str(val_metric_scope).lower()
+    if metric_scope not in {"native", "filtered"}:
+        raise ValueError(f"Unsupported val_metric_scope={val_metric_scope!r}; expected native or filtered")
+    use_valid_filter = metric_scope == "filtered"
+    logger.info("Running val with binary input adapter (metric_scope=%s)...", metric_scope)
+    if use_valid_filter:
+        logger.info("Using filtered val metrics: passing valid_* class sets into ClassMeanRecall")
     _data_loader = iter(data_loader)
-    model.base_model.eval()
-    model.input_adapter.eval()
+    model_inner = unwrap_ddp(model)
+    model_inner.base_model.eval()
+    model_inner.input_adapter.eval()
     for c in classifiers:
         c.train(mode=False)
     if action_is_verb_noun:
@@ -319,18 +436,25 @@ def validate_with_binary_input_adapter(
             if binary_map is None:
                 binary_map = map_builder.build(clips, metadata)
             tokens = model(clips, anticipation_times, binary_map=binary_map)
+            if tokens is None:
+                logger.warning("Skipping binary_input_adapter val batch because encoder output is non-finite at itr=%d", itr)
+                continue
             outputs = [c(tokens) for c in classifiers]
-            action_metrics = [m(o["action"], labels["action"], valid_actions) for o, m in zip(outputs, action_metric_loggers)]
+            valid_actions_arg = valid_actions if use_valid_filter else None
+            valid_verbs_arg = valid_verbs if use_valid_filter else None
+            valid_nouns_arg = valid_nouns if use_valid_filter else None
+            action_metrics = [m(o["action"], labels["action"], valid_actions_arg) for o, m in zip(outputs, action_metric_loggers)]
             if action_is_verb_noun:
-                verb_metrics = [m(o["verb"], labels["verb"], valid_verbs) for o, m in zip(outputs, verb_metric_loggers)]
-                noun_metrics = [m(o["noun"], labels["noun"], valid_nouns) for o, m in zip(outputs, noun_metric_loggers)]
+                verb_metrics = [m(o["verb"], labels["verb"], valid_verbs_arg) for o, m in zip(outputs, verb_metric_loggers)]
+                noun_metrics = [m(o["noun"], labels["noun"], valid_nouns_arg) for o, m in zip(outputs, noun_metric_loggers)]
                 verb_loss = sum(criterion(o["verb"], labels["verb"]) for o in outputs)
                 noun_loss = sum(criterion(o["noun"], labels["noun"]) for o in outputs)
                 action_loss = sum(criterion(o["action"], labels["action"]) for o in outputs)
                 loss = verb_loss + noun_loss + action_loss
             else:
                 loss = sum(criterion(o["action"], labels["action"]) for o in outputs)
-        dumper.add_batch(udata, outputs, labels, {"verb": verb_classes, "noun": noun_classes, "action": action_classes})
+        best_head_idx = max(range(len(action_metrics)), key=lambda i: action_metrics[i]["accuracy"])
+        dumper.add_batch(udata, [outputs[best_head_idx]], labels, {"verb": verb_classes, "noun": noun_classes, "action": action_classes})
         if itr % 10 == 0 or itr == ipe - 1:
             if action_is_verb_noun:
                 logger.info(
@@ -351,9 +475,10 @@ def validate_with_binary_input_adapter(
     if map_builder.adapter_checkpoint_path and map_builder.rank == 0:
         path = Path(map_builder.adapter_checkpoint_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"input_adapter": model.input_adapter.state_dict()}, path)
+        torch.save({"input_adapter": unwrap_ddp(model).input_adapter.state_dict()}, path)
         logger.info("Wrote binary input adapter checkpoint: %s", path)
     ret = {"action": {"accuracy": max(a["accuracy"] for a in action_metrics), "recall": max(a["recall"] for a in action_metrics)}}
+    ret["metric_scope"] = metric_scope
     if action_is_verb_noun:
         ret.update(
             {

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -123,6 +123,23 @@ def _module_param_diag(name: str, module: Optional[nn.Module]) -> bool:
     for param_name, param in module.named_parameters(recurse=True):
         bad = _tensor_diag(f"{name}.{param_name}", param) or bad
     return bad
+
+
+def _scalar_for_log(value: Any) -> float:
+    if value is None:
+        return float("nan")
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return float("nan")
+        return float(value.detach().float().reshape(-1)[0].item())
+    return float(value)
+
+
+def _first_nonfinite_grad(enc: nn.Module) -> tuple[str, torch.Tensor] | tuple[None, None]:
+    for name, param in enc.named_parameters(recurse=True):
+        if param.grad is not None and not bool(torch.isfinite(param.grad.detach().float()).all().item()):
+            return name, param
+    return None, None
 
 
 def _adaptive_segment_pool(x: torch.Tensor, mask: torch.Tensor, k: int) -> torch.Tensor:
@@ -415,6 +432,14 @@ class GazeTrajectoryLoader:
         self.traj_len = int(cfg.get("traj_len", 1024))
         rnn_cfg = dict(cfg.get("rnn", {}))
         self.use_video_tokens = bool(rnn_cfg.get("use_video_tokens", False))
+        self.history_sec = float(rnn_cfg.get("history_sec", 0.0) or 0.0)
+        if self.history_sec < 0.0:
+            raise ValueError(f"gaze.rnn.history_sec must be non-negative, got {self.history_sec}")
+        if self.history_sec > 0.0 and self.use_video_tokens:
+            raise ValueError(
+                "gaze.rnn.history_sec currently supports the gaze-only branch only; "
+                "disable gaze.rnn.use_video_tokens or implement overlap-only video conditioning."
+            )
         self.video_fusion = str(rnn_cfg.get("video_fusion", "nearest_concat")).lower()
         supported_fusions = {"nearest_concat", "gated_nearest", "local_attention", "residual_conditioned"}
         if self.video_fusion not in supported_fusions:
@@ -441,7 +466,8 @@ class GazeTrajectoryLoader:
             records.append(traj)
         B = len(records)
         T = self.traj_len
-        padded = torch.zeros(B, T, 3, dtype=torch.float32)
+        input_dim = int(self.cfg.get("rnn", {}).get("input_dim", 3))
+        padded = torch.zeros(B, T, input_dim, dtype=torch.float32)
         lengths = torch.zeros(B, dtype=torch.long)
         sample_valid = torch.zeros(B, dtype=torch.bool)
         video_features = None
@@ -560,8 +586,14 @@ class GazeTrajectoryLoader:
         if frame_indices.size < 2 or vfps <= 0:
             return None
 
-        mp4_t0_ns = float(frame_indices.min()) / vfps * 1e9
         mp4_t1_ns = float(frame_indices.max()) / vfps * 1e9
+        if self.history_sec > 0.0:
+            # Extend gaze history before the observed video clip, but never before
+            # the source video start. The final part of the gaze window overlaps
+            # the actual V-JEPA input clip.
+            mp4_t0_ns = max(0.0, mp4_t1_ns - self.history_sec * 1e9)
+        else:
+            mp4_t0_ns = float(frame_indices.min()) / vfps * 1e9
         if record.sync is not None and {"mp4_time_ns", "vrs_device_time_ns"}.issubset(record.sync.columns):
             sync_mp4 = record.sync["mp4_time_ns"].to_numpy(dtype=np.float64)
             sync_vrs = record.sync["vrs_device_time_ns"].to_numpy(dtype=np.float64)
@@ -584,6 +616,55 @@ class GazeTrajectoryLoader:
             axis=1,
         )
         return traj
+
+
+class PoseTrajectoryLoader:
+    """Build per-batch SLAM pose trajectories from dataloader metadata."""
+
+    def __init__(self, cfg: dict, gate: Optional[GazeTokenGate] = None):
+        self.cfg = dict(cfg)
+        pose_cfg = dict(cfg.get("pose", {}))
+        pose_cfg.setdefault("gaze_root", cfg.get("gaze_root"))
+        pose_cfg.setdefault("sync_root", cfg.get("sync_root"))
+        if gate is None:
+            gate = GazeTokenGate({"mode": "none", "gaze_root": cfg.get("gaze_root"), "sync_root": cfg.get("sync_root")})
+        from app.hdepic_lora_action_anticipation.pose_slam import SlamPoseLoader
+
+        self.pose_loader = SlamPoseLoader(pose_cfg, gate=gate)
+        self.traj_len = int(cfg.get("traj_len", 1024))
+        self.input_dim = self.pose_loader.input_dim
+        self.history_sec = float(pose_cfg.get("history_sec", 0.0) or 0.0)
+
+    def _load_one(self, meta) -> Optional[np.ndarray]:
+        return self.pose_loader.query_clip_features(meta)
+
+    def load_batch(
+        self,
+        metadata,
+        device: torch.device,
+        video_tokens: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
+        del video_tokens
+        records = [self._load_one(meta) for meta in metadata]
+        B = len(records)
+        T = self.traj_len
+        D = self.input_dim
+        padded = torch.zeros(B, T, D, dtype=torch.float32)
+        lengths = torch.zeros(B, dtype=torch.long)
+        sample_valid = torch.zeros(B, dtype=torch.bool)
+        for i, traj in enumerate(records):
+            if traj is None or traj.shape[0] < 2:
+                continue
+            sample_valid[i] = True
+            n_raw = traj.shape[0]
+            if n_raw > T:
+                idx = np.linspace(0, n_raw - 1, T).astype(np.int64)
+                padded[i] = torch.from_numpy(traj[idx])
+                lengths[i] = T
+            else:
+                padded[i, :n_raw] = torch.from_numpy(traj)
+                lengths[i] = n_raw
+        return padded.to(device), lengths.to(device), sample_valid.to(device), None
 
 
 class GazeFusedAttentivePooler(AttentivePooler):
@@ -619,9 +700,13 @@ class GazeFusedAttentiveClassifier(AttentiveClassifier):
         new_pooler.__class__ = GazeFusedAttentivePooler
         self.pooler = new_pooler
         self.gaze_encoder: Optional[GazeTrajectoryEncoder] = None
+        self.pose_encoder: Optional[GazeTrajectoryEncoder] = None
 
     def attach_gaze_encoder(self, encoder: GazeTrajectoryEncoder):
         self.gaze_encoder = encoder
+
+    def attach_pose_encoder(self, encoder: GazeTrajectoryEncoder):
+        self.pose_encoder = encoder
 
     def forward(self, x, gaze_tokens: Optional[torch.Tensor] = None):  # type: ignore[override]
         if torch.isnan(x).any():
@@ -682,12 +767,80 @@ def load_gaze_batch(
     return traj_loader.load_batch(metadata, device, video_tokens=video_tokens)
 
 
-def attach_gaze_encoder_to_classifier(
-    classifier: GazeFusedAttentiveClassifier,
-    embed_dim: int,
-    rnn_cfg: dict,
-) -> GazeTrajectoryEncoder:
-    encoder = GazeTrajectoryEncoder(
+def load_pose_batch(
+    metadata,
+    traj_loader: PoseTrajectoryLoader,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
+    return traj_loader.load_batch(metadata, device)
+
+
+def _encode_with_encoder(
+    classifier: nn.Module,
+    encoder: GazeTrajectoryEncoder,
+    traj: torch.Tensor,
+    lengths: torch.Tensor,
+    sample_valid: torch.Tensor,
+    video_features: Optional[torch.Tensor],
+) -> torch.Tensor:
+    return encoder(traj, lengths=lengths, sample_valid=sample_valid, video_features=video_features)
+
+
+def encode_pose_tokens(
+    classifier: nn.Module,
+    metadata,
+    traj_loader: PoseTrajectoryLoader,
+    device: torch.device,
+    pose_batch: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]] = None,
+) -> Optional[torch.Tensor]:
+    if metadata is None:
+        return None
+    inner = classifier.module if hasattr(classifier, "module") else classifier
+    encoder = getattr(inner, "pose_encoder", None)
+    if encoder is None:
+        return None
+    if pose_batch is None:
+        pose_batch = load_pose_batch(metadata, traj_loader, device)
+    traj, lengths, sample_valid, _ = pose_batch
+    return _encode_with_encoder(classifier, encoder, traj, lengths, sample_valid, None)
+
+
+def encode_fusion_tokens(
+    classifier: nn.Module,
+    metadata,
+    device: torch.device,
+    gaze_loader: Optional[GazeTrajectoryLoader] = None,
+    pose_loader: Optional[PoseTrajectoryLoader] = None,
+    video_tokens: Optional[torch.Tensor] = None,
+    gaze_batch: Optional[tuple] = None,
+    pose_batch: Optional[tuple] = None,
+) -> Optional[torch.Tensor]:
+    """Encode gaze and/or pose branches; concat tokens on the sequence axis."""
+    parts: list[torch.Tensor] = []
+    if gaze_loader is not None:
+        gt = encode_gaze_tokens(
+            classifier,
+            metadata,
+            gaze_loader,
+            device,
+            video_tokens=video_tokens,
+            gaze_batch=gaze_batch,
+        )
+        if gt is not None:
+            parts.append(gt)
+    if pose_loader is not None:
+        pt = encode_pose_tokens(classifier, metadata, pose_loader, device, pose_batch=pose_batch)
+        if pt is not None:
+            parts.append(pt)
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    return torch.cat(parts, dim=1)
+
+
+def _build_trajectory_encoder(embed_dim: int, rnn_cfg: dict) -> GazeTrajectoryEncoder:
+    return GazeTrajectoryEncoder(
         embed_dim=embed_dim,
         mode=str(rnn_cfg.get("mode_impl", "rnn")),
         input_dim=int(rnn_cfg.get("input_dim", 3)),
@@ -702,7 +855,25 @@ def attach_gaze_encoder_to_classifier(
         video_fusion=str(rnn_cfg.get("video_fusion", "nearest_concat")),
         residual_alpha_init=float(rnn_cfg.get("residual_alpha_init", 0.01)),
     )
+
+
+def attach_gaze_encoder_to_classifier(
+    classifier: GazeFusedAttentiveClassifier,
+    embed_dim: int,
+    rnn_cfg: dict,
+) -> GazeTrajectoryEncoder:
+    encoder = _build_trajectory_encoder(embed_dim, rnn_cfg)
     classifier.attach_gaze_encoder(encoder)
+    return encoder
+
+
+def attach_pose_encoder_to_classifier(
+    classifier: GazeFusedAttentiveClassifier,
+    embed_dim: int,
+    rnn_cfg: dict,
+) -> GazeTrajectoryEncoder:
+    encoder = _build_trajectory_encoder(embed_dim, rnn_cfg)
+    classifier.attach_pose_encoder(encoder)
     return encoder
 
 
@@ -763,38 +934,60 @@ class GazeHiddenDump:
 
 
 def gaze_encoder_param_names(classifier: nn.Module) -> set[str]:
-    """Return the set of parameter names that belong to the gaze encoder."""
-    inner = classifier.module if hasattr(classifier, "module") else classifier
+    """Return parameter names belonging to gaze/pose trajectory encoders."""
     names: set[str] = set()
-    enc = getattr(inner, "gaze_encoder", None)
-    if enc is None:
-        return names
-    prefix_root = "gaze_encoder."
-    # Walk classifier.named_parameters to recover the keys actually visible to the optimizer.
     for name, _p in classifier.named_parameters():
-        # Handle DDP "module." prefix and any nesting.
         bare = name.split("module.", 1)[-1] if name.startswith("module.") else name
-        if bare.startswith(prefix_root):
+        if bare.startswith("gaze_encoder.") or bare.startswith("pose_encoder."):
             names.add(name)
     return names
 
 
-def clip_gaze_encoder_grads(classifier: nn.Module, max_norm: float = 1.0) -> bool:
+def clip_gaze_encoder_grads(
+    classifier: nn.Module,
+    max_norm: float = 1.0,
+    *,
+    head_idx: Optional[int] = None,
+    itr: Optional[int] = None,
+    loss_info: Optional[dict[str, Any]] = None,
+    scaler_scale: Optional[float] = None,
+) -> bool:
     """Clip gaze encoder gradients; return False if non-finite grads were found."""
     inner = classifier.module if hasattr(classifier, "module") else classifier
-    enc = getattr(inner, "gaze_encoder", None)
-    if enc is None:
+    encoders = [getattr(inner, "gaze_encoder", None), getattr(inner, "pose_encoder", None)]
+    encoders = [e for e in encoders if e is not None]
+    if not encoders:
         return True
-    params = [p for p in enc.parameters() if p.requires_grad and p.grad is not None]
+    params = [p for e in encoders for p in e.parameters() if p.requires_grad and p.grad is not None]
     if not params:
         return True
-    for param in params:
-        if not torch.isfinite(param.grad).all():
-            logger.warning("Non-finite gaze encoder gradient detected; skipping optimizer step for this classifier")
-            return False
+    bad_name, _bad_param = None, None
+    for enc in encoders:
+        bad_name, _bad_param = _first_nonfinite_grad(enc)
+        if bad_name is not None:
+            break
+    if bad_name is not None:
+        logger.warning(
+            "Non-finite gaze encoder gradient detected; itr=%s head=%s param=%s loss=%s scaler_scale=%s; "
+            "skipping optimizer step for this classifier",
+            itr,
+            head_idx,
+            bad_name,
+            None if loss_info is None else _scalar_for_log(loss_info.get("total")),
+            scaler_scale,
+        )
+        return False
     if max_norm and max_norm > 0:
         total_norm = torch.nn.utils.clip_grad_norm_(params, float(max_norm), error_if_nonfinite=False)
         if not torch.isfinite(total_norm):
-            logger.warning("Non-finite gaze encoder grad norm detected; skipping optimizer step for this classifier")
+            logger.warning(
+                "Non-finite gaze encoder grad norm detected; itr=%s head=%s loss=%s scaler_scale=%s total_norm=%s; "
+                "skipping optimizer step for this classifier",
+                itr,
+                head_idx,
+                None if loss_info is None else _scalar_for_log(loss_info.get("total")),
+                scaler_scale,
+                _scalar_for_log(total_norm),
+            )
             return False
     return True

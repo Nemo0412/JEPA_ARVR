@@ -3,7 +3,7 @@ tasks_per_node: 1
 cpus_per_task: 12
 tag: ek100-vitg16-384
 eval_name: action_anticipation_frozen
-folder: /scratch/yh6416/VJEPA2-EXP/outputs/ek100_vitg384_probe
+folder: /path/to/VJEPA2-EXP/outputs/ek100_vitg384_probe
 resume_checkpoint: true
 val_only: true
 experiment:
@@ -17,9 +17,9 @@ experiment:
     auto_augment: true
     file_format: 1
     dataset: EK100
-    base_path: /scratch/yh6416/VJEPA2-EXP/data/hdepic_vjepa_videos
-    dataset_train: /scratch/yh6416/VJEPA2-EXP/data/hdepic_vjepa_annotations/HD_EPIC_train_vjepa.csv
-    dataset_val: /scratch/yh6416/VJEPA2-EXP/data/hdepic_vjepa_annotations/HD_EPIC_val_vjepa.csv
+    base_path: /path/to/VJEPA2-EXP/data/hdepic_vjepa_videos
+    dataset_train: /path/to/VJEPA2-EXP/data/hdepic_vjepa_annotations/HD_EPIC_train_vjepa.csv
+    dataset_val: /path/to/VJEPA2-EXP/data/hdepic_vjepa_annotations/HD_EPIC_val_vjepa.csv
     frames_per_clip: 32
     frames_per_second: 8
     motion_shift: false
@@ -49,7 +49,7 @@ experiment:
       final_lr: 0.0
       warmup: 0.0
 model_kwargs:
-  checkpoint: /scratch/yh6416/VJEPA2-EXP/checkpoints/vitg-384.pt
+  checkpoint: /path/to/VJEPA2-EXP/checkpoints/vitg-384.pt
   module_name: evals.action_anticipation_frozen.modelcustom.vit_encoder_predictor_concat_ar
   wrapper_kwargs:
     no_predictor: false

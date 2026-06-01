@@ -1,16 +1,16 @@
 #!/bin/bash
 #SBATCH --job-name=VJEPA2-EXP__binary_adapter_zero_val
-#SBATCH --account=YOUR_SLURM_ACCOUNT
+#SBATCH --account=torch_pr_674_tandon_advanced
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=128GB
 #SBATCH --time=08:00:00
-#SBATCH --output=/scratch/yh6416/VJEPA2-EXP/logs/hdepic_binary_adapter_zero_val_%j.out
-#SBATCH --error=/scratch/yh6416/VJEPA2-EXP/logs/hdepic_binary_adapter_zero_val_%j.err
+#SBATCH --output=/path/to/VJEPA2-EXP/logs/hdepic_binary_adapter_zero_val_%j.out
+#SBATCH --error=/path/to/VJEPA2-EXP/logs/hdepic_binary_adapter_zero_val_%j.err
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=YOUR_EMAIL@example.com
+#SBATCH --mail-user=<email>
 
 set -euo pipefail
 
@@ -18,7 +18,7 @@ set -euo pipefail
 # load the trained classifiers from latest.pt, load the trained input adapter
 # from binary_input_adapter_latest.pt, but force the emitted gaze channel to 0.
 
-PROJECT_ROOT="${PROJECT_ROOT:-/scratch/yh6416/VJEPA2-EXP}"
+PROJECT_ROOT="${PROJECT_ROOT:-/path/to/VJEPA2-EXP}"
 RUN_TAG="${RUN_TAG:-hdepic-lora-binary-input-adapter-r64-h8-dlmap-multihead-bs2-w12}"
 RUN_DIR="${RUN_DIR:-${PROJECT_ROOT}/outputs/hdepic_lora_action_anticipation/action_anticipation_frozen/${RUN_TAG}}"
 ZERO_VAL_TAG="${ZERO_VAL_TAG:-${RUN_TAG}-zero-channel-val}"

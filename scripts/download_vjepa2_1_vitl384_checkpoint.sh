@@ -10,7 +10,7 @@ set -euo pipefail
 # Optional:
 #   CHECKPOINT_DIR=/some/path bash scripts/download_vjepa2_1_vitl384_checkpoint.sh
 
-PROJECT_ROOT="${PROJECT_ROOT:-/scratch/yh6416/VJEPA2-EXP}"
+PROJECT_ROOT="${PROJECT_ROOT:-/path/to/VJEPA2-EXP}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${PROJECT_ROOT}/checkpoints}"
 CHECKPOINT_NAME="${CHECKPOINT_NAME:-vjepa2_1_vitl_dist_vitG_384.pt}"
 CHECKPOINT_URL="${CHECKPOINT_URL:-https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitl_dist_vitG_384.pt}"

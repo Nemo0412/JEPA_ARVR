@@ -92,6 +92,7 @@ def _load_adapter(cfg: dict, checkpoint: Path | None, device: torch.device):
         scale=float(adapter_cfg.get("scale", 1.0)),
         temporal_kernel=int(adapter_cfg.get("temporal_kernel", 1)),
         binary_center=float(adapter_cfg.get("binary_center", 0.0)),
+        residual_clamp=float(adapter_cfg.get("residual_clamp", 1.0)),
     ).to(device)
     if checkpoint is not None:
         state = torch.load(checkpoint, map_location="cpu")
@@ -271,6 +272,7 @@ def run(args):
         "samples": samples,
         "gaze": {
             "binary_radius_px": gaze_cfg.get("binary_radius_px"),
+            "binary_map_type": gaze_cfg.get("binary_map_type", gaze_cfg.get("map_type", "binary")),
             "disable_train_aug": gaze_cfg.get("disable_train_aug", False),
         },
         "map_nonzero_fraction_mean": float(torch.tensor(map_nonzero).mean()) if map_nonzero else None,

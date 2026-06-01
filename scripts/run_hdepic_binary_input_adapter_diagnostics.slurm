@@ -1,18 +1,18 @@
 #!/bin/bash
 #SBATCH --job-name=VJEPA2-EXP__hdepic_biadapter_diag
-#SBATCH --account=YOUR_SLURM_ACCOUNT
+#SBATCH --account=torch_pr_674_tandon_advanced
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=160GB
 #SBATCH --time=02:00:00
-#SBATCH --output=/scratch/yh6416/VJEPA2-EXP/logs/hdepic_binary_input_adapter_diag_%j.out
-#SBATCH --error=/scratch/yh6416/VJEPA2-EXP/logs/hdepic_binary_input_adapter_diag_%j.err
+#SBATCH --output=/path/to/VJEPA2-EXP/logs/hdepic_binary_input_adapter_diag_%j.out
+#SBATCH --error=/path/to/VJEPA2-EXP/logs/hdepic_binary_input_adapter_diag_%j.err
 
 set -euo pipefail
 
-PROJECT_ROOT="${PROJECT_ROOT:-/scratch/yh6416/VJEPA2-EXP}"
+PROJECT_ROOT="${PROJECT_ROOT:-/path/to/VJEPA2-EXP}"
 VJEPA_ROOT="${VJEPA_ROOT:-${PROJECT_ROOT}/vjepa2}"
 SIF="${SIF:-/share/apps/images/cuda12.1.1-cudnn8.9.0-devel-ubuntu22.04.2.sif}"
 OVERLAY="${OVERLAY:-${PROJECT_ROOT}/overlay-15GB-500K.ext3}"

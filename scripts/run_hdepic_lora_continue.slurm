@@ -1,16 +1,16 @@
 #!/bin/bash
 #SBATCH --job-name=VJEPA2-EXP__hdepic_lora_cont
-#SBATCH --account=YOUR_SLURM_ACCOUNT
+#SBATCH --account=torch_pr_674_tandon_advanced
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=128GB
 #SBATCH --time=48:00:00
-#SBATCH --output=/scratch/yh6416/VJEPA2-EXP/logs/hdepic_lora_continue_%j.out
-#SBATCH --error=/scratch/yh6416/VJEPA2-EXP/logs/hdepic_lora_continue_%j.err
+#SBATCH --output=/path/to/VJEPA2-EXP/logs/hdepic_lora_continue_%j.out
+#SBATCH --error=/path/to/VJEPA2-EXP/logs/hdepic_lora_continue_%j.err
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=YOUR_EMAIL@example.com
+#SBATCH --mail-user=<email>
 
 set -euo pipefail
 
@@ -19,7 +19,7 @@ set -euo pipefail
 # number of additional epochs. If latest.pt stores epoch 3 and EVAL_NUM_EPOCHS=10,
 # the job runs epochs 4..10.
 
-PROJECT_ROOT="${PROJECT_ROOT:-/scratch/yh6416/VJEPA2-EXP}"
+PROJECT_ROOT="${PROJECT_ROOT:-/path/to/VJEPA2-EXP}"
 LORA_TAG="${LORA_TAG:-hdepic-lora-vitg16-384-cleanp01-refmetrics}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs/hdepic_lora_action_anticipation}"
 RUN_DIR="${OUTPUT_DIR}/action_anticipation_frozen/${LORA_TAG}"

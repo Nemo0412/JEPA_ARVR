@@ -7,7 +7,7 @@ set -euo pipefail
 # Run on HPC:
 #   bash scripts/download_ek100_vitg384_inference_ckpts.sh
 
-PROJECT_ROOT="${PROJECT_ROOT:-/scratch/yh6416/VJEPA2-EXP}"
+PROJECT_ROOT="${PROJECT_ROOT:-/path/to/VJEPA2-EXP}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${PROJECT_ROOT}/checkpoints}"
 PROBE_ROOT="${PROBE_ROOT:-${PROJECT_ROOT}/outputs/ek100_vitg384_probe}"
 PROBE_TAG="${PROBE_TAG:-ek100-vitg16-384}"

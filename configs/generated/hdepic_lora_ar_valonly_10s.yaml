@@ -3,7 +3,7 @@ tasks_per_node: 1
 cpus_per_task: 12
 tag: hdepic-lora-vitg16-384-cleanp01-refmetrics
 eval_name: app.hdepic_lora_action_anticipation
-folder: /scratch/yh6416/VJEPA2-EXP/outputs/hdepic_lora_action_anticipation
+folder: /path/to/VJEPA2-EXP/outputs/hdepic_lora_action_anticipation
 resume_checkpoint: true
 experiment:
   classifier:
@@ -16,9 +16,9 @@ experiment:
     auto_augment: true
     file_format: 1
     dataset: EK100
-    base_path: /scratch/yh6416/VJEPA2-EXP/data/hdepic_vjepa_videos
-    dataset_train: /scratch/yh6416/VJEPA2-EXP/data/hdepic_vjepa_annotations/HD_EPIC_train_vjepa.csv
-    dataset_val: /scratch/yh6416/VJEPA2-EXP/data/hdepic_vjepa_annotations/HD_EPIC_val_vjepa.csv
+    base_path: /path/to/VJEPA2-EXP/data/hdepic_vjepa_videos
+    dataset_train: /path/to/VJEPA2-EXP/data/hdepic_vjepa_annotations/HD_EPIC_train_vjepa.csv
+    dataset_val: /path/to/VJEPA2-EXP/data/hdepic_vjepa_annotations/HD_EPIC_val_vjepa.csv
     frames_per_clip: 32
     frames_per_second: 8
     motion_shift: false
@@ -167,10 +167,31 @@ experiment:
     alpha: 16.0
     dropout: 0.05
     train_heads: true
-    pretrained_probe: /scratch/yh6416/VJEPA2-EXP/outputs/ek100_vitg384_probe/action_anticipation_frozen/ek100-vitg16-384/latest.pt
+    pretrained_probe: /path/to/VJEPA2-EXP/outputs/ek100_vitg384_probe/action_anticipation_frozen/ek100-vitg16-384/latest.pt
     align_reference_metrics: true
+    gaze:
+      mode: none
+      gaze_root: /path/to/VJEPA2-EXP/data/raw/HD-EPIC/SLAM-and-Gaze
+      extract_root: /path/to/VJEPA2-EXP/outputs/hdepic_gaze_token_gate/extracted
+      sync_root: /path/to/VJEPA2-EXP/data/raw/HD-EPIC/HD-EPIC/Videos
+      gamma: 0.7
+      sigma_px: 40.0
+      use_motion: false
+      traj_len: 1024
+      rnn:
+        hidden_dim: 256
+        num_layers: 2
+        bidirectional: true
+        dropout: 0.1
+        num_tokens: 64
+        gaze_lr_mult: 5.0
+      hidden_dump:
+        enabled: false
+        max_batches: 4
+    prediction_dump:
+      enabled: false
 model_kwargs:
-  checkpoint: /scratch/yh6416/VJEPA2-EXP/checkpoints/vitg-384.pt
+  checkpoint: /path/to/VJEPA2-EXP/checkpoints/vitg-384.pt
   module_name: app.hdepic_lora_action_anticipation.modelcustom.vit_encoder_predictor_rollout
   wrapper_kwargs:
     no_predictor: false

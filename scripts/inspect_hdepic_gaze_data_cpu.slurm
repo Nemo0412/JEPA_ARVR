@@ -1,15 +1,15 @@
 #!/bin/bash
 #SBATCH --job-name=VJEPA2-EXP__hdepic_gaze_scan
-#SBATCH --account=YOUR_SLURM_ACCOUNT
+#SBATCH --account=torch_pr_674_tandon_advanced
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16GB
 #SBATCH --time=01:00:00
-#SBATCH --output=/scratch/yh6416/VJEPA2-EXP/logs/hdepic_gaze_scan_%j.out
-#SBATCH --error=/scratch/yh6416/VJEPA2-EXP/logs/hdepic_gaze_scan_%j.err
+#SBATCH --output=/path/to/VJEPA2-EXP/logs/hdepic_gaze_scan_%j.out
+#SBATCH --error=/path/to/VJEPA2-EXP/logs/hdepic_gaze_scan_%j.err
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=YOUR_EMAIL@example.com
+#SBATCH --mail-user=<email>
 
 set -euo pipefail
 
@@ -17,7 +17,7 @@ set -euo pipefail
 # payload. It updates the official downloader repo, reads its md5 manifest, and
 # scans local files/annotations for gaze or gaze-priming artifacts.
 
-PROJECT_ROOT="${PROJECT_ROOT:-/scratch/yh6416/VJEPA2-EXP}"
+PROJECT_ROOT="${PROJECT_ROOT:-/path/to/VJEPA2-EXP}"
 SIF="${SIF:-/share/apps/images/cuda12.1.1-cudnn8.9.0-devel-ubuntu22.04.2.sif}"
 OVERLAY="${OVERLAY:-${PROJECT_ROOT}/overlay-15GB-500K.ext3}"
 ENV_NAME="${ENV_NAME:-EgoLifeExp}"

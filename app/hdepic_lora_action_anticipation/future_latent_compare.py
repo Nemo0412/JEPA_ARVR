@@ -11,7 +11,6 @@ import argparse
 import csv
 import json
 import logging
-import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +21,16 @@ from decord import VideoReader, cpu
 from torch.utils.data import DataLoader, Dataset
 
 from app.hdepic_lora_action_anticipation.eval import Top3AccuracyRecallAt5, _make_lora_init_classifier
+from app.hdepic_lora_action_anticipation.binary_input_adapter import (
+    BinaryGazeMapBuilder,
+    BinaryMapInputAdapter,
+)
+from app.hdepic_lora_action_anticipation.gaze import GazeTokenGate
+from app.hdepic_lora_action_anticipation.gaze_rnn import (
+    GazeTrajectoryLoader,
+    call_classifier,
+    encode_gaze_tokens,
+)
 from evals.action_anticipation_frozen.dataloader import filter_annotations, make_transforms
 from src.utils.checkpoint_loader import robust_checkpoint_loader
 
@@ -44,7 +53,7 @@ class FutureOracleDataset(Dataset):
         samples: list[FutureSample],
         horizon_sec: float,
         frames_per_clip: int,
-        fps: int,
+        fps: float,
         anticipation_point: tuple[float, float],
         resolution: int,
         drop_incomplete_history: bool,
@@ -53,7 +62,7 @@ class FutureOracleDataset(Dataset):
         self.samples = samples[:max_samples] if max_samples else samples
         self.horizon_sec = float(horizon_sec)
         self.frames_per_clip = int(frames_per_clip)
-        self.fps = int(fps)
+        self.fps = float(fps)
         self.anticipation_point = anticipation_point
         self.transform = make_transforms(training=False, crop_size=resolution)
         self.drop_incomplete_history = bool(drop_incomplete_history)
@@ -99,17 +108,21 @@ class FutureOracleDataset(Dataset):
         n_total = len(vr)
         if n_total > 0:
             indices[indices >= n_total] = n_total - 1
-        return self.transform(vr.get_batch(indices).asnumpy())
+        clip = self.transform(vr.get_batch(indices).asnumpy())
+        return clip, indices
 
     def __getitem__(self, idx: int):
         sample = self.samples[idx]
         vr = VideoReader(sample.video_path, num_threads=1, ctx=cpu(0))
         vr.seek(0)
         vfps = float(vr.get_avg_fps())
+        frame_shape = vr.next().shape  # (H, W, C); next() avoids decoding all metadata
+        h0, w0 = int(frame_shape[0]), int(frame_shape[1])
+        vr.seek(0)
         anchor = self._anchor_frame(sample)
         observed_end = anchor - int(self.horizon_sec * vfps)
-        obs = self._decode_clip(vr, vfps, observed_end)
-        oracle = self._decode_clip(vr, vfps, anchor)
+        obs, obs_indices = self._decode_clip(vr, vfps, observed_end)
+        oracle, oracle_indices = self._decode_clip(vr, vfps, anchor)
         return {
             "observed": obs,
             "oracle": oracle,
@@ -123,6 +136,11 @@ class FutureOracleDataset(Dataset):
                 "anchor_frame": anchor,
                 "observed_end_frame": observed_end,
                 "horizon_sec": self.horizon_sec,
+                "frame_indices": obs_indices.tolist(),
+                "oracle_frame_indices": oracle_indices.tolist(),
+                "vfps": vfps,
+                "height": h0,
+                "width": w0,
             },
         }
 
@@ -205,7 +223,11 @@ def _load_encoder_predictor(cfg: dict, device: torch.device):
 
 def _load_classifiers(cfg: dict, annotations: dict, embed_dim: int, device: torch.device):
     lora_cfg = cfg["experiment"].get("lora", {})
-    factory = _make_lora_init_classifier(lora_cfg)
+    gaze_cfg = dict(lora_cfg.get("gaze", {}))
+    gaze_mode = str(gaze_cfg.get("mode", "none")).lower()
+    traj_mode = gaze_mode if gaze_mode in {"rnn_fuse", "mlp_fuse"} else None
+    rnn_cfg = dict(gaze_cfg.get("rnn", {}))
+    factory = _make_lora_init_classifier(lora_cfg, traj_mode=traj_mode, rnn_cfg=rnn_cfg)
     classifiers = factory(
         embed_dim=embed_dim,
         num_heads=cfg["experiment"]["classifier"]["num_heads"],
@@ -233,13 +255,14 @@ def _last_layer(tokens: torch.Tensor, embed_dim: int) -> torch.Tensor:
 def _predict_direct(encoder, predictor, observed_tokens, horizon_sec, cfg, device, dense: bool = False):
     data_cfg = cfg["experiment"]["data"]
     wrapper_cfg = cfg["model_kwargs"].get("wrapper_kwargs", {})
+    downsample_factor = float(data_cfg.get("video_downsample_factor", 1.0) or 1.0)
     B, N, _ = observed_tokens.shape
     grid = data_cfg["resolution"] // encoder.patch_size
     spatial = grid * grid
     tubelet = encoder.tubelet_size
     num_output_frames = max(int(wrapper_cfg.get("num_output_frames", 2)), tubelet)
     n_pred = int(spatial * (num_output_frames // tubelet))
-    anticipation_steps = int(horizon_sec * data_cfg["frames_per_second"] / tubelet)
+    anticipation_steps = int((horizon_sec / downsample_factor) * data_cfg["frames_per_second"] / tubelet)
     start = N + spatial * anticipation_steps
     mask_start = N if dense else start
     mask_tokens = (start - N) + n_pred if dense else n_pred
@@ -267,6 +290,7 @@ def _predict_direct(encoder, predictor, observed_tokens, horizon_sec, cfg, devic
 def _predict_ar(encoder, predictor, observed_tokens, horizon_sec, cfg, device):
     data_cfg = cfg["experiment"]["data"]
     wrapper_cfg = cfg["model_kwargs"].get("wrapper_kwargs", {})
+    downsample_factor = float(data_cfg.get("video_downsample_factor", 1.0) or 1.0)
     B, N, _ = observed_tokens.shape
     grid = data_cfg["resolution"] // encoder.patch_size
     spatial = grid * grid
@@ -275,7 +299,7 @@ def _predict_ar(encoder, predictor, observed_tokens, horizon_sec, cfg, device):
     n_pred = int(spatial * (num_output_frames // tubelet))
     local_x = torch.arange(N, device=device).unsqueeze(0).repeat(B, 1)
     local_y = torch.arange(n_pred, device=device).unsqueeze(0).repeat(B, 1) + N
-    horizon_chunks = int(horizon_sec * data_cfg["frames_per_second"] / tubelet)
+    horizon_chunks = int((horizon_sec / downsample_factor) * data_cfg["frames_per_second"] / tubelet)
     rollout_steps = max(1, horizon_chunks + (num_output_frames // tubelet))
     max_steps = int(wrapper_cfg.get("max_rollout_steps", 512))
     if rollout_steps > max_steps:
@@ -314,10 +338,17 @@ def _metric_pack(annotations: dict, device: torch.device):
     }
 
 
-def _update_metrics(metrics, outputs, labels, annotations):
-    metrics["verb"](outputs["verb"], labels["verb"], annotations["val_verbs"])
-    metrics["noun"](outputs["noun"], labels["noun"], annotations["val_nouns"])
-    metrics["action"](outputs["action"], labels["action"], annotations["val_actions"])
+def _update_metrics(metrics, outputs, labels, annotations, metric_scope: str = "native"):
+    if metric_scope == "filtered":
+        metrics["verb"](outputs["verb"], labels["verb"], annotations["val_verbs"])
+        metrics["noun"](outputs["noun"], labels["noun"], annotations["val_nouns"])
+        metrics["action"](outputs["action"], labels["action"], annotations["val_actions"])
+    elif metric_scope == "native":
+        metrics["verb"](outputs["verb"], labels["verb"])
+        metrics["noun"](outputs["noun"], labels["noun"])
+        metrics["action"](outputs["action"], labels["action"])
+    else:
+        raise ValueError(f"Unsupported metric_scope={metric_scope!r}; expected native or filtered")
 
 
 def _metric_values(metric: Top3AccuracyRecallAt5):
@@ -337,6 +368,44 @@ def _final_metrics(metrics):
     return out
 
 
+def _select_head_metrics(metrics_per_head, head_selection: str):
+    per_head = []
+    for idx, metric_pack in enumerate(metrics_per_head):
+        vals = _final_metrics(metric_pack)
+        vals["head"] = idx
+        per_head.append(vals)
+
+    if not per_head:
+        return None, {}, {}
+
+    metric_keys = [
+        "action_top3",
+        "action_recall5",
+        "verb_top3",
+        "verb_recall5",
+        "noun_top3",
+        "noun_recall5",
+    ]
+    action_head = max(per_head, key=lambda row: row["action_top3"])
+    selected_heads = {}
+
+    if head_selection == "action_top3":
+        report = {key: action_head[key] for key in metric_keys}
+        for key in metric_keys:
+            selected_heads[f"{key}_head"] = int(action_head["head"])
+        return int(action_head["head"]), report, selected_heads
+
+    if head_selection != "vjepa2":
+        raise ValueError(f"Unsupported head_selection={head_selection!r}; expected vjepa2 or action_top3")
+
+    report = {}
+    for key in metric_keys:
+        best = max(per_head, key=lambda row: row[key])
+        report[key] = best[key]
+        selected_heads[f"{key}_head"] = int(best["head"])
+    return int(action_head["head"]), report, selected_heads
+
+
 def _latent_stats(pred: torch.Tensor, oracle: torch.Tensor):
     pred_f = pred.float()
     oracle_f = oracle.float()
@@ -345,21 +414,103 @@ def _latent_stats(pred: torch.Tensor, oracle: torch.Tensor):
     return mse, cos
 
 
+def _collate(batch):
+    out = {
+        "observed": torch.stack([b["observed"] for b in batch], dim=0),
+        "oracle": torch.stack([b["oracle"] for b in batch], dim=0),
+        "verb_raw": torch.stack([b["verb_raw"] for b in batch], dim=0),
+        "noun_raw": torch.stack([b["noun_raw"] for b in batch], dim=0),
+        "metadata": [b["metadata"] for b in batch],
+    }
+    return out
+
+
+def _build_gaze_components(cfg, classifiers, device):
+    """Construct gaze runtime components from cfg + checkpoint, if a gaze mode is set.
+
+    Returns a dict with keys:
+        - mode: "none" | "binary_input_adapter" | "rnn_fuse" | "mlp_fuse"
+        - adapter: BinaryMapInputAdapter | None
+        - map_builder: BinaryGazeMapBuilder | None
+        - traj_loader: GazeTrajectoryLoader | None
+    """
+    lora_cfg = cfg.get("experiment", {}).get("lora", {})
+    gaze_cfg = dict(lora_cfg.get("gaze", {}))
+    mode = str(gaze_cfg.get("mode", "none")).lower()
+    out = {"mode": mode, "adapter": None, "map_builder": None, "traj_loader": None}
+    if mode == "none":
+        return out
+
+    data_cfg = cfg.get("experiment", {}).get("data", {})
+    enc_kwargs = cfg["model_kwargs"]["pretrain_kwargs"]["encoder"]
+    gaze_cfg.setdefault("crop_size", data_cfg.get("resolution", 384))
+    gaze_cfg.setdefault("frames_per_clip", data_cfg.get("frames_per_clip", 32))
+    gaze_cfg.setdefault("patch_size", enc_kwargs.get("patch_size", 16))
+    gaze_cfg.setdefault("tubelet_size", enc_kwargs.get("tubelet_size", 2))
+
+    if mode == "binary_input_adapter":
+        ad_cfg = dict(gaze_cfg.get("input_adapter", {}))
+        adapter = BinaryMapInputAdapter(
+            hidden_dim=int(ad_cfg.get("hidden_dim", 8)),
+            scale=float(ad_cfg.get("scale", 1.0)),
+            temporal_kernel=int(ad_cfg.get("temporal_kernel", 1)),
+            binary_center=float(ad_cfg.get("binary_center", 0.0)),
+            residual_clamp=float(ad_cfg.get("residual_clamp", 1.0)),
+        ).to(device).eval()
+        for p in adapter.parameters():
+            p.requires_grad = False
+        ckpt_path = Path(cfg["folder"]) / "action_anticipation_frozen" / cfg["tag"] / "binary_input_adapter_latest.pt"
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"binary_input_adapter checkpoint not found: {ckpt_path}")
+        ckpt = robust_checkpoint_loader(str(ckpt_path), map_location=torch.device("cpu"))
+        state = ckpt.get("input_adapter", ckpt)
+        if any(str(k).startswith("module.input_adapter.") for k in state):
+            state = {str(k).removeprefix("module.input_adapter."): v for k, v in state.items() if str(k).startswith("module.input_adapter.")}
+        elif any(str(k).startswith("input_adapter.") for k in state):
+            state = {str(k).removeprefix("input_adapter."): v for k, v in state.items() if str(k).startswith("input_adapter.")}
+        missing, unexpected = adapter.load_state_dict(state, strict=False)
+        logger.info("Loaded binary_input_adapter from %s missing=%d unexpected=%d", ckpt_path, len(missing), len(unexpected))
+        gate = GazeTokenGate({**gaze_cfg, "mode": "token_gate"})
+        map_builder = BinaryGazeMapBuilder(gaze_cfg, gate=gate)
+        out["adapter"] = adapter
+        out["map_builder"] = map_builder
+        return out
+
+    if mode in {"rnn_fuse", "mlp_fuse"}:
+        gate = GazeTokenGate({**gaze_cfg, "mode": mode})
+        traj_loader = GazeTrajectoryLoader(gaze_cfg, gate=gate)
+        out["traj_loader"] = traj_loader
+        return out
+
+    raise ValueError(f"Unsupported gaze mode for future_latent_compare: {mode}")
+
+
 @torch.no_grad()
-def run_horizon(args, cfg, annotations, samples, encoder, predictor, classifiers, device, horizon: float):
+def run_horizon(args, cfg, annotations, samples, encoder, predictor, classifiers, device, horizon: float, gaze_components: dict | None = None):
     data_cfg = cfg["experiment"]["data"]
+    downsample_factor = float(data_cfg.get("video_downsample_factor", 1.0) or 1.0)
     ds = FutureOracleDataset(
         samples=samples,
         horizon_sec=horizon,
         frames_per_clip=data_cfg["frames_per_clip"],
-        fps=data_cfg["frames_per_second"],
+        fps=float(data_cfg["frames_per_second"]) / downsample_factor,
         anticipation_point=tuple(data_cfg.get("val_anticipation_point", [0.0, 0.0])),
         resolution=data_cfg["resolution"],
         drop_incomplete_history=args.drop_incomplete_history,
         max_samples=args.max_samples,
     )
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+    loader = DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=_collate,
+    )
     logger.info("Running horizon %.3fs over %d samples", horizon, len(ds))
+    metric_scope = str(args.metric_scope).lower()
+    head_selection = str(args.head_selection).lower()
+    logger.info("Metric scope: %s head_selection: %s", metric_scope, head_selection)
 
     methods = ["encoder", "direct_single", "direct_dense", "ar", "oracle"]
     metrics = {m: [_metric_pack(annotations, device) for _ in classifiers] for m in methods}
@@ -367,12 +518,30 @@ def run_horizon(args, cfg, annotations, samples, encoder, predictor, classifiers
     status_counts: dict[str, int] = {}
     sample_count = 0
     use_bfloat16 = bool(cfg["experiment"]["optimization"].get("use_bfloat16", False)) and device.type == "cuda"
+    gaze_components = gaze_components or {"mode": "none"}
+    gaze_mode = gaze_components.get("mode", "none")
+    adapter = gaze_components.get("adapter")
+    map_builder = gaze_components.get("map_builder")
+    traj_loader = gaze_components.get("traj_loader")
 
     for batch_idx, batch in enumerate(loader):
         observed = batch["observed"].to(device, non_blocking=True)
         oracle_clip = batch["oracle"].to(device, non_blocking=True)
+        metadata = batch["metadata"]
         labels = _labels(batch, annotations, device)
         with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
+            if gaze_mode == "binary_input_adapter" and adapter is not None and map_builder is not None:
+                obs_meta = [
+                    {**m, "frame_indices": m.get("frame_indices")} for m in metadata
+                ]
+                oracle_meta = [
+                    {**m, "frame_indices": m.get("oracle_frame_indices", m.get("frame_indices"))}
+                    for m in metadata
+                ]
+                obs_map = map_builder.build(observed, obs_meta)
+                oracle_map = map_builder.build(oracle_clip, oracle_meta)
+                observed = adapter(observed, obs_map)
+                oracle_clip = adapter(oracle_clip, oracle_map)
             observed_tokens = encoder(observed)
             observed_last = _last_layer(observed_tokens, encoder.embed_dim)
             oracle_tokens = encoder(oracle_clip)
@@ -413,25 +582,27 @@ def run_horizon(args, cfg, annotations, samples, encoder, predictor, classifiers
 
             for method, target in target_by_method.items():
                 tokens_by_method[method] = torch.cat([observed_last, target], dim=1)
+            gaze_tokens_per_classifier = [None] * len(classifiers)
+            if gaze_mode in {"rnn_fuse", "mlp_fuse"} and traj_loader is not None:
+                for idx, classifier in enumerate(classifiers):
+                    gaze_tokens_per_classifier[idx] = encode_gaze_tokens(
+                        classifier,
+                        metadata,
+                        traj_loader,
+                        device,
+                        video_tokens=observed_last if traj_loader.use_video_tokens else None,
+                    )
             for method, tokens in tokens_by_method.items():
                 for idx, classifier in enumerate(classifiers):
-                    outputs = classifier(tokens)
-                    _update_metrics(metrics[method][idx], outputs, labels, annotations)
+                    outputs = call_classifier(classifier, tokens, gaze_tokens_per_classifier[idx])
+                    _update_metrics(metrics[method][idx], outputs, labels, annotations, metric_scope)
         sample_count += observed.size(0)
         if batch_idx % args.log_every == 0:
             logger.info("horizon %.3fs batch %d samples=%d statuses=%s", horizon, batch_idx, sample_count, status_counts)
 
     rows = []
     for method in methods:
-        best_idx = None
-        best_action = -math.inf
-        best_metrics = None
-        for idx, metric_pack in enumerate(metrics[method]):
-            vals = _final_metrics(metric_pack)
-            if vals["action_top3"] > best_action:
-                best_idx = idx
-                best_action = vals["action_top3"]
-                best_metrics = vals
+        action_top3_head, report_metrics, selected_heads = _select_head_metrics(metrics[method], head_selection)
         latent_mse = ""
         latent_cos = ""
         if method in latent_rows and latent_rows[method]:
@@ -444,13 +615,18 @@ def run_horizon(args, cfg, annotations, samples, encoder, predictor, classifiers
             status = "ok" if ok == sample_count else f"partial_ok_{ok}_of_{sample_count}"
         row = {
             "horizon_sec": horizon,
+            "metric_scope": metric_scope,
+            "head_selection": head_selection,
+            "metric_aggregation": "metric_wise_max" if head_selection == "vjepa2" else "action_top3_single_head",
             "method": method,
             "status": status,
             "samples": sample_count,
-            "best_classifier": best_idx,
+            "best_classifier": action_top3_head,
             "latent_mse_to_oracle": latent_mse,
             "latent_cos_to_oracle": latent_cos,
-            **(best_metrics or {}),
+            **report_metrics,
+            **selected_heads,
+            "selected_heads_json": json.dumps(selected_heads, sort_keys=True),
             "status_counts": json.dumps(status_counts, sort_keys=True),
         }
         rows.append(row)
@@ -467,6 +643,8 @@ def parse_args():
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--drop-incomplete-history", action="store_true")
     parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument("--metric-scope", choices=["native", "filtered"], default="native")
+    parser.add_argument("--head-selection", choices=["vjepa2", "action_top3"], default="vjepa2")
     return parser.parse_args()
 
 
@@ -487,11 +665,17 @@ def main():
     samples = _build_samples(annotations["val"])
     encoder, predictor = _load_encoder_predictor(cfg, device)
     classifiers = _load_classifiers(cfg, annotations, encoder.embed_dim, device)
+    gaze_components = _build_gaze_components(cfg, classifiers, device)
+    logger.info("Gaze mode: %s", gaze_components["mode"])
 
     horizons = [float(x) for x in args.horizons.replace(",", " ").split()]
     rows = []
     for horizon in horizons:
-        rows.extend(run_horizon(args, cfg, annotations, samples, encoder, predictor, classifiers, device, horizon))
+        rows.extend(
+            run_horizon(
+                args, cfg, annotations, samples, encoder, predictor, classifiers, device, horizon, gaze_components,
+            )
+        )
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

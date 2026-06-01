@@ -1,15 +1,15 @@
 #!/bin/bash
 #SBATCH --job-name=VJEPA2-EXP__hdepic_refresh_csv
-#SBATCH --account=YOUR_SLURM_ACCOUNT
+#SBATCH --account=torch_pr_674_tandon_advanced
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32GB
 #SBATCH --time=04:00:00
-#SBATCH --output=/scratch/yh6416/VJEPA2-EXP/logs/hdepic_refresh_csv_%j.out
-#SBATCH --error=/scratch/yh6416/VJEPA2-EXP/logs/hdepic_refresh_csv_%j.err
+#SBATCH --output=/path/to/VJEPA2-EXP/logs/hdepic_refresh_csv_%j.out
+#SBATCH --error=/path/to/VJEPA2-EXP/logs/hdepic_refresh_csv_%j.err
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=YOUR_EMAIL@example.com
+#SBATCH --mail-user=<email>
 
 set -euo pipefail
 
@@ -20,7 +20,7 @@ set -euo pipefail
 #   sbatch --export=ALL,INCLUDE_PARTICIPANTS=P01,VAL_PARTICIPANTS=,VAL_RATIO=0.2 scripts/refresh_hdepic_vjepa_annotations.slurm
 #   sbatch --export=ALL,INCLUDE_PARTICIPANTS="P01 P02",VAL_PARTICIPANTS=P02 scripts/refresh_hdepic_vjepa_annotations.slurm
 
-PROJECT_ROOT="${PROJECT_ROOT:-/scratch/yh6416/VJEPA2-EXP}"
+PROJECT_ROOT="${PROJECT_ROOT:-/path/to/VJEPA2-EXP}"
 SIF="${SIF:-/share/apps/images/cuda12.1.1-cudnn8.9.0-devel-ubuntu22.04.2.sif}"
 OVERLAY="${OVERLAY:-${PROJECT_ROOT}/overlay-15GB-500K.ext3}"
 ENV_NAME="${ENV_NAME:-EgoLifeExp}"

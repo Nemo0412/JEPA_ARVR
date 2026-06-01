@@ -1,0 +1,19 @@
+#!/bin/sh
+
+limit=$((95 * 1024 * 1024))
+
+git diff --cached --name-only --diff-filter=AM | while read -r file; do
+  [ -f "$file" ] || continue
+
+  size=$(wc -c < "$file" | tr -d " ")
+
+  if [ "$size" -gt "$limit" ]; then
+    echo "ERROR: File is larger than 95 MB and should not be committed:"
+    echo "  $file"
+    echo "  size: $size bytes"
+    echo
+    echo "GitHub rejects files over 100 MB."
+    echo "Move it elsewhere, compress/split it, or use Git LFS."
+    exit 1
+  fi
+done

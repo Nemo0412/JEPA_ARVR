@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import csv
+import faulthandler
+import gc
 import json
 import logging
 import math
@@ -18,6 +20,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import webdataset as wds
 from decord import VideoReader, cpu
@@ -25,6 +28,8 @@ from torch.utils.data import get_worker_info
 from evals.action_anticipation_frozen.epickitchens import DataInfo, split_by_node
 from src.datasets.utils.worker_init_fn import pl_worker_init_function
 from src.utils.logging import AverageMeter
+
+from app.hdepic_lora_action_anticipation.binary_map_utils import normalize_map_type, rasterize_gaze_disk
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +71,8 @@ class ClipBalancedDecodeVideosToClips(wds.PipelineStage):
         drop_incomplete_history=False,
         epoch=None,
         label_horizon_schedule=None,
+        cache_reader=True,
+        decoder_num_threads=-1,
     ):
         self.frames_per_clip = frames_per_clip
         self.fps = fps
@@ -76,24 +83,92 @@ class ClipBalancedDecodeVideosToClips(wds.PipelineStage):
         self.emit_metadata = emit_metadata
         self.emit_binary_map = emit_binary_map
         self.binary_map_cfg = dict(binary_map_cfg or {})
+        self.binary_map_type = normalize_map_type(self.binary_map_cfg.get("binary_map_type", self.binary_map_cfg.get("map_type", "binary")))
         self.drop_incomplete_history = drop_incomplete_history
         self.epoch = epoch
         self.label_horizon_schedule = list(label_horizon_schedule or [])
+        self.cache_reader = bool(cache_reader)
+        self.decoder_num_threads = int(decoder_num_threads)
         self._reader_path: str | None = None
         self._reader_state: tuple[VideoReader, float, int] | None = None
         self._binary_gate = None
         self._binary_grid_cache: dict[tuple[int, int, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._worker_diagnostics_enabled = False
+        self._aug_aware = bool(self.binary_map_cfg.get("aug_aware", False)) and self.emit_binary_map
+        self._aug_aware_transform = None
+        self._aug_aware_training = bool(self.binary_map_cfg.get("aug_aware_training", False))
+        if self._aug_aware:
+            from app.hdepic_lora_action_anticipation.binary_map_aug import BinaryMapAwareTransform
+
+            cfg = self.binary_map_cfg
+            self._aug_aware_transform = BinaryMapAwareTransform(
+                training=self._aug_aware_training,
+                crop_size=int(cfg.get("crop_size", 384)),
+                radius_px=float(cfg.get("binary_radius_px", cfg.get("binary_radius", 64.0))),
+                map_type=self.binary_map_type,
+                random_resize_scale=tuple(cfg.get("random_resize_scale", (0.08, 1.0))),
+                random_resize_aspect_ratio=tuple(cfg.get("random_resize_aspect_ratio", (3.0 / 4.0, 4.0 / 3.0))),
+                random_horizontal_flip=bool(cfg.get("random_horizontal_flip", True)),
+                auto_augment=bool(cfg.get("auto_augment", True)),
+                reprob=float(cfg.get("reprob", 0.25)),
+            )
+
+    def _release_reader(self):
+        self._reader_path = None
+        self._reader_state = None
+        gc.collect()
+
+    def _ensure_worker_diagnostics(self):
+        if not hasattr(self, "_worker_diagnostics_enabled"):
+            self._worker_diagnostics_enabled = False
+        if self._worker_diagnostics_enabled:
+            return
+        try:
+            faulthandler.enable(all_threads=True)
+        except Exception:
+            logger.debug("Could not enable faulthandler in dataloader worker", exc_info=True)
+        self._worker_diagnostics_enabled = True
+
+    def _trace_sample(self, event: str, payload: dict[str, Any]):
+        trace_dir = os.environ.get("GAZE_DATALOADER_TRACE_DIR", "").strip()
+        if not trace_dir:
+            return
+        info = get_worker_info()
+        worker_id = info.id if info is not None else 0
+        record = {
+            "time": time.time(),
+            "pid": os.getpid(),
+            "worker_id": worker_id,
+            "event": event,
+            **payload,
+        }
+        try:
+            root = Path(trace_dir)
+            root.mkdir(parents=True, exist_ok=True)
+            (root / f"clip_balanced_worker_{worker_id}_last_sample.json").write_text(
+                json.dumps(record, sort_keys=True),
+                encoding="utf-8",
+            )
+            if os.environ.get("GAZE_DATALOADER_TRACE_EVENTS", "0").lower() in {"1", "true", "yes", "on"}:
+                with (root / f"clip_balanced_worker_{worker_id}_events.jsonl").open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, sort_keys=True) + "\n")
+        except Exception:
+            logger.debug("Could not write dataloader trace breadcrumb", exc_info=True)
 
     def _reader(self, path: str):
-        if self._reader_path == path and self._reader_state is not None:
+        if self.cache_reader and self._reader_path == path and self._reader_state is not None:
             return self._reader_state
-        vr = VideoReader(path, num_threads=-1, ctx=cpu(0))
+        if self._reader_state is not None:
+            self._release_reader()
+        vr = VideoReader(path, num_threads=self.decoder_num_threads, ctx=cpu(0))
         vr.seek(0)
         vfps = float(vr.get_avg_fps())
         nframes_total = len(vr)
-        self._reader_path = path
-        self._reader_state = (vr, vfps, nframes_total)
-        return self._reader_state
+        state = (vr, vfps, nframes_total)
+        if self.cache_reader:
+            self._reader_path = path
+            self._reader_state = state
+        return state
 
     def _sample_anticipation_range(self):
         if not self.label_horizon_schedule:
@@ -153,73 +228,207 @@ class ClipBalancedDecodeVideosToClips(wds.PipelineStage):
         xy_t = torch.as_tensor(xy[:nframes], dtype=video.dtype)
         x = xy_t[:, 0].view(nframes, 1, 1) * (width - 1) / max(1, crop_size - 1)
         y = xy_t[:, 1].view(nframes, 1, 1) * (height - 1) / max(1, crop_size - 1)
-        binary_map[0, :nframes] = (((xx - x) ** 2 + (yy - y) ** 2) <= radius_px**2).to(video.dtype)
+        map_type = getattr(
+            self,
+            "binary_map_type",
+            normalize_map_type(self.binary_map_cfg.get("binary_map_type", self.binary_map_cfg.get("map_type", "binary"))),
+        )
+        binary_map[0, :nframes] = rasterize_gaze_disk(
+            xx,
+            yy,
+            x,
+            y,
+            radius_px,
+            map_type=map_type,
+            dtype=video.dtype,
+        )
         return binary_map
 
     def run(self, src):
-        for item in src:
-            try:
-                path = str(item["video_path"])
-                video_id = str(item["video_id"])
-                sf = int(item["start_frame"])
-                ef = int(item["stop_frame"])
-                labels_verb = int(item["verb_class"])
-                labels_noun = int(item["noun_class"])
-                vr, vfps, nframes_total = self._reader(path)
-                frame_step = max(1, int(vfps / self.fps))
-                nframes = int(self.frames_per_clip * frame_step)
-                sample_at = float(np.random.uniform(*self._sample_anticipation_range()))
-                model_at = float(np.random.uniform(*self.model_anticipation_time))
-                aframes = int(sample_at * vfps)
-                ap = float(np.random.uniform(*self.anticipation_point))
-                af = int(sf * ap + (1 - ap) * ef - aframes)
-                if self.drop_incomplete_history and af - nframes < 0:
+        self._ensure_worker_diagnostics()
+        try:
+            for item in src:
+                try:
+                    path = str(item["video_path"])
+                    video_id = str(item["video_id"])
+                    sf = int(item["start_frame"])
+                    ef = int(item["stop_frame"])
+                    labels_verb = int(item["verb_class"])
+                    labels_noun = int(item["noun_class"])
+                    vr, vfps, nframes_total = self._reader(path)
+                    frame_step = max(1, int(vfps / self.fps))
+                    nframes = int(self.frames_per_clip * frame_step)
+                    sample_at = float(np.random.uniform(*self._sample_anticipation_range()))
+                    model_at = float(np.random.uniform(*self.model_anticipation_time))
+                    aframes = int(sample_at * vfps)
+                    ap = float(np.random.uniform(*self.anticipation_point))
+                    af = int(sf * ap + (1 - ap) * ef - aframes)
+                    if self.drop_incomplete_history and af - nframes < 0:
+                        continue
+                    indices = np.arange(af - nframes, af, frame_step).astype(np.int64)
+                    indices[indices < 0] = 0
+                    if nframes_total > 0:
+                        indices[indices >= nframes_total] = nframes_total - 1
+                    self._trace_sample(
+                        "before_decode",
+                        {
+                            "video_id": video_id,
+                            "video_path": path,
+                            "video_index": int(item.get("video_index", -1)),
+                            "action_index": int(item.get("action_index", -1)),
+                            "start_frame": sf,
+                            "stop_frame": ef,
+                            "vfps": vfps,
+                            "frame_count": nframes_total,
+                            "indices_first": int(indices[0]) if len(indices) else None,
+                            "indices_last": int(indices[-1]) if len(indices) else None,
+                            "indices_len": int(len(indices)),
+                            "cache_reader": self.cache_reader,
+                            "decoder_num_threads": self.decoder_num_threads,
+                        },
+                    )
+                    buffer = vr.get_batch(indices).asnumpy().copy()
+                    self._trace_sample(
+                        "after_decode",
+                        {
+                            "video_id": video_id,
+                            "video_path": path,
+                            "video_index": int(item.get("video_index", -1)),
+                            "action_index": int(item.get("action_index", -1)),
+                            "buffer_shape": list(buffer.shape),
+                            "buffer_dtype": str(buffer.dtype),
+                        },
+                    )
+                    if not self.cache_reader:
+                        del vr
+                except Exception as exc:
+                    self._trace_sample("decode_exception", {"error": repr(exc)})
+                    logging.info("Encountered exception decoding clip-balanced sample: %r", exc)
                     continue
-                indices = np.arange(af - nframes, af, frame_step).astype(np.int64)
-                indices[indices < 0] = 0
-                if nframes_total > 0:
-                    indices[indices >= nframes_total] = nframes_total - 1
-                buffer = vr.get_batch(indices).asnumpy()
-            except Exception as exc:
-                logging.info("Encountered exception decoding clip-balanced sample: %r", exc)
-                continue
 
-            height, width = int(buffer.shape[1]), int(buffer.shape[2])
-            if self.transform is not None:
-                buffer = self.transform(buffer)
+                height, width = int(buffer.shape[1]), int(buffer.shape[2])
+                aug_aware_binary = None
+                if self._aug_aware and self._aug_aware_transform is not None:
+                    from app.hdepic_lora_action_anticipation.binary_map_aug import query_resized_xy
 
-            out = {
-                "video": buffer,
-                "verb": labels_verb,
-                "noun": labels_noun,
-                "anticipation_time": model_at,
-            }
-            if self.emit_metadata:
-                out["metadata"] = {
-                    "video_id": video_id,
-                    "video_path": path,
-                    "frame_indices": indices.tolist(),
-                    "vfps": vfps,
-                    "height": height,
-                    "width": width,
-                    "start_frame": sf,
-                    "stop_frame": ef,
-                    "anticipation_point": ap,
-                    "sample_anticipation_time": sample_at,
-                    "model_anticipation_time": model_at,
-                }
-            if self.emit_binary_map:
-                meta = out.get("metadata")
-                if meta is None:
-                    meta = {
+                    try:
+                        gate = self._get_binary_gate()
+                        record = gate._load_record(video_id)  # noqa: SLF001
+                        xy_resized = None
+                        resized_hw = None
+                        if record is not None:
+                            res = query_resized_xy(
+                                gate,
+                                record,
+                                indices.tolist(),
+                                vfps,
+                                height,
+                                width,
+                                int(self.binary_map_cfg.get("crop_size", 384)),
+                            )
+                            if res is not None:
+                                xy_resized, resized_hw = res
+                        rgb, aug_aware_binary = self._aug_aware_transform(buffer, xy_resized, resized_hw)
+                        buffer = rgb
+                    except Exception as exc:
+                        self._trace_sample(
+                            "transform_exception",
+                            {
+                                "video_id": video_id,
+                                "video_path": path,
+                                "video_index": int(item.get("video_index", -1)),
+                                "action_index": int(item.get("action_index", -1)),
+                                "error": repr(exc),
+                            },
+                        )
+                        raise
+                elif self.transform is not None:
+                    try:
+                        buffer = self.transform(buffer)
+                    except Exception as exc:
+                        self._trace_sample(
+                            "transform_exception",
+                            {
+                                "video_id": video_id,
+                                "video_path": path,
+                                "video_index": int(item.get("video_index", -1)),
+                                "action_index": int(item.get("action_index", -1)),
+                                "error": repr(exc),
+                            },
+                        )
+                        raise
+                self._trace_sample(
+                    "after_transform",
+                    {
                         "video_id": video_id,
+                        "video_path": path,
+                        "video_index": int(item.get("video_index", -1)),
+                        "action_index": int(item.get("action_index", -1)),
+                        "video_shape": list(buffer.shape) if hasattr(buffer, "shape") else None,
+                    },
+                )
+
+                out = {
+                    "video": buffer,
+                    "verb": labels_verb,
+                    "noun": labels_noun,
+                    "anticipation_time": model_at,
+                }
+                if self.emit_metadata:
+                    out["metadata"] = {
+                        "video_id": video_id,
+                        "video_path": path,
                         "frame_indices": indices.tolist(),
                         "vfps": vfps,
                         "height": height,
                         "width": width,
+                        "start_frame": sf,
+                        "stop_frame": ef,
+                        "anticipation_point": ap,
+                        "sample_anticipation_time": sample_at,
+                        "model_anticipation_time": model_at,
                     }
-                out["binary_map"] = self._build_binary_map(buffer, meta)
-            yield out
+                if self.emit_binary_map:
+                    if aug_aware_binary is not None:
+                        out["binary_map"] = aug_aware_binary
+                    else:
+                        meta = out.get("metadata")
+                        if meta is None:
+                            meta = {
+                                "video_id": video_id,
+                                "frame_indices": indices.tolist(),
+                                "vfps": vfps,
+                                "height": height,
+                                "width": width,
+                            }
+                        try:
+                            out["binary_map"] = self._build_binary_map(buffer, meta)
+                        except Exception as exc:
+                            self._trace_sample(
+                                "binary_map_exception",
+                                {
+                                    "video_id": video_id,
+                                    "video_path": path,
+                                    "video_index": int(item.get("video_index", -1)),
+                                    "action_index": int(item.get("action_index", -1)),
+                                    "error": repr(exc),
+                                },
+                            )
+                            raise
+                    self._trace_sample(
+                        "after_binary_map",
+                        {
+                            "video_id": video_id,
+                            "video_path": path,
+                            "video_index": int(item.get("video_index", -1)),
+                            "action_index": int(item.get("action_index", -1)),
+                            "binary_map_shape": list(out["binary_map"].shape),
+                        },
+                    )
+                yield out
+        finally:
+            self._trace_sample("stage_exit", {"reader_path": self._reader_path})
+            self._release_reader()
 
 
 def _metadata_collate(batch):
@@ -350,6 +559,33 @@ class ContiguousSplitByWorker(wds.PipelineStage):
         yield from items[start:end]
 
 
+def _load_debug_subset(debug_subset_path, training: bool) -> set[str] | None:
+    """Load the fixed video_id allowlist from a debug-subset JSON, or return None (disabled)."""
+    if not debug_subset_path:
+        return None
+    path = Path(str(debug_subset_path))
+    with path.open("r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    split_key = "train" if training else "val"
+    video_ids = cfg.get(split_key, {}).get("video_ids", [])
+    if not video_ids:
+        logger.warning(
+            "DEBUG_SUBSET: %s has no video_ids for split=%s (placeholder?); ignoring subset filter",
+            path,
+            split_key,
+        )
+        return None
+    id_set = set(str(v) for v in video_ids)
+    logger.warning(
+        "DEBUG_SUBSET ACTIVE (split=%s): restricting to %d videos from %s — "
+        "DO NOT use these results for teacher-facing reporting.",
+        split_key,
+        len(id_set),
+        path,
+    )
+    return id_set
+
+
 def make_clip_balanced_webvid(
     base_path,
     annotations_path,
@@ -371,15 +607,33 @@ def make_clip_balanced_webvid(
     binary_map_cfg=None,
     drop_incomplete_history=False,
     label_horizon_schedule=None,
+    cache_reader=None,
+    decoder_num_threads=None,
+    debug_subset_path=None,
     **kwargs,
 ):
     del base_path, kwargs
-    if emit_binary_map and training and bool((binary_map_cfg or {}).get("disable_train_aug", False)):
+    if emit_binary_map and binary_map_cfg is not None and bool(binary_map_cfg.get("aug_aware", False)):
+        binary_map_cfg = dict(binary_map_cfg)
+        binary_map_cfg["aug_aware_training"] = bool(training)
+        logger.info("Using aug-aware joint RGB+binary transform (training=%s)", training)
+    elif emit_binary_map and training and bool((binary_map_cfg or {}).get("disable_train_aug", False)):
         if hasattr(transform, "training"):
             transform.training = False
             logger.info("Disabled training video augmentation for binary-map alignment")
     paths, annotations = annotations_path
     samples = _build_clip_samples(paths, annotations)
+    debug_video_ids = _load_debug_subset(debug_subset_path, training=bool(training))
+    if debug_video_ids is not None:
+        before = len(samples)
+        samples = [s for s in samples if str(s["video_id"]) in debug_video_ids]
+        logger.warning(
+            "DEBUG_SUBSET: filtered samples %d -> %d (kept %d/%d videos)",
+            before,
+            len(samples),
+            len({s["video_id"] for s in samples}),
+            len(debug_video_ids),
+        )
     if drop_incomplete_history:
         samples = _filter_samples_with_full_history(
             samples,
@@ -392,6 +646,14 @@ def make_clip_balanced_webvid(
     from evals.action_anticipation_frozen.epickitchens import SharedEpoch
 
     epoch = SharedEpoch(epoch=0)
+    if cache_reader is None:
+        cache_reader = os.environ.get("GAZE_DECODER_CACHE_READER", "1").lower() not in {"0", "false", "no", "off"}
+    if decoder_num_threads is None:
+        decoder_threads_env = os.environ.get("GAZE_DECODER_NUM_THREADS")
+        if decoder_threads_env is not None:
+            decoder_num_threads = int(decoder_threads_env)
+        else:
+            decoder_num_threads = 1 if int(num_workers or 0) > 0 else -1
     decoder = ClipBalancedDecodeVideosToClips(
         frames_per_clip=frames_per_clip,
         fps=fps,
@@ -405,6 +667,8 @@ def make_clip_balanced_webvid(
         drop_incomplete_history=drop_incomplete_history,
         epoch=epoch,
         label_horizon_schedule=label_horizon_schedule,
+        cache_reader=cache_reader,
+        decoder_num_threads=decoder_num_threads,
     )
     if emit_binary_map:
         tuple_keys = ("video", "verb", "noun", "metadata", "anticipation_time", "binary_map")
@@ -436,12 +700,14 @@ def make_clip_balanced_webvid(
     dataloader.num_batches = len(samples) // (world_size * batch_size)
     dataloader.num_samples = len(samples)
     logger.info(
-        "Using clip-balanced HD-EPIC dataloader: samples=%d batch_size=%d workers=%d emit_metadata=%s emit_binary_map=%s",
+        "Using clip-balanced HD-EPIC dataloader: samples=%d batch_size=%d workers=%d emit_metadata=%s emit_binary_map=%s cache_reader=%s decoder_num_threads=%d",
         len(samples),
         batch_size,
         num_workers,
         emit_metadata,
         emit_binary_map,
+        cache_reader,
+        decoder_num_threads,
     )
     return dataset, dataloader, DataInfo(dataloader=dataloader, shared_epoch=epoch)
 
@@ -453,6 +719,7 @@ def patch_metadata_dataloader(
     train_label_horizon_schedule=None,
     emit_binary_map=False,
     binary_map_cfg=None,
+    debug_subset_path=None,
 ):
     import evals.action_anticipation_frozen.dataloader as dl
     import evals.action_anticipation_frozen.epickitchens as ek
@@ -461,6 +728,8 @@ def patch_metadata_dataloader(
         kwargs["emit_metadata"] = True
         kwargs["emit_binary_map"] = emit_binary_map
         kwargs["binary_map_cfg"] = binary_map_cfg
+        if debug_subset_path:
+            kwargs["debug_subset_path"] = debug_subset_path
         should_apply = model_anticipation_time_sec is not None and (apply_to_train or not bool(kwargs.get("training", True)))
         if should_apply:
             kwargs["model_anticipation_time_sec"] = model_anticipation_time_sec
@@ -478,12 +747,15 @@ def patch_clip_balanced_dataloader(
     drop_incomplete_history=False,
     apply_to_train=False,
     train_label_horizon_schedule=None,
+    debug_subset_path=None,
 ):
     import evals.action_anticipation_frozen.dataloader as dl
     import evals.action_anticipation_frozen.epickitchens as ek
 
     def _make(*args, **kwargs):
         kwargs["emit_metadata"] = False
+        if debug_subset_path:
+            kwargs["debug_subset_path"] = debug_subset_path
         should_apply = model_anticipation_time_sec is not None and (apply_to_train or not bool(kwargs.get("training", True)))
         if should_apply:
             kwargs["model_anticipation_time_sec"] = model_anticipation_time_sec
@@ -541,10 +813,18 @@ class GazeRecord:
     sync: pd.DataFrame | None
 
 
-class GazeTokenGate:
+class GazeTokenGate(nn.Module):
     def __init__(self, cfg: dict[str, Any]):
+        super().__init__()
         self.enabled = str(cfg.get("mode", "none")).lower() == "token_gate"
-        self.gamma = float(cfg.get("gamma", 0.7))
+        gamma = float(cfg.get("gamma", 0.7))
+        gamma = min(max(gamma, 1e-6), 1.0 - 1e-6)
+        self.learnable_gate = self.enabled and bool(cfg.get("learnable_gate", True))
+        if self.learnable_gate:
+            gamma_logit = math.log(gamma / (1.0 - gamma))
+            self.gamma_logit = nn.Parameter(torch.tensor(gamma_logit, dtype=torch.float32))
+        else:
+            self.register_buffer("gamma_value", torch.tensor(gamma, dtype=torch.float32), persistent=False)
         self.sigma_px = float(cfg.get("sigma_px", 40.0))
         self.fallback_fov_deg = float(cfg.get("fallback_fov_deg", 90.0))
         self.patch_size = int(cfg.get("patch_size", 16))
@@ -556,6 +836,11 @@ class GazeTokenGate:
         self.use_motion = bool(cfg.get("use_motion", True))
         self.motion_weight = float(cfg.get("motion_weight", 0.15))
         self.cache: dict[str, GazeRecord | None] = {}
+
+    def current_gamma(self) -> torch.Tensor:
+        if self.learnable_gate:
+            return torch.sigmoid(self.gamma_logit)
+        return self.gamma_value
 
     def _extract_zip(self, video_id: str) -> Path | None:
         if self.gaze_root is None:
@@ -791,28 +1076,39 @@ class GazeTokenGate:
             imp = imp[:, : tokens.shape[1]]
         imp = imp - imp.min(dim=1, keepdim=True).values
         imp = imp / imp.max(dim=1, keepdim=True).values.clamp(min=1e-6)
-        gate = (1.0 - self.gamma) + self.gamma * imp
+        gamma = self.current_gamma().to(device=tokens.device, dtype=imp.dtype)
+        gate = (1.0 - gamma) + gamma * imp
         return tokens * gate.unsqueeze(-1).to(tokens.dtype)
 
 
 class PredictionDumper:
+    # Top-k values stored per sample. topk_max controls how many indices are
+    # written to CSV; rescore/window analyses can use any k up to topk_max.
+    TOPK_LEVELS = (1, 3, 5, 10)
+
     def __init__(self, cfg: dict[str, Any], output_dir: str | os.PathLike | None, rank: int):
         self.enabled = bool(cfg.get("enabled", False)) and rank == 0
-        self.topk = int(cfg.get("topk", 5))
+        self.topk = int(cfg.get("topk", 10))
         self.rows: list[dict[str, Any]] = []
+        self.class_maps: dict[str, Any] = {}
         path = cfg.get("path")
         self.path = Path(path) if path else (Path(output_dir) / "val_predictions.csv" if output_dir else None)
 
     def add_batch(self, udata, outputs, labels, class_maps):
         if not self.enabled:
             return
+        if not self.class_maps and isinstance(class_maps, dict):
+            self.class_maps = {k: dict(v) if isinstance(v, dict) else v for k, v in class_maps.items()}
         metadata = udata[3] if len(udata) > 4 else []
         out = outputs[0]
         for i in range(out["action"].shape[0]):
             row = {}
             meta = metadata[i] if isinstance(metadata, list) and i < len(metadata) else {}
             for key, value in meta.items():
-                row[key] = json.dumps(value) if isinstance(value, (list, dict)) else value
+                if key in {"video_id", "start_frame", "stop_frame", "vfps", "model_anticipation_time", "sample_anticipation_time", "anticipation_point"}:
+                    row[key] = value
+                else:
+                    row[key] = json.dumps(value) if isinstance(value, (list, dict)) else value
             row.update(
                 {
                     "verb_raw": int(udata[1][i]),
@@ -827,11 +1123,13 @@ class PredictionDumper:
                 k = min(self.topk, logits.numel())
                 scores, preds = logits.topk(k)
                 pred_list = [int(x) for x in preds.detach().cpu().tolist()]
+                score_list = [float(x) for x in scores.detach().cpu().tolist()]
                 row[f"{name}_top{self.topk}"] = json.dumps(pred_list)
-                row[f"{name}_scores_top{self.topk}"] = json.dumps([float(x) for x in scores.detach().cpu().tolist()])
+                row[f"{name}_scores_top{self.topk}"] = json.dumps(score_list)
                 row[f"{name}_top1"] = pred_list[0] if pred_list else -1
-                row[f"{name}_top3_hit"] = int(int(labels[name][i]) in pred_list[:3])
-                row[f"{name}_top5_hit"] = int(int(labels[name][i]) in pred_list[:5])
+                gt = int(labels[name][i])
+                for kk in self.TOPK_LEVELS:
+                    row[f"{name}_top{kk}_hit"] = int(gt in pred_list[:kk])
             self.rows.append(row)
 
     def write(self):
@@ -843,34 +1141,101 @@ class PredictionDumper:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(self.rows)
+        self._write_class_maps()
         self._write_summary()
         logger.info("Wrote validation prediction dump: %s", self.path)
 
+    def _write_class_maps(self):
+        # Persist verb/noun/action class mappings next to the dump so offline
+        # rescore scripts can recover the (verb_raw, noun_raw) -> action_id map
+        # without re-running the training config.
+        if not self.class_maps:
+            return
+        out = {}
+        for name, mapping in self.class_maps.items():
+            if isinstance(mapping, dict):
+                entries = []
+                for key, value in mapping.items():
+                    if isinstance(key, tuple):
+                        entries.append({"key": list(key), "value": int(value) if isinstance(value, (int, float)) else value})
+                    else:
+                        try:
+                            k = int(key)
+                        except (TypeError, ValueError):
+                            k = key
+                        entries.append({"key": k, "value": int(value) if isinstance(value, (int, float)) else value})
+                out[name] = entries
+            else:
+                out[name] = mapping
+        mapping_path = self.path.with_name(f"{self.path.stem}_class_maps.json")
+
+        class _IntEncoder(json.JSONEncoder):
+            def default(self, o):
+                try:
+                    return int(o)
+                except (TypeError, ValueError):
+                    return super().default(o)
+
+        with mapping_path.open("w", encoding="utf-8") as f:
+            json.dump(out, f, cls=_IntEncoder)
+
     def _write_summary(self):
         for name in ["verb", "noun", "action"]:
-            counts = Counter()
+            label_totals: Counter = Counter()
+            label_hits: dict[int, Counter] = {}
+            pred_totals: Counter = Counter()
+            pred_hits: dict[int, Counter] = {}
             for row in self.rows:
                 label = row.get(f"{name}_label")
-                counts[(label, "hit")] += int(row.get(f"{name}_top3_hit", 0))
-                counts[(label, "miss")] += 1 - int(row.get(f"{name}_top3_hit", 0))
+                if label is None:
+                    continue
+                label_totals[label] += 1
+                hits_row = label_hits.setdefault(label, Counter())
+                for kk in self.TOPK_LEVELS:
+                    hits_row[kk] += int(row.get(f"{name}_top{kk}_hit", 0))
+                top1 = row.get(f"{name}_top1")
+                if top1 is not None and top1 != -1:
+                    pred_totals[top1] += 1
+                    hp = pred_hits.setdefault(top1, Counter())
+                    hp[1] += int(row.get(f"{name}_top1_hit", 0))
             summary = self.path.with_name(f"{self.path.stem}_{name}_summary.csv")
             with summary.open("w", encoding="utf-8", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=["label", "top3_hits", "top3_misses", "total", "top3_accuracy"])
+                fieldnames = ["label", "total"]
+                for kk in self.TOPK_LEVELS:
+                    fieldnames += [f"top{kk}_hits", f"top{kk}_recall"]
+                fieldnames += ["top1_predicted_as", "top1_precision"]
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
-                labels = sorted({label for label, _ in counts})
+                labels = sorted(label_totals.keys())
                 for label in labels:
-                    hits = counts[(label, "hit")]
-                    misses = counts[(label, "miss")]
-                    total = hits + misses
-                    writer.writerow(
-                        {
-                            "label": label,
-                            "top3_hits": hits,
-                            "top3_misses": misses,
-                            "total": total,
-                            "top3_accuracy": 100.0 * hits / max(1, total),
-                        }
-                    )
+                    total = label_totals[label]
+                    pred_n = pred_totals.get(label, 0)
+                    pred_h = pred_hits.get(label, Counter()).get(1, 0)
+                    row_out = {"label": label, "total": total}
+                    for kk in self.TOPK_LEVELS:
+                        h = label_hits.get(label, Counter()).get(kk, 0)
+                        row_out[f"top{kk}_hits"] = h
+                        row_out[f"top{kk}_recall"] = 100.0 * h / max(1, total)
+                    row_out["top1_predicted_as"] = pred_n
+                    row_out["top1_precision"] = 100.0 * pred_h / max(1, pred_n)
+                    writer.writerow(row_out)
+
+
+def _finite_head_loss_mean(losses: list[torch.Tensor]):
+    finite_values = []
+    nan_heads = []
+    for idx, loss in enumerate(losses):
+        detached = loss.detach().float()
+        if bool(torch.isfinite(detached).item()):
+            finite_values.append(detached)
+        else:
+            nan_heads.append(idx)
+    if finite_values:
+        mean = torch.stack(finite_values).mean()
+    else:
+        device = losses[0].device if losses else torch.device("cpu")
+        mean = torch.tensor(float("nan"), device=device)
+    return mean, nan_heads, len(finite_values)
 
 
 def labels_from_udata(udata, device, action_is_verb_noun, verb_classes, noun_classes, action_classes):
@@ -911,6 +1276,7 @@ def train_one_epoch_with_gaze(
     action_classes,
     criterion,
     traj_loader=None,
+    pose_loader=None,
 ):
     _data_loader = iter(data_loader)
     for c in classifiers:
@@ -947,43 +1313,86 @@ def train_one_epoch_with_gaze(
             metadata = udata[3] if len(udata) > 4 else None
             with torch.no_grad():
                 tokens = model(clips, anticipation_times)
-                tokens = gate.apply(tokens, clips, metadata)
-            if traj_loader is not None and metadata is not None:
+            tokens = gate.apply(tokens, clips, metadata)
+            if (traj_loader is not None or pose_loader is not None) and metadata is not None:
                 from app.hdepic_lora_action_anticipation.gaze_rnn import (
                     call_classifier,
-                    encode_gaze_tokens,
+                    encode_fusion_tokens,
                     gaze_fusion_monitor,
                     load_gaze_batch,
+                    load_pose_batch,
                 )
 
-                gaze_batch = load_gaze_batch(metadata, traj_loader, device, video_tokens=tokens)
+                gaze_batch = None
+                pose_batch = None
+                if traj_loader is not None:
+                    gaze_batch = load_gaze_batch(metadata, traj_loader, device, video_tokens=tokens)
+                if pose_loader is not None:
+                    pose_batch = load_pose_batch(metadata, pose_loader, device)
                 outputs = []
                 for idx, c in enumerate(classifiers):
-                    gaze_tokens = encode_gaze_tokens(c, metadata, traj_loader, device, gaze_batch=gaze_batch)
-                    outputs.append(call_classifier(c, tokens, gaze_tokens))
+                    fusion_tokens = encode_fusion_tokens(
+                        c,
+                        metadata,
+                        device,
+                        gaze_loader=traj_loader,
+                        pose_loader=pose_loader,
+                        video_tokens=tokens,
+                        gaze_batch=gaze_batch,
+                        pose_batch=pose_batch,
+                    )
+                    outputs.append(call_classifier(c, tokens, fusion_tokens))
                     if idx == 0:
                         fusion_monitor = gaze_fusion_monitor(c)
             else:
                 outputs = [c(tokens) for c in classifiers]
 
         if action_is_verb_noun:
-            loss = [
-                criterion(o["verb"], labels["verb"])
-                + criterion(o["noun"], labels["noun"])
-                + criterion(o["action"], labels["action"])
-                for o in outputs
-            ]
+            verb_loss = [criterion(o["verb"], labels["verb"]) for o in outputs]
+            noun_loss = [criterion(o["noun"], labels["noun"]) for o in outputs]
+            action_loss = [criterion(o["action"], labels["action"]) for o in outputs]
+            loss = [v + n + a for v, n, a in zip(verb_loss, noun_loss, action_loss)]
         else:
-            loss = [criterion(o["action"], labels["action"]) for o in outputs]
-        if traj_loader is not None:
+            action_loss = [criterion(o["action"], labels["action"]) for o in outputs]
+            verb_loss = noun_loss = [None for _ in outputs]
+            loss = action_loss
+
+        def _loss_info(idx):
+            info = {"total": loss[idx]}
+            if action_is_verb_noun:
+                info.update({"verb": verb_loss[idx], "noun": noun_loss[idx], "action": action_loss[idx]})
+            else:
+                info.update({"action": action_loss[idx]})
+            return info
+
+        if traj_loader is not None or pose_loader is not None:
             from app.hdepic_lora_action_anticipation.gaze_rnn import clip_gaze_encoder_grads
 
             grad_clip = float(os.environ.get("GAZE_RNN_GRAD_CLIP", "1.0"))
         else:
             clip_gaze_encoder_grads = None
             grad_clip = 0.0
-        if use_bfloat16:
-            for l, s, o, c in zip(loss, scaler, optimizer, classifiers):
+        if getattr(gate, "learnable_gate", False):
+            finite_losses = [torch.isfinite(L.detach()) for L in loss]
+            if not all(bool(ok) for ok in finite_losses):
+                bad = [idx for idx, ok in enumerate(finite_losses) if not bool(ok)]
+                logger.warning("Skipping optimizer step because learnable token-gate loss is non-finite for heads=%s", bad)
+                [o.zero_grad() for o in optimizer]
+                if use_bfloat16 and scaler:
+                    scaler[0].update()
+                continue
+            total_loss = torch.stack(loss).mean()
+            if use_bfloat16:
+                scaler[0].scale(total_loss).backward()
+                for o in optimizer:
+                    scaler[0].step(o)
+                scaler[0].update()
+            else:
+                total_loss.backward()
+                for o in optimizer:
+                    o.step()
+        elif use_bfloat16:
+            for head_idx, (l, s, o, c) in enumerate(zip(loss, scaler, optimizer, classifiers)):
                 if not torch.isfinite(l.detach()):
                     logger.warning("Skipping optimizer step because gaze loss is non-finite: %s", float(l.detach().float()))
                     o.zero_grad()
@@ -991,20 +1400,34 @@ def train_one_epoch_with_gaze(
                 s.scale(l).backward()
                 if clip_gaze_encoder_grads is not None:
                     s.unscale_(o)
-                    if not clip_gaze_encoder_grads(c, max_norm=grad_clip):
+                    scaler_scale = float(s.get_scale()) if hasattr(s, "get_scale") else None
+                    if not clip_gaze_encoder_grads(
+                        c,
+                        max_norm=grad_clip,
+                        head_idx=head_idx,
+                        itr=itr,
+                        loss_info=_loss_info(head_idx),
+                        scaler_scale=scaler_scale,
+                    ):
                         o.zero_grad()
                         s.update()
                         continue
                 s.step(o)
                 s.update()
         else:
-            for L, o, c in zip(loss, optimizer, classifiers):
+            for head_idx, (L, o, c) in enumerate(zip(loss, optimizer, classifiers)):
                 if not torch.isfinite(L.detach()):
                     logger.warning("Skipping optimizer step because gaze loss is non-finite: %s", float(L.detach().float()))
                     o.zero_grad()
                     continue
                 L.backward()
-                if clip_gaze_encoder_grads is not None and not clip_gaze_encoder_grads(c, max_norm=grad_clip):
+                if clip_gaze_encoder_grads is not None and not clip_gaze_encoder_grads(
+                    c,
+                    max_norm=grad_clip,
+                    head_idx=head_idx,
+                    itr=itr,
+                    loss_info=_loss_info(head_idx),
+                ):
                     o.zero_grad()
                     continue
                 o.step()
@@ -1065,9 +1488,17 @@ def validate_with_gaze(
     action_classes,
     criterion,
     traj_loader=None,
+    pose_loader=None,
     hidden_dump=None,
+    val_metric_scope: str = "native",
 ):
-    logger.info("Running val with project-local gaze/dump hooks...")
+    metric_scope = str(val_metric_scope).lower()
+    if metric_scope not in {"native", "filtered"}:
+        raise ValueError(f"Unsupported val_metric_scope={val_metric_scope!r}; expected native or filtered")
+    use_valid_filter = metric_scope == "filtered"
+    logger.info("Running val with project-local gaze/dump hooks (metric_scope=%s)...", metric_scope)
+    if use_valid_filter:
+        logger.info("Using filtered val metrics: passing valid_* class sets into ClassMeanRecall")
     _data_loader = iter(data_loader)
     for c in classifiers:
         c.train(mode=False)
@@ -1075,7 +1506,6 @@ def validate_with_gaze(
         verb_metric_loggers = [base_eval.ClassMeanRecall(num_classes=len(verb_classes), device=device, k=5) for _ in classifiers]
         noun_metric_loggers = [base_eval.ClassMeanRecall(num_classes=len(noun_classes), device=device, k=5) for _ in classifiers]
     action_metric_loggers = [base_eval.ClassMeanRecall(num_classes=len(action_classes), device=device, k=5) for _ in classifiers]
-
     for itr in range(ipe):
         fusion_monitor = {}
         try:
@@ -1090,43 +1520,66 @@ def validate_with_gaze(
             metadata = udata[3] if len(udata) > 4 else None
             tokens = model(clips, anticipation_times)
             tokens = gate.apply(tokens, clips, metadata)
-            if traj_loader is not None and metadata is not None:
+            if (traj_loader is not None or pose_loader is not None) and metadata is not None:
                 from app.hdepic_lora_action_anticipation.gaze_rnn import (
                     call_classifier,
-                    encode_gaze_tokens,
+                    encode_fusion_tokens,
                     gaze_fusion_monitor,
                     load_gaze_batch,
+                    load_pose_batch,
                 )
 
-                gaze_batch = load_gaze_batch(metadata, traj_loader, device, video_tokens=tokens)
+                gaze_batch = None
+                pose_batch = None
+                if traj_loader is not None:
+                    gaze_batch = load_gaze_batch(metadata, traj_loader, device, video_tokens=tokens)
+                if pose_loader is not None:
+                    pose_batch = load_pose_batch(metadata, pose_loader, device)
                 outputs = []
                 for idx, c in enumerate(classifiers):
-                    gaze_tokens = encode_gaze_tokens(c, metadata, traj_loader, device, gaze_batch=gaze_batch)
-                    outputs.append(call_classifier(c, tokens, gaze_tokens))
+                    fusion_tokens = encode_fusion_tokens(
+                        c,
+                        metadata,
+                        device,
+                        gaze_loader=traj_loader,
+                        pose_loader=pose_loader,
+                        video_tokens=tokens,
+                        gaze_batch=gaze_batch,
+                        pose_batch=pose_batch,
+                    )
+                    outputs.append(call_classifier(c, tokens, fusion_tokens))
                     if idx == 0:
                         fusion_monitor = gaze_fusion_monitor(c)
                     if hidden_dump is not None and idx == 0:
-                        hidden_dump.add(c, metadata, gaze_tokens)
+                        hidden_dump.add(c, metadata, fusion_tokens)
             else:
                 outputs = [c(tokens) for c in classifiers]
-            action_metrics = [m(o["action"], labels["action"], valid_actions) for o, m in zip(outputs, action_metric_loggers)]
+            valid_actions_arg = valid_actions if use_valid_filter else None
+            valid_verbs_arg = valid_verbs if use_valid_filter else None
+            valid_nouns_arg = valid_nouns if use_valid_filter else None
+            action_metrics = [m(o["action"], labels["action"], valid_actions_arg) for o, m in zip(outputs, action_metric_loggers)]
             if action_is_verb_noun:
-                verb_metrics = [m(o["verb"], labels["verb"], valid_verbs) for o, m in zip(outputs, verb_metric_loggers)]
-                noun_metrics = [m(o["noun"], labels["noun"], valid_nouns) for o, m in zip(outputs, noun_metric_loggers)]
-                verb_loss = sum(criterion(o["verb"], labels["verb"]) for o in outputs)
-                noun_loss = sum(criterion(o["noun"], labels["noun"]) for o in outputs)
-                action_loss = sum(criterion(o["action"], labels["action"]) for o in outputs)
-                loss = verb_loss + noun_loss + action_loss
+                verb_metrics = [m(o["verb"], labels["verb"], valid_verbs_arg) for o, m in zip(outputs, verb_metric_loggers)]
+                noun_metrics = [m(o["noun"], labels["noun"], valid_nouns_arg) for o, m in zip(outputs, noun_metric_loggers)]
+                verb_losses = [criterion(o["verb"], labels["verb"]) for o in outputs]
+                noun_losses = [criterion(o["noun"], labels["noun"]) for o in outputs]
+                action_losses = [criterion(o["action"], labels["action"]) for o in outputs]
+                total_losses = [v + n + a for v, n, a in zip(verb_losses, noun_losses, action_losses)]
+                loss, nan_heads, finite_heads = _finite_head_loss_mean(total_losses)
+                verb_loss, _, _ = _finite_head_loss_mean(verb_losses)
+                noun_loss, _, _ = _finite_head_loss_mean(noun_losses)
             else:
-                loss = sum(criterion(o["action"], labels["action"]) for o in outputs)
-        dumper.add_batch(udata, outputs, labels, {"verb": verb_classes, "noun": noun_classes, "action": action_classes})
+                action_losses = [criterion(o["action"], labels["action"]) for o in outputs]
+                loss, nan_heads, finite_heads = _finite_head_loss_mean(action_losses)
+        best_head_idx = max(range(len(action_metrics)), key=lambda i: action_metrics[i]["accuracy"])
+        dumper.add_batch(udata, [outputs[best_head_idx]], labels, {"verb": verb_classes, "noun": noun_classes, "action": action_classes})
         if itr % 10 == 0 or itr == ipe - 1:
             fusion_text = ""
             if fusion_monitor:
                 fusion_text = " [fusion: " + " ".join(f"{k}={v:.4f}" for k, v in sorted(fusion_monitor.items())) + "]"
             if action_is_verb_noun:
                 logger.info(
-                    "[%5d] acc (v/n): %.1f%% (%.1f%% %.1f%%) recall (v/n): %.1f%% (%.1f%% %.1f%%) loss (v/n): %.3f (%.3f %.3f) [mem: %.2e]%s",
+                    "[%5d] acc (v/n): %.1f%% (%.1f%% %.1f%%) recall (v/n): %.1f%% (%.1f%% %.1f%%) loss_mean (v/n): %.3f (%.3f %.3f) finite_heads=%d/%d nan_heads=%s [mem: %.2e]%s",
                     itr,
                     max(a["accuracy"] for a in action_metrics),
                     max(v["accuracy"] for v in verb_metrics),
@@ -1137,6 +1590,22 @@ def validate_with_gaze(
                     loss,
                     verb_loss,
                     noun_loss,
+                    finite_heads,
+                    len(outputs),
+                    nan_heads,
+                    torch.cuda.max_memory_allocated() / 1024.0**2,
+                    fusion_text,
+                )
+            else:
+                logger.info(
+                    "[%5d] acc (v/n): %.1f%% recall (v/n): %.1f%% loss_mean (v/n): %.3f finite_heads=%d/%d nan_heads=%s [mem: %.2e]%s",
+                    itr,
+                    max(a["accuracy"] for a in action_metrics),
+                    max(a["recall"] for a in action_metrics),
+                    loss,
+                    finite_heads,
+                    len(outputs),
+                    nan_heads,
                     torch.cuda.max_memory_allocated() / 1024.0**2,
                     fusion_text,
                 )
@@ -1144,6 +1613,7 @@ def validate_with_gaze(
     if hidden_dump is not None:
         hidden_dump.flush()
     ret = {"action": {"accuracy": max(a["accuracy"] for a in action_metrics), "recall": max(a["recall"] for a in action_metrics)}}
+    ret["metric_scope"] = metric_scope
     if action_is_verb_noun:
         ret.update(
             {

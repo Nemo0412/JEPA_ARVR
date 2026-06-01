@@ -1,19 +1,19 @@
 #!/bin/bash
 #SBATCH --job-name=VJEPA2-EXP__hdepic_priors
-#SBATCH --account=YOUR_SLURM_ACCOUNT
+#SBATCH --account=torch_pr_674_tandon_advanced
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=8GB
 #SBATCH --time=00:30:00
-#SBATCH --output=/scratch/yh6416/VJEPA2-EXP/logs/hdepic_label_priors_%j.out
-#SBATCH --error=/scratch/yh6416/VJEPA2-EXP/logs/hdepic_label_priors_%j.err
+#SBATCH --output=/path/to/VJEPA2-EXP/logs/hdepic_label_priors_%j.out
+#SBATCH --error=/path/to/VJEPA2-EXP/logs/hdepic_label_priors_%j.err
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=YOUR_EMAIL@example.com
+#SBATCH --mail-user=<email>
 
 set -euo pipefail
 
-PROJECT_ROOT="${PROJECT_ROOT:-/scratch/yh6416/VJEPA2-EXP}"
+PROJECT_ROOT="${PROJECT_ROOT:-/path/to/VJEPA2-EXP}"
 SIF="${SIF:-/share/apps/images/cuda12.1.1-cudnn8.9.0-devel-ubuntu22.04.2.sif}"
 OVERLAY="${OVERLAY:-${PROJECT_ROOT}/overlay-15GB-500K.ext3}"
 ENV_NAME="${ENV_NAME:-EgoLifeExp}"

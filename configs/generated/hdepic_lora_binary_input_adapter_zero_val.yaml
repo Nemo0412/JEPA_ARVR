@@ -1,9 +1,9 @@
 nodes: 1
 tasks_per_node: 1
 cpus_per_task: 12
-tag: hdepic-lora-binary-input-adapter-r64-h8-dlmap-multihead-bs2-w12-zero-channel-val
+tag: hdepic-lora-binary-input-adapter-r64-h8-dlmap-multihead-bs2-w12-gazefixed-gradisolate-zero-channel-val
 eval_name: app.hdepic_lora_action_anticipation
-folder: /scratch/yh6416/VJEPA2-EXP/outputs/hdepic_lora_action_anticipation
+folder: /path/to/VJEPA2-EXP/outputs/hdepic_lora_action_anticipation
 resume_checkpoint: true
 experiment:
   classifier:
@@ -16,9 +16,9 @@ experiment:
     auto_augment: true
     file_format: 1
     dataset: EK100
-    base_path: /scratch/yh6416/VJEPA2-EXP/data/hdepic_vjepa_videos
-    dataset_train: /scratch/yh6416/VJEPA2-EXP/data/hdepic_vjepa_annotations/HD_EPIC_train_vjepa.csv
-    dataset_val: /scratch/yh6416/VJEPA2-EXP/data/hdepic_vjepa_annotations/HD_EPIC_val_vjepa.csv
+    base_path: /path/to/VJEPA2-EXP/data/hdepic_vjepa_videos
+    dataset_train: /path/to/VJEPA2-EXP/data/hdepic_vjepa_annotations/HD_EPIC_train_vjepa.csv
+    dataset_val: /path/to/VJEPA2-EXP/data/hdepic_vjepa_annotations/HD_EPIC_val_vjepa.csv
     frames_per_clip: 32
     frames_per_second: 8
     motion_shift: false
@@ -168,13 +168,13 @@ experiment:
     alpha: 16.0
     dropout: 0.05
     train_heads: true
-    pretrained_probe: /scratch/yh6416/VJEPA2-EXP/outputs/ek100_vitg384_probe/action_anticipation_frozen/ek100-vitg16-384/latest.pt
+    pretrained_probe: /path/to/VJEPA2-EXP/outputs/ek100_vitg384_probe/action_anticipation_frozen/ek100-vitg16-384/latest.pt
     align_reference_metrics: true
     gaze:
       mode: binary_input_adapter
-      gaze_root: /scratch/yh6416/VJEPA2-EXP/data/raw/HD-EPIC/SLAM-and-Gaze
-      extract_root: /scratch/yh6416/VJEPA2-EXP/outputs/hdepic_gaze_token_gate/extracted
-      sync_root: /scratch/yh6416/VJEPA2-EXP/data/raw/HD-EPIC/HD-EPIC/Videos
+      gaze_root: /path/to/VJEPA2-EXP/data/raw/HD-EPIC/SLAM-and-Gaze
+      extract_root: /path/to/VJEPA2-EXP/outputs/hdepic_gaze_token_gate/extracted
+      sync_root: /path/to/VJEPA2-EXP/data/raw/HD-EPIC/HD-EPIC/Videos
       gamma: 0.7
       sigma_px: 40.0
       use_motion: false
@@ -191,6 +191,7 @@ experiment:
         local_temporal_radius: 0
         local_spatial_radius: 1
         residual_alpha_init: 0.01
+        history_sec: 0.0
         gaze_lr_mult: 5.0
       hidden_dump:
         enabled: false
@@ -204,14 +205,15 @@ experiment:
         scale: 1.0
         temporal_kernel: 1
         binary_center: 0.0
+        residual_clamp: 1.0
         lr_mult: 0.05
         weight_decay: 0.0001
         activation_checkpointing: false
-        load_checkpoint_path: /scratch/yh6416/VJEPA2-EXP/outputs/hdepic_lora_action_anticipation/action_anticipation_frozen/hdepic-lora-binary-input-adapter-r64-h8-dlmap-multihead-bs2-w12/binary_input_adapter_latest.pt
+        load_checkpoint_path: /path/to/VJEPA2-EXP/outputs/hdepic_lora_action_anticipation/action_anticipation_frozen/hdepic-lora-binary-input-adapter-r64-h8-dlmap-multihead-bs2-w12-gazefixed-gradisolate/binary_input_adapter_latest.pt
     prediction_dump:
       enabled: false
 model_kwargs:
-  checkpoint: /scratch/yh6416/VJEPA2-EXP/checkpoints/vitg-384.pt
+  checkpoint: /path/to/VJEPA2-EXP/checkpoints/vitg-384.pt
   module_name: evals.action_anticipation_frozen.modelcustom.vit_encoder_predictor_concat_ar
   wrapper_kwargs:
     no_predictor: false

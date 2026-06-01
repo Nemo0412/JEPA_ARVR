@@ -1,28 +1,28 @@
 #!/bin/bash
 #SBATCH --job-name=VJEPA2-EXP__hdepic_aa_prep
-#SBATCH --account=YOUR_SLURM_ACCOUNT
+#SBATCH --account=torch_pr_674_tandon_advanced
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32GB
 #SBATCH --time=24:00:00
-#SBATCH --output=/scratch/yh6416/VJEPA2-EXP/hdepic_aa_prep_%j.out
-#SBATCH --error=/scratch/yh6416/VJEPA2-EXP/hdepic_aa_prep_%j.err
+#SBATCH --output=/path/to/VJEPA2-EXP/hdepic_aa_prep_%j.out
+#SBATCH --error=/path/to/VJEPA2-EXP/hdepic_aa_prep_%j.err
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=YOUR_EMAIL@example.com
+#SBATCH --mail-user=<email>
 
 set -euo pipefail
 
 # One-command HD-EPIC action anticipation workflow.
 #
 # Submit from the HPC login node:
-#   sbatch /scratch/yh6416/VJEPA2-EXP/scripts/run_hdepic_action_anticipation.slurm
+#   sbatch /path/to/VJEPA2-EXP/scripts/run_hdepic_action_anticipation.slurm
 #
 # Optional overrides:
 #   sbatch --export=ALL,DOWNLOAD_PARTICIPANTS=1,2,3,VAL_PARTICIPANTS=P03 \
-#     /scratch/yh6416/VJEPA2-EXP/scripts/run_hdepic_action_anticipation.slurm
+#     /path/to/VJEPA2-EXP/scripts/run_hdepic_action_anticipation.slurm
 
-PROJECT_ROOT="${PROJECT_ROOT:-/scratch/yh6416/VJEPA2-EXP}"
+PROJECT_ROOT="${PROJECT_ROOT:-/path/to/VJEPA2-EXP}"
 VJEPA_ROOT="${VJEPA_ROOT:-${PROJECT_ROOT}/vjepa2}"
 SIF="${SIF:-/share/apps/images/cuda12.1.1-cudnn8.9.0-devel-ubuntu22.04.2.sif}"
 OVERLAY="${OVERLAY:-${PROJECT_ROOT}/overlay-15GB-500K.ext3}"
@@ -258,7 +258,7 @@ if [[ "${MODE}" == "prep" ]]; then
             --parsable
             --dependency="afterok:${SLURM_JOB_ID}"
             --job-name=VJEPA2-EXP__hdepic_aa_eval
-            --account=YOUR_SLURM_ACCOUNT
+            --account=torch_pr_674_tandon_advanced
             --nodes=1
             --ntasks=1
             --gres="gpu:${EVAL_GPUS}"

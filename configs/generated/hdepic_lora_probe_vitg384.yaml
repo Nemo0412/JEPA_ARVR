@@ -1,10 +1,10 @@
 nodes: 1
 tasks_per_node: 1
 cpus_per_task: 12
-tag: hdepic-lora-vitg16-384-cleanp01-refmetrics
+tag: hdepic-lora-binary-input-adapter-DEBUG_SUBSET-l40-valw0-step80
 eval_name: app.hdepic_lora_action_anticipation
-folder: /scratch/yh6416/VJEPA2-EXP/outputs/hdepic_lora_action_anticipation
-resume_checkpoint: true
+folder: /path/to/VJEPA2-EXP/outputs/hdepic_lora_action_anticipation
+resume_checkpoint: false
 experiment:
   classifier:
     num_probe_blocks: 4
@@ -16,9 +16,9 @@ experiment:
     auto_augment: true
     file_format: 1
     dataset: EK100
-    base_path: /scratch/yh6416/VJEPA2-EXP/data/hdepic_vjepa_videos
-    dataset_train: /scratch/yh6416/VJEPA2-EXP/data/hdepic_vjepa_annotations/HD_EPIC_train_vjepa.csv
-    dataset_val: /scratch/yh6416/VJEPA2-EXP/data/hdepic_vjepa_annotations/HD_EPIC_val_vjepa.csv
+    base_path: /path/to/VJEPA2-EXP/data/hdepic_vjepa_videos
+    dataset_train: /path/to/VJEPA2-EXP/data/hdepic_vjepa_annotations/HD_EPIC_train_vjepa.csv
+    dataset_val: /path/to/VJEPA2-EXP/data/hdepic_vjepa_annotations/HD_EPIC_val_vjepa.csv
     frames_per_clip: 32
     frames_per_second: 8
     motion_shift: false
@@ -35,22 +35,24 @@ experiment:
     train_anticipation_time_sec:
     - 0.25
     - 1.75
+    val_num_workers: 0
+    clip_balanced: true
   optimization:
-    num_epochs: 10
+    num_epochs: 1
     batch_size: 1
     use_bfloat16: true
     use_focal_loss: true
     multihead_kwargs:
     - weight_decay: 0.0001
       final_weight_decay: 0.0001
-      lr: 0.005
-      start_lr: 0.005
+      lr: 0.002
+      start_lr: 0.002
       final_lr: 0.0
       warmup: 0.0
     - weight_decay: 0.0001
       final_weight_decay: 0.0001
-      lr: 0.003
-      start_lr: 0.003
+      lr: 0.002
+      start_lr: 0.002
       final_lr: 0.0
       warmup: 0.0
     - weight_decay: 0.0001
@@ -73,14 +75,14 @@ experiment:
       warmup: 0.0
     - weight_decay: 0.001
       final_weight_decay: 0.001
-      lr: 0.005
-      start_lr: 0.005
+      lr: 0.002
+      start_lr: 0.002
       final_lr: 0.0
       warmup: 0.0
     - weight_decay: 0.001
       final_weight_decay: 0.001
-      lr: 0.003
-      start_lr: 0.003
+      lr: 0.002
+      start_lr: 0.002
       final_lr: 0.0
       warmup: 0.0
     - weight_decay: 0.001
@@ -103,14 +105,14 @@ experiment:
       warmup: 0.0
     - weight_decay: 0.01
       final_weight_decay: 0.01
-      lr: 0.005
-      start_lr: 0.005
+      lr: 0.002
+      start_lr: 0.002
       final_lr: 0.0
       warmup: 0.0
     - weight_decay: 0.01
       final_weight_decay: 0.01
-      lr: 0.003
-      start_lr: 0.003
+      lr: 0.002
+      start_lr: 0.002
       final_lr: 0.0
       warmup: 0.0
     - weight_decay: 0.01
@@ -133,14 +135,14 @@ experiment:
       warmup: 0.0
     - weight_decay: 0.1
       final_weight_decay: 0.1
-      lr: 0.005
-      start_lr: 0.005
+      lr: 0.002
+      start_lr: 0.002
       final_lr: 0.0
       warmup: 0.0
     - weight_decay: 0.1
       final_weight_decay: 0.1
-      lr: 0.003
-      start_lr: 0.003
+      lr: 0.002
+      start_lr: 0.002
       final_lr: 0.0
       warmup: 0.0
     - weight_decay: 0.1
@@ -167,20 +169,57 @@ experiment:
     alpha: 16.0
     dropout: 0.05
     train_heads: true
-    pretrained_probe: /scratch/yh6416/VJEPA2-EXP/outputs/ek100_vitg384_probe/action_anticipation_frozen/ek100-vitg16-384/latest.pt
+    pretrained_probe: /path/to/VJEPA2-EXP/outputs/ek100_vitg384_probe/action_anticipation_frozen/ek100-vitg16-384/latest.pt
     align_reference_metrics: true
     gaze:
-      mode: none
-      gaze_root: /scratch/yh6416/VJEPA2-EXP/data/raw/HD-EPIC/SLAM-and-Gaze
-      extract_root: /scratch/yh6416/VJEPA2-EXP/outputs/hdepic_gaze_token_gate/extracted
-      sync_root: /scratch/yh6416/VJEPA2-EXP/data/raw/HD-EPIC/HD-EPIC/Videos
+      mode: binary_input_adapter
+      gaze_root: /path/to/VJEPA2-EXP/data/raw/HD-EPIC/SLAM-and-Gaze
+      extract_root: /path/to/VJEPA2-EXP/outputs/hdepic_gaze_token_gate/extracted
+      sync_root: /path/to/VJEPA2-EXP/data/raw/HD-EPIC/HD-EPIC/Videos
       gamma: 0.7
       sigma_px: 40.0
-      use_motion: true
+      use_motion: false
+      traj_len: 1024
+      rnn:
+        hidden_dim: 256
+        num_layers: 2
+        bidirectional: true
+        dropout: 0.1
+        num_tokens: 64
+        use_video_tokens: false
+        video_fusion: nearest_concat
+        video_proj_dim: 128
+        local_temporal_radius: 0
+        local_spatial_radius: 1
+        residual_alpha_init: 0.01
+        history_sec: 0.0
+        gaze_lr_mult: 5.0
+      hidden_dump:
+        enabled: false
+        max_batches: 4
+      binary_radius_px: 64.0
+      fallback_full_frame: false
+      force_zero_map: false
+      aug_aware: false
+      disable_train_aug: true
+      input_adapter:
+        hidden_dim: 8
+        scale: 1.0
+        temporal_kernel: 1
+        binary_center: 0.0
+        residual_clamp: 1.0
+        lr_mult: 0.05
+        weight_decay: 0.0001
+        activation_checkpointing: true
+      encoder_output_adapter:
+        num_heads: 4
+        dropout: 0.0
+        lr_mult: 0.05
+        weight_decay: 0.0001
     prediction_dump:
       enabled: false
 model_kwargs:
-  checkpoint: /scratch/yh6416/VJEPA2-EXP/checkpoints/vitg-384.pt
+  checkpoint: /path/to/VJEPA2-EXP/checkpoints/vitg-384.pt
   module_name: evals.action_anticipation_frozen.modelcustom.vit_encoder_predictor_concat_ar
   wrapper_kwargs:
     no_predictor: false
