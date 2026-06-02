@@ -1,12 +1,12 @@
 """
 HD-EPIC gaze -> spatiotemporal importance for ViT token gating.
 
-真实像素级 gaze  heatmap 在官方的 slam-gaze 数据里（≈349GB，需单独下载）。
-本模块组合：
-  1) motion saliency：帧差幅度（仅从 RGB 可得）
-  2) temporal prior：eye-gaze-priming 里与各帧对齐的 gaze priming frame（数据集自带 JSON）
+Ground-truth pixel-level gaze heatmaps are in the official slam-gaze release (~349 GB, separate download).
+This module combines:
+  1) Motion saliency: frame-difference magnitude (from RGB only)
+  2) Temporal prior: gaze priming frames from eye-gaze-priming JSON
 
-映射到 ViT patch 网格后与 encoder 输出的 token 数对齐，用于乘法门控。
+Mapped to the ViT patch grid and aligned with the encoder token count for multiplicative gating.
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ def temporal_prior_from_frames(
     peak_frames: List[int],
     sigma_frames: float = 12.0,
 ) -> np.ndarray:
-    """每个采样帧给一个 [0.3, 1.0+] 量级权重（高斯包络），无 priming 时全 1。"""
+    """Per-frame Gaussian weight in [0.35, 1.0+]; returns all-ones when no priming frames exist."""
     fi = np.asarray(frame_indices, dtype=np.float64)
     if not peak_frames:
         return np.ones(len(fi), dtype=np.float32)
@@ -63,7 +63,7 @@ def temporal_prior_from_frames(
         m = 0.0
         for p in peak_frames:
             m = max(m, math.exp(-0.5 * ((f - p) / sigma) ** 2))
-        w.append(max(0.35, float(m)))  # 下限保留底噪，避免全乘死
+        w.append(max(0.35, float(m)))  # floor to avoid zeroing everything out
     return np.asarray(w, dtype=np.float32)
 
 
@@ -73,7 +73,7 @@ def motion_saliency_tubes(
 ) -> torch.Tensor:
     """
     gray: [B, T, H, W]
-    返回 [B, T//tubelet, H, W]：每个 temporal tubelet 内平均各帧的运动强度。
+    Returns [B, T//tubelet, H, W]: average frame-diff magnitude per temporal tubelet.
     """
     B, T, H, W = gray_bt_hw.shape
     d = torch.zeros_like(gray_bt_hw)
@@ -90,8 +90,8 @@ def patch_importance_from_maps(
     patch_size: int,
 ) -> torch.Tensor:
     """
-    imp_b_t_hw: [B, Ttube, H, W]，与 ViT temporal tubelets 一致
-    空间缩放到 patch 网格 (h_p, w_p)，再展平得到 [B, Ttube*h_p*w_p]
+    imp_b_t_hw: [B, Ttube, H, W], aligned with ViT temporal tubelets
+    Spatially pooled to patch grid (h_p, w_p), then flattened to [B, Ttube*h_p*w_p]
     """
     B, tt, _, _ = imp_b_t_hw.shape
     h_p, w_p = spatial_size_hw[0] // patch_size, spatial_size_hw[1] // patch_size
@@ -107,7 +107,7 @@ def gate_encoder_tokens(
     gamma: float = 0.75,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """feat [B,N,D], imp [B,N] -> 乘以 (常数偏置 + 归一化 imp)。"""
+    """feat [B,N,D], imp [B,N] -> multiply by (constant offset + normalised imp)."""
     imp = imp_bn - imp_bn.min(dim=1, keepdim=True)[0]
     imp = imp / (imp.max(dim=1, keepdim=True)[0] + eps)
     g = (1.0 - gamma) + gamma * imp
@@ -121,7 +121,7 @@ def splat_gaze_heatmap(
     W: int,
     sigma: float = 36.0,
 ) -> np.ndarray:
-    """每帧在 (u,v) 处 splat 高斯，[T,H,W] float32。"""
+    """Splat a Gaussian at (u,v) for each frame; returns [T,H,W] float32."""
     T = len(u_coords)
     out = np.zeros((T, H, W), dtype=np.float32)
     yy, xx = np.ogrid[0:H, 0:W]
@@ -144,7 +144,7 @@ def image_coords_after_resize_center_crop(
     W0: int,
     out_size: int = 256,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """与 vjepa 视频 eval 一致：short_side = 256/224*out_size，再 CenterCrop(out_size)。"""
+    """Matches V-JEPA video eval: short_side = 256/224*out_size then CenterCrop(out_size)."""
     short_side = int(256.0 / 224 * out_size)
     scale = short_side / float(min(H0, W0))
     new_w = int(round(W0 * scale))
@@ -167,7 +167,8 @@ def build_gaze_maps_for_indices(
     sigma_px: float = 36.0,
 ) -> np.ndarray:
     """
-    根据 MP4 帧号 -> vrs 时间 -> 最近 gaze 样本，将 yaw/pitch 投到原图再映射到 crop 后坐标，返回 [T,out_size,out_size]。
+    Maps MP4 frame index -> VRS time -> nearest gaze sample; projects yaw/pitch to image coords
+    after Resize+CenterCrop, returns [T, out_size, out_size].
     """
     mp4_ns = (frame_indices.astype(np.float64) / vfps) * 1e9
     vrs_ns = np.interp(

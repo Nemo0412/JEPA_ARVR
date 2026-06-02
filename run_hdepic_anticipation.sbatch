@@ -8,7 +8,7 @@
 #SBATCH --time=00:30:00
 #SBATCH --output=/scratch/ll5914/logs/vjepa2_hdepic_%j.out
 
-echo "=== V-JEPA 2 HD-EPIC P01 第一个场景 ==="
+echo "=== V-JEPA 2 HD-EPIC P01 First Scene ==="
 echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $SLURMD_NODENAME"
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader)"

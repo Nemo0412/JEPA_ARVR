@@ -1,6 +1,6 @@
 """
 V-JEPA 2 Action Anticipation on EK100 — P01_11
-指标: Verb Top-3, Noun Top-3, Action Recall@5 (Class-Mean)
+Metrics: Verb Top-3, Noun Top-3, Action Recall@5 (class-mean)
 """
 
 import sys
@@ -42,7 +42,7 @@ def build_transform():
 
 
 def build_class_maps():
-    """与官方 epickitchens.py 相同的逻辑，保证 action_id 与 checkpoint 一致。"""
+    """Same logic as official epickitchens.py to ensure action_id matches checkpoint."""
     tdf = pd.read_csv(TRAIN_CSV)
     tactions = set(zip(tdf["verb_class"].values, tdf["noun_class"].values))
     tverbs   = set(v for v, _ in tactions)
@@ -65,7 +65,7 @@ def build_class_maps():
 
 
 def load_encoder(device):
-    print("  加载 ViT-L encoder...")
+    print("  Loading ViT-L encoder...")
     model = vit_large_rope(
         img_size=(IMG_SIZE, IMG_SIZE), num_frames=FRAMES_PER_CLIP,
         tubelet_size=2, patch_size=16, uniform_power=True,
@@ -79,7 +79,7 @@ def load_encoder(device):
 
 
 def load_probe(verb_map, noun_map, action_map, embed_dim, device):
-    print(f"  加载 EK100 probe (verbs={len(verb_map)}, nouns={len(noun_map)}, actions={len(action_map)})...")
+    print(f"  Loading EK100 probe (verbs={len(verb_map)}, nouns={len(noun_map)}, actions={len(action_map)})...")
     classifier = AttentiveClassifier(
         verb_classes=verb_map, noun_classes=noun_map, action_classes=action_map,
         embed_dim=embed_dim, num_heads=16, depth=4, use_activation_checkpointing=False,
@@ -115,23 +115,23 @@ def run():
     print("=" * 65)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"设备: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
+    print(f"Device: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
 
-    print("\n[1] 加载标注...")
+    print("\n[1] Loading annotations...")
     verb_map, noun_map, verb_o2m, noun_o2m, action_o2m, action_map = build_class_maps()
     df_val    = pd.read_csv(VAL_CSV)
     df_p01_11 = df_val[df_val['video_id'] == 'P01_11'].sort_values('start_frame').reset_index(drop=True)
-    print(f"  P01_11 共 {len(df_p01_11)} 个标注动作")
+    print(f"  P01_11: {len(df_p01_11)} annotated actions")
 
-    print("\n[2] 加载模型...")
+    print("\n[2] Loading models...")
     encoder    = load_encoder(device)
     classifier = load_probe(verb_map, noun_map, action_map, encoder.embed_dim, device)
 
-    print("\n[3] 加载视频...")
+    print("\n[3] Loading video...")
     vr       = VideoReader(VIDEO_PATH, num_threads=1, ctx=cpu(0))
     vfps     = vr.get_avg_fps()
     duration = len(vr) / vfps
-    print(f"  {len(vr)} 帧, {vfps:.1f} FPS, 时长 {duration:.1f}s ({duration/60:.1f}min)")
+    print(f"  {len(vr)} frames, {vfps:.1f} FPS, duration {duration:.1f}s ({duration/60:.1f}min)")
 
     transform = build_transform()
 
@@ -143,7 +143,7 @@ def run():
     act_cls_c5  = defaultdict(int); act_cls_t  = defaultdict(int)
     total = 0
 
-    print("\n[4] 逐动作推理...")
+    print("\n[4] Running inference per action...")
     for i, (_, row) in enumerate(df_p01_11.iterrows()):
         start_sec   = int(row['start_frame']) / vfps
         obs_end_sec = start_sec - ANTICIPATION_SEC
@@ -180,7 +180,7 @@ def run():
 
         total += 1
         if (i + 1) % 20 == 0:
-            print(f"  已处理 {total} 个动作...")
+            print(f"  Processed {total} actions...")
 
     v_cmr5 = class_mean_recall(verb_cls_c5, verb_cls_t)
     n_cmr5 = class_mean_recall(noun_cls_c5, noun_cls_t)
@@ -188,9 +188,9 @@ def run():
     n_act  = sum(act_cls_t.values())
 
     print(f"\n{'=' * 65}")
-    print(f"EK100 P01_11  |  共 {total} 个动作  |  提前 {ANTICIPATION_SEC}s 预测")
+    print(f"EK100 P01_11  |  {total} actions  |  anticipation {ANTICIPATION_SEC}s")
     print(f"{'=' * 65}")
-    print(f"{'指标':<30} {'Verb':>8} {'Noun':>8} {'Action':>8}")
+    print(f"{'Metric':<30} {'Verb':>8} {'Noun':>8} {'Action':>8}")
     print(f"{'-' * 58}")
     for k in [1, 3, 5]:
         vp = 100 * verb_correct[k]   / total
@@ -199,7 +199,7 @@ def run():
         print(f"  Top-{k} Accuracy        {vp:>7.1f}% {np_:>7.1f}% {ap:>7.1f}%")
     print(f"  Class-Mean Recall@5  {v_cmr5:>7.1f}% {n_cmr5:>7.1f}% {a_cmr5:>7.1f}%")
     print(f"{'=' * 65}")
-    print("\n注：仅 P01_11 单个视频，非完整 val set 结果。")
+    print("\nNote: single video P01_11 only, not full val set results.")
 
 
 if __name__ == "__main__":

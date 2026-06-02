@@ -9,19 +9,19 @@
 
 set -euo pipefail
 
-# P01 第一个视频（按文件名日期）：20240202-110250
+# First P01 video (by filename date): 20240202-110250
 VID="P01-20240202-110250"
 ROOT="/scratch/ll5914/datasets"
 SCRIPT_DIR="/scratch/ll5914/datasets/HD-EPIC/hd-epic-downloader"
 
-echo "HD-EPIC slam-gaze（单视频 gaze 包）: ${VID}"
-echo "输出根目录: ${ROOT}/HD-EPIC/"
+echo "HD-EPIC slam-gaze (single video gaze package): ${VID}"
+echo "Output root: ${ROOT}/HD-EPIC/"
 echo "Start: $(date)"
 echo ""
 
 cd "${SCRIPT_DIR}"
 
-# 仅 slam-gaze；--video-id 时 manifest 里与该 id 匹配的文件（约 1 个 zip）
+# slam-gaze only; with --video-id, downloads the matching zip from the manifest (~1 file)
 python3 hd-epic-downloader.py "${ROOT}" --slam-gaze --video-id "${VID}"
 
 echo ""

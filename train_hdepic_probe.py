@@ -1,21 +1,21 @@
 """
 HD-EPIC Probe Fine-tuning on V-JEPA 2
 ======================================
-冻结 V-JEPA 2 ViT-L encoder，训练一个新的 AttentiveClassifier
-用 HD-EPIC 自己的 verb/noun 词汇表（106 verbs, 303 nouns）。
+Freeze V-JEPA 2 ViT-L encoder and train a new AttentiveClassifier
+on HD-EPIC's own verb/noun vocabulary (106 verbs, 303 nouns).
 
-数据划分 (HD-EPIC P01 共 27 个视频):
-  训练集: video_id 含子串 "20240203"（12 段视频 / 当日录制）
-  验证集: 其余 15 段视频（20240202 + 20240204 两天）
-  （按日期切分，同一天不会同时出现在 train/val）
+Data split (HD-EPIC P01, 27 videos total):
+  Train: video_id contains '20240203' (12 videos recorded that day)
+  Val:   remaining 15 videos (20240202 + 20240204)
+  (date-based split; same day never appears in both train and val)
 
 Checkpoints:
-  hdepic-vitl-probe-last.pt — 每个 epoch 验证后覆盖
-  hdepic-vitl-probe-best.pt — 验证 Verb Recall@5 创新高时保存
+  hdepic-vitl-probe-last.pt  — overwritten after every epoch
+  hdepic-vitl-probe-best.pt  — saved when val Verb Recall@5 improves
 
-运行:
+Usage:
   cd /home/ll5914/ARVR_Video/vjepa2
-  python ../train_hdepic_probe.py          # 若存在 last.pt 则自动续训
+  python ../train_hdepic_probe.py           # resumes from last.pt if present
   python ../train_hdepic_probe.py --from-scratch
 """
 
@@ -36,7 +36,7 @@ import src.datasets.utils.video.volume_transforms as volume_transforms
 from src.models.attentive_pooler import AttentivePooler
 from src.models.vision_transformer import vit_large_rope
 
-# ── 路径 ─────────────────────────────────────────────────────────────
+# ── Paths ───────────────────────────────────────────────────────────
 ENCODER_CKPT  = "/scratch/ll5914/models/vjepa2/vitl.pt"
 HD_EPIC_NARR  = "/scratch/ll5914/datasets/HD-EPIC/hd-epic-annotations/narrations-and-action-segments/HD_EPIC_Narrations.pkl"
 HD_VERB_CSV   = "/scratch/ll5914/datasets/HD-EPIC/hd-epic-annotations/narrations-and-action-segments/HD_EPIC_verb_classes.csv"
@@ -46,7 +46,7 @@ SAVE_DIR      = "/scratch/ll5914/models/vjepa2"
 PROBE_BEST    = os.path.join(SAVE_DIR, "hdepic-vitl-probe-best.pt")
 PROBE_LAST    = os.path.join(SAVE_DIR, "hdepic-vitl-probe-last.pt")
 
-# ── 超参数 ────────────────────────────────────────────────────────────
+# ── Hyper-parameters ────────────────────────────────────────────────
 IMG_SIZE         = 256
 FRAMES_PER_CLIP  = 32
 FPS              = 8
@@ -61,11 +61,11 @@ NUM_WORKERS      = 4
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
 
-# 20240203 用于训练，其余用于验证
+# 20240203 videos used for training; others for validation
 TRAIN_DATE = "20240203"
 
 
-# ── 数据集 ────────────────────────────────────────────────────────────
+# ── Dataset ─────────────────────────────────────────────────────────
 class HDEpicDataset(Dataset):
     def __init__(self, annotations, video_dir, transform, verb_map, noun_map, action_map, is_train=True):
         self.video_dir  = video_dir
@@ -75,7 +75,7 @@ class HDEpicDataset(Dataset):
         self.action_map = action_map  # (v,n) → mapped_id
         self.is_train   = is_train
 
-        # 展开多 verb/noun 标注为单一主动作（取第一个）
+        # Use first verb/noun class as primary label (multi-label annotations)
         self.samples = []
         for _, row in annotations.iterrows():
             vcs = row['verb_classes']
@@ -120,7 +120,7 @@ class HDEpicDataset(Dataset):
             frames  = vr.get_batch(indices).asnumpy()  # [T, H, W, C]
             clip    = self.transform(torch.from_numpy(frames).permute(0, 3, 1, 2))
         except Exception:
-            # 出错时返回零帧
+            # Fall back to zero clip on decode error
             clip = torch.zeros(3, FRAMES_PER_CLIP, IMG_SIZE, IMG_SIZE)
 
         return clip, s['verb_id'], s['noun_id'], s['action_id']
@@ -145,9 +145,9 @@ def build_transforms(is_train):
         ])
 
 
-# ── 模型 ─────────────────────────────────────────────────────────────
+# ── Model ───────────────────────────────────────────────────────────
 class HDEpicProbe(nn.Module):
-    """独立的 HD-EPIC 分类头 (num_queries=3: verb, noun, action)"""
+    """Standalone HD-EPIC classification head (num_queries=3: verb, noun, action)"""
     def __init__(self, embed_dim, num_verbs, num_nouns, num_actions):
         super().__init__()
         self.pooler = AttentivePooler(
@@ -170,7 +170,7 @@ class HDEpicProbe(nn.Module):
 
 
 def load_encoder(device):
-    print("  加载 ViT-L encoder（冻结）...")
+    print("  Loading ViT-L encoder (frozen)...")
     model = vit_large_rope(
         img_size=(IMG_SIZE, IMG_SIZE),
         num_frames=FRAMES_PER_CLIP,
@@ -186,7 +186,7 @@ def load_encoder(device):
     return model.to(device).eval()
 
 
-# ── 评估 ─────────────────────────────────────────────────────────────
+# ── Evaluation ──────────────────────────────────────────────────────
 def evaluate(encoder, probe, loader, device, num_verbs, num_nouns, num_actions):
     probe.eval()
     v_c = defaultdict(int); v_t = defaultdict(int)
@@ -238,30 +238,30 @@ def evaluate(encoder, probe, loader, device, num_verbs, num_nouns, num_actions):
     }
 
 
-# ── 主训练流程 ────────────────────────────────────────────────────────
+# ── Main training loop ──────────────────────────────────────────────
 def run(from_scratch=False):
     print("=" * 65)
     print("V-JEPA 2 — HD-EPIC Probe Fine-tuning")
     print("=" * 65)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"设备: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
+    print(f"Device: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
 
-    # 加载标注
-    print("\n[1] 加载标注...")
+    # Load annotations
+    print("\n[1] Loading annotations...")
     with open(HD_EPIC_NARR, "rb") as f:
         narr_df = pickle.load(f)
     p01_df = narr_df[narr_df['video_id'].str.startswith('P01')].copy()
 
     vdf = pd.read_csv(HD_VERB_CSV)
     ndf = pd.read_csv(HD_NOUN_CSV)
-    # HD-EPIC verb_classes.csv 的 id 列就是 class id
+    # id column in HD-EPIC verb_classes.csv is the class id directly
     verb_map   = {int(r['id']): int(r['id']) for _, r in vdf.iterrows()}   # id → id (identity)
     noun_map   = {int(r['id']): int(r['id']) for _, r in ndf.iterrows()}
     verb_names = {int(r['id']): r['key'] for _, r in vdf.iterrows()}
     noun_names = {int(r['id']): r['key'] for _, r in ndf.iterrows()}
 
-    # action classes: unique (verb_class, noun_class) in P01 annotations
+    # Action classes: unique (verb_class, noun_class) pairs in P01
     pairs = set()
     for _, row in p01_df.iterrows():
         vcs = row['verb_classes']; ncs = row['noun_classes']
@@ -270,26 +270,26 @@ def run(from_scratch=False):
     action_map = {k: i for i, k in enumerate(pairs)}
     print(f"  verbs={len(vdf)}, nouns={len(ndf)}, actions={len(action_map)}")
 
-    # 划分训练/验证集
+    # Train / val split
     train_df = p01_df[p01_df['video_id'].str.contains(TRAIN_DATE)]
     val_df   = p01_df[~p01_df['video_id'].str.contains(TRAIN_DATE)]
     train_vids = sorted(train_df["video_id"].unique())
     val_vids   = sorted(val_df["video_id"].unique())
-    print(f"  训练标注行数: {len(train_df)} | 训练用视频 {len(train_vids)} 个（video_id 含日期 {TRAIN_DATE}）")
-    print(f"  验证标注行数: {len(val_df)} | 验证用视频 {len(val_vids)} 个（其余日期，作 val 非独立 test）", flush=True)
+    print(f"  Train annotations: {len(train_df)} rows | {len(train_vids)} videos (date {TRAIN_DATE})")
+    print(f"  Val annotations: {len(val_df)} rows | {len(val_vids)} videos (other dates, used as val)", flush=True)
 
-    # 构建 Dataset
+    # Build datasets
     train_ds = HDEpicDataset(train_df, VIDEO_DIR, build_transforms(True),  verb_map, noun_map, action_map, is_train=True)
     val_ds   = HDEpicDataset(val_df,   VIDEO_DIR, build_transforms(False), verb_map, noun_map, action_map, is_train=False)
-    print(f"  有效训练样本: {len(train_ds)}, 验证样本: {len(val_ds)}", flush=True)
+    print(f"  Valid train samples: {len(train_ds)}, val samples: {len(val_ds)}", flush=True)
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
                               num_workers=NUM_WORKERS, pin_memory=True)
 
-    # 加载模型
-    print("\n[2] 加载模型...")
+    # Load models
+    print("\n[2] Loading models...")
     encoder = load_encoder(device)
     probe   = HDEpicProbe(
         embed_dim=encoder.embed_dim,
@@ -298,9 +298,9 @@ def run(from_scratch=False):
         num_actions=len(action_map),
     ).to(device)
     total_params = sum(p.numel() for p in probe.parameters()) / 1e6
-    print(f"  Probe 参数量: {total_params:.1f}M")
+    print(f"  Probe parameters: {total_params:.1f}M")
 
-    # 优化器 + LR 调度
+    # Optimizer + LR schedule
     optimizer = optim.AdamW(probe.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     total_steps = NUM_EPOCHS * len(train_loader)
     warmup_steps = WARMUP_EPOCHS * len(train_loader)
@@ -328,7 +328,7 @@ def run(from_scratch=False):
             "val_video_ids": sorted(val_df["video_id"].unique().tolist()),
         }
 
-    # -------- 恢复训练 --------
+    # -------- Resume training --------
     start_epoch = 0
     best_verb_r5 = 0.0
     resume_path = None
@@ -336,27 +336,27 @@ def run(from_scratch=False):
         resume_path = PROBE_LAST
 
     if resume_path:
-        print(f"\n  [resume] 读取 {resume_path} ...", flush=True)
+        print(f"\n  [resume] Loading {resume_path} ...", flush=True)
         ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         probe.load_state_dict(ckpt["probe"])
         start_epoch = int(ckpt["epoch"])
         if start_epoch >= NUM_EPOCHS:
-            print(f"  已完成全部 {NUM_EPOCHS} 个 epoch（ckpt epoch={start_epoch}），无需继续。", flush=True)
+            print(f"  All {NUM_EPOCHS} epochs already done (ckpt epoch={start_epoch}).", flush=True)
             print("=" * 65, flush=True)
             return
 
         if ckpt.get("optimizer"):
             optimizer.load_state_dict(ckpt["optimizer"])
-            print(f"    已恢复 optimizer", flush=True)
+            print(f"    Restored optimizer", flush=True)
         else:
-            print(f"    [WARN] ckpt 无 optimizer，仅用新优化器接上（略损动量连续性）", flush=True)
+            print(f"    [WARN] No optimizer in ckpt; using fresh optimizer (slight momentum discontinuity)", flush=True)
 
         if ckpt.get("scheduler"):
             scheduler.load_state_dict(ckpt["scheduler"])
-            print(f"    已恢复 scheduler", flush=True)
+            print(f"    Restored scheduler", flush=True)
         else:
             steps_done = start_epoch * len(train_loader)
-            print(f"    [WARN] ckpt 无 scheduler，对 LR 调度快进 {steps_done} 步", flush=True)
+            print(f"    [WARN] No scheduler in ckpt; fast-forwarding LR schedule by {steps_done} steps", flush=True)
             for _ in range(steps_done):
                 scheduler.step()
 
@@ -364,18 +364,18 @@ def run(from_scratch=False):
             b = torch.load(PROBE_BEST, map_location="cpu", weights_only=False)
             if b.get("metrics") and "verb_r5" in b["metrics"]:
                 best_verb_r5 = float(b["metrics"]["verb_r5"])
-                print(f"    历史 best verb R@5 = {best_verb_r5:.1f}%（来自 best.pt）", flush=True)
+                print(f"    Historical best verb R@5 = {best_verb_r5:.1f}% (from best.pt)", flush=True)
 
-        print(f"  [resume] 已完成 {start_epoch} 个 epoch，从第 {start_epoch + 1}/{NUM_EPOCHS} 个 epoch 继续", flush=True)
+        print(f"  [resume] Completed {start_epoch} epochs, resuming from epoch {start_epoch + 1}/{NUM_EPOCHS}", flush=True)
     else:
         if from_scratch:
-            print("\n  [train] --from-scratch，从头训练", flush=True)
+            print("\n  [train] --from-scratch: training from scratch", flush=True)
         else:
-            print("\n  [train] 未找到 last.pt，从头训练", flush=True)
+            print("\n  [train] No last.pt found, training from scratch", flush=True)
 
-    print(f"\n[3] 开始训练 ({NUM_EPOCHS} epochs, batch={BATCH_SIZE}, lr={LR})...")
-    print(f"    每 epoch 后保存: {PROBE_LAST}", flush=True)
-    print(f"    Verb R@5 最优时保存: {PROBE_BEST}", flush=True)
+    print(f"\n[3] Starting training ({NUM_EPOCHS} epochs, batch={BATCH_SIZE}, lr={LR})...")
+    print(f"    Saved every epoch: {PROBE_LAST}", flush=True)
+    print(f"    Saved on best Verb R@5: {PROBE_BEST}", flush=True)
     print("=" * 65, flush=True)
 
     for epoch in range(start_epoch, NUM_EPOCHS):
@@ -411,35 +411,35 @@ def run(from_scratch=False):
 
         avg_loss = epoch_loss / len(train_loader)
         elapsed  = time.time() - t0
-        print(f"\nEpoch {epoch+1}/{NUM_EPOCHS} 完成 | avg_loss={avg_loss:.3f} | {elapsed:.0f}s", flush=True)
+        print(f"\nEpoch {epoch+1}/{NUM_EPOCHS} done | avg_loss={avg_loss:.3f} | {elapsed:.0f}s", flush=True)
 
-        # 每个 epoch 做一次验证
+        # Validate after each epoch
         metrics = evaluate(encoder, probe, val_loader, device,
                            len(vdf), len(ndf), len(action_map))
-        print(f"  验证结果:", flush=True)
+        print(f"  Validation:", flush=True)
         print(f"    Verb  Top-3={metrics['verb_top3']:.1f}%  Recall@5={metrics['verb_r5']:.1f}%", flush=True)
         print(f"    Noun  Top-3={metrics['noun_top3']:.1f}%  Recall@5={metrics['noun_r5']:.1f}%", flush=True)
         print(f"    Action Top-3={metrics['action_top3']:.1f}%  Recall@5={metrics['action_r5']:.1f}%", flush=True)
 
         torch.save(pack_ckpt(epoch + 1, metrics), PROBE_LAST)
-        print(f"  ✓ 已保存 latest → {PROBE_LAST}", flush=True)
+        print(f"  ✓ Saved latest -> {PROBE_LAST}", flush=True)
 
         if metrics["verb_r5"] > best_verb_r5:
             best_verb_r5 = metrics["verb_r5"]
             torch.save(pack_ckpt(epoch + 1, metrics), PROBE_BEST)
-            print(f"  ✓ 已保存 best (verb R@5={best_verb_r5:.1f}%) → {PROBE_BEST}", flush=True)
+            print(f"  ✓ Saved best (verb R@5={best_verb_r5:.1f}%) -> {PROBE_BEST}", flush=True)
 
         probe.train()
         print("", flush=True)
 
     print("=" * 65, flush=True)
-    print(f"训练完成！最优 Verb Recall@5 = {best_verb_r5:.1f}%", flush=True)
+    print(f"Training complete! Best Verb Recall@5 = {best_verb_r5:.1f}%", flush=True)
     print(f"Latest: {PROBE_LAST}", flush=True)
     print(f"Best:   {PROBE_BEST}", flush=True)
 
 
 if __name__ == "__main__":
     _p = argparse.ArgumentParser()
-    _p.add_argument("--from-scratch", action="store_true", help="忽略 last.pt，从头训练")
+    _p.add_argument("--from-scratch", action="store_true", help="Ignore last.pt and train from scratch")
     _args = _p.parse_args()
     run(from_scratch=_args.from_scratch)

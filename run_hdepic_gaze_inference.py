@@ -1,18 +1,19 @@
 """
-HD-EPIC：用 MPS gaze（general_eye_gaze.csv）+ 视频时间对齐，生成热力图，对 ViT token 乘法门控后再过 HD-EPIC probe。
+HD-EPIC: use MPS gaze (general_eye_gaze.csv) + video time alignment to build heatmaps,
+then multiplicatively gate ViT tokens before the HD-EPIC probe.
 
-对比：baseline（无门控） vs gaze-gated。
-需已训练 probe：hdepic-vitl-probe-last.pt（或自行改路径）。
+Comparison: baseline (no gating) vs gaze-gated.
+Requires a trained probe: hdepic-vitl-probe-last.pt (or adjust path).
 
-用法:
+Usage:
   cd /home/ll5914/ARVR_Video/vjepa2
   python ../run_hdepic_gaze_inference.py
 
-环境变量（可选）:
-  HDEPIC_GAZE_EVAL_MAX=N  仅跑前 N 条样本（调试 / 省显存；默认 0 表示全量）
-  HDEPIC_GAZE_BATCH=B     DataLoader batch size（默认 2）
+Environment variables (optional):
+  HDEPIC_GAZE_EVAL_MAX=N  evaluate first N samples (debug/memory; 0 = all)
+  HDEPIC_GAZE_BATCH=B     DataLoader batch size (default 2)
 
-默认只做有 gaze zip 对齐文件的视频：P01-20240202-110250。
+Defaults to the one video with extracted gaze data: P01-20240202-110250.
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from collections import defaultdict
 from decord import VideoReader, cpu
 from torch.utils.data import Dataset, DataLoader
 
-# vjepa2 包（AttentivePooler、load_encoder）；脚本在 ARVR_Video 根目录，该目录自动在 sys.path
+# vjepa2 package (AttentivePooler, load_encoder); script lives in ARVR_Video root
 sys.path.insert(0, "/home/ll5914/ARVR_Video/vjepa2")
 
 import train_hdepic_probe as tcfg
@@ -42,7 +43,7 @@ from hdepic_gaze_mask import (
     build_gaze_maps_for_indices,
 )
 
-# ── gaze 文件（你已下载的第一个视频）────────────────────────────────────
+# ── Gaze files (first downloaded video) ─────────────────────────────
 VIDEO_ID_FOR_GAZE = "P01-20240202-110250"
 SYNC_CSV = f"/scratch/ll5914/datasets/HD-EPIC/HD-EPIC/Videos/P01/{VIDEO_ID_FOR_GAZE}_mp4_to_vrs_time_ns.csv"
 GAZE_EXTRACT_ROOT = Path("/scratch/ll5914/datasets/HD-EPIC/_gaze_extract/mps_P01-20240202-110250_vrs/eye_gaze")
@@ -50,7 +51,7 @@ GAZE_CSV = GAZE_EXTRACT_ROOT / "general_eye_gaze.csv"
 
 
 class GazeInferenceDataset(Dataset):
-    """与训练相同采样，额外返回解码帧号（对齐 gaze）。"""
+    """Same sampling as training; additionally returns decoded frame indices for gaze alignment."""
     def __init__(self, ann_df: pd.DataFrame, transform_fn, verb_map, noun_map, action_map):
         self.transform_fn = transform_fn
         self.samples = []
@@ -173,7 +174,7 @@ def fresh_state():
 
 
 class HDEpicProbe(torch.nn.Module):
-    """复制自 train_hdepic_probe，避免 import optimizer 等大段副作用。"""
+    """Replicated from train_hdepic_probe to avoid importing the full training module."""
     def __init__(self, embed_dim, num_verbs, num_nouns, num_actions):
         super().__init__()
         self.pooler = AttentivePooler(
@@ -194,13 +195,13 @@ class HDEpicProbe(torch.nn.Module):
 
 def run():
     if not os.path.isfile(SYNC_CSV) or not GAZE_CSV.is_file():
-        print("缺少时间对齐或 gaze CSV，请检查:")
+        print("Missing time-sync or gaze CSV, please check:")
         print(" ", SYNC_CSV)
         print(" ", GAZE_CSV)
         return
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("设备:", device)
+    print("Device:", device)
 
     sync_df = pd.read_csv(SYNC_CSV)
     gaze_df = pd.read_csv(GAZE_CSV)
@@ -219,17 +220,17 @@ def run():
         else Path(tcfg.PROBE_BEST)
     )
     if not ckpt_path.is_file():
-        print("未找到 probe checkpoint:", tcfg.PROBE_LAST, "或", tcfg.PROBE_BEST)
+        print("Probe checkpoint not found:", tcfg.PROBE_LAST, "or", tcfg.PROBE_BEST)
         return
     ck = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
     print("Checkpoint:", ckpt_path, "epoch", ck.get("epoch"))
     action_map_ck = ck.get("action_map")
     if action_map_ck is None:
-        raise KeyError("checkpoint 缺少 action_map")
+        raise KeyError("checkpoint missing action_map")
 
     val_df = p01[~p01["video_id"].str.contains(tcfg.TRAIN_DATE)]
     subset = val_df[val_df["video_id"] == VIDEO_ID_FOR_GAZE]
-    print(f"评估视频 {VIDEO_ID_FOR_GAZE}，样本数（过滤后）: {len(subset)}")
+    print(f"Evaluating video {VIDEO_ID_FOR_GAZE}, samples (filtered): {len(subset)}")
 
     ds = GazeInferenceDataset(
         subset,
@@ -239,13 +240,13 @@ def run():
         action_map_ck,
     )
     if len(ds) == 0:
-        print("无有效样本，退出。")
+        print("No valid samples, exiting.")
         return
 
     max_eval = int(os.environ.get("HDEPIC_GAZE_EVAL_MAX", "0"))
     if max_eval > 0:
         ds.samples = ds.samples[:max_eval]
-        print(f"HDEPIC_GAZE_EVAL_MAX={max_eval}，仅评估前 {len(ds.samples)} 条样本。")
+        print(f"HDEPIC_GAZE_EVAL_MAX={max_eval}: evaluating first {len(ds.samples)} samples only.")
 
     bs = int(os.environ.get("HDEPIC_GAZE_BATCH", "2"))
 
@@ -306,10 +307,10 @@ def run():
             vg, ng, ag = probe(fg)
             update_metrics(st_gaze, vg, ng, ag, v_ids, n_ids, a_ids)
 
-    print("\n====== Baseline（无 gaze 门控）======")
+    print("\n====== Baseline (no gaze gating) ======")
     for k, v in summarize(st_base).items():
         print(f"  {k}: {v:.2f}%")
-    print("\n====== Gaze + motion 热力图 → token gate ======")
+    print("\n====== Gaze + motion heatmap -> token gate ======")
     for k, v in summarize(st_gaze).items():
         print(f"  {k}: {v:.2f}%")
 

@@ -9,7 +9,7 @@
 #SBATCH --output=/scratch/ll5914/logs/hdepic_gaze_infer_%j.out
 
 export PYTHONUNBUFFERED=1
-# 可选：仅 smoke 测试前 N 条
+# Optional: uncomment for smoke test (first N samples)
 # export HDEPIC_GAZE_EVAL_MAX=32
 # export HDEPIC_GAZE_BATCH=2
 

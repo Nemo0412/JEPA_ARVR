@@ -1,7 +1,7 @@
 """
-V-JEPA 2 Action Anticipation on HD-EPIC — P01 第一个场景
-指标: Verb Top-3, Noun Top-3, Action Recall@5 (Class-Mean)
-场景: P01-20240203-093333 (约3分钟，做咖啡场景)
+V-JEPA 2 Action Anticipation on HD-EPIC — P01 first scene
+Metrics: Verb Top-3, Noun Top-3, Action Recall@5 (class-mean)
+Scene: P01-20240203-093333 (~3 min, morning coffee preparation)
 """
 
 import sys, pickle
@@ -44,7 +44,7 @@ def build_transform():
 
 
 def build_ek100_maps():
-    """与官方 epickitchens.py 相同逻辑，保证 action_id 与 checkpoint 一致。"""
+    """Same logic as official epickitchens.py to ensure action_id matches checkpoint."""
     tdf = pd.read_csv(EK100_TRAIN_CSV)
     tactions = set(zip(tdf["verb_class"].values, tdf["noun_class"].values))
     tverbs   = set(v for v, _ in tactions)
@@ -62,7 +62,7 @@ def build_ek100_maps():
 
 
 def load_encoder(device):
-    print("  加载 ViT-L encoder...")
+    print("  Loading ViT-L encoder...")
     model = vit_large_rope(
         img_size=(IMG_SIZE, IMG_SIZE), num_frames=FRAMES_PER_CLIP,
         tubelet_size=2, patch_size=16, uniform_power=True,
@@ -76,7 +76,7 @@ def load_encoder(device):
 
 
 def load_probe(verb_map, noun_map, action_map, embed_dim, device):
-    print(f"  加载 EK100 probe (verbs={len(verb_map)}, nouns={len(noun_map)}, actions={len(action_map)})...")
+    print(f"  Loading EK100 probe (verbs={len(verb_map)}, nouns={len(noun_map)}, actions={len(action_map)})...")
     classifier = AttentiveClassifier(
         verb_classes=verb_map, noun_classes=noun_map, action_classes=action_map,
         embed_dim=embed_dim, num_heads=16, depth=4, use_activation_checkpointing=False,
@@ -110,28 +110,28 @@ def class_mean_recall(per_class_correct, per_class_total):
 def run():
     print("=" * 70)
     print("V-JEPA 2 — HD-EPIC Action Anticipation")
-    print(f"场景: {VIDEO_ID}  (早晨咖啡机操作，约3分钟)")
+    print(f"Scene: {VIDEO_ID}  (morning coffee preparation, ~3 min)")
     print("=" * 70)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"设备: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
+    print(f"Device: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
 
-    print("\n[1] 加载标注...")
+    print("\n[1] Loading annotations...")
     verb_map, noun_map, verb_n2id, noun_n2id, action_o2m, action_map = build_ek100_maps()
     with open(HD_EPIC_NARR, "rb") as f:
         narr_df = pickle.load(f)
     scene_df = narr_df[narr_df['video_id'] == VIDEO_ID].sort_values('start_timestamp').reset_index(drop=True)
-    print(f"  {VIDEO_ID} 共 {len(scene_df)} 个标注动作")
+    print(f"  {VIDEO_ID} — {len(scene_df)} annotated actions")
 
-    print("\n[2] 加载模型...")
+    print("\n[2] Loading models...")
     encoder    = load_encoder(device)
     classifier = load_probe(verb_map, noun_map, action_map, encoder.embed_dim, device)
 
-    print("\n[3] 加载视频...")
+    print("\n[3] Loading video...")
     vr       = VideoReader(VIDEO_PATH, num_threads=1, ctx=cpu(0))
     vfps     = vr.get_avg_fps()
     duration = len(vr) / vfps
-    print(f"  {len(vr)} 帧, {vfps:.1f} FPS, 时长 {duration:.1f}s ({duration/60:.1f}min)")
+    print(f"  {len(vr)} frames, {vfps:.1f} FPS, duration {duration:.1f}s ({duration/60:.1f}min)")
 
     transform = build_transform()
 
@@ -145,13 +145,13 @@ def run():
 
     verb_correct   = {1: 0, 3: 0, 5: 0}
     noun_correct   = {1: 0, 3: 0, 5: 0}
-    # action Recall@5: 用 HD-EPIC 第一个 verb 和第一个 noun 找对应的 EK100 action_id
+    # Action Recall@5: match first verb/noun to EK100 action_id
     act_cls_c5 = defaultdict(int); act_cls_t = defaultdict(int)
     verb_cls_c5 = defaultdict(int); verb_cls_t = defaultdict(int)
     noun_cls_c5 = defaultdict(int); noun_cls_t = defaultdict(int)
     total = 0
 
-    print("\n[4] 逐动作推理...")
+    print("\n[4] Running inference per action...")
     for _, row in scene_df.iterrows():
         start_sec = float(row['start_timestamp'])
         obs_end   = start_sec - ANTICIPATION_SEC
@@ -172,7 +172,7 @@ def run():
             if topk_hit_any(gt_verbs, output["verb"], verb_map, k): verb_correct[k] += 1
             if topk_hit_any(gt_nouns, output["noun"], noun_map, k): noun_correct[k] += 1
 
-        # Class-mean Recall@5 — 用能在 EK100 词汇表里找到的 GT 词
+        # Class-mean Recall@5 — using GT words that can be found in EK100 vocabulary
         v_id = verb_n2id.get(gt_verbs[0], None)
         n_id = noun_n2id.get(gt_nouns[0], None)
         if v_id is not None:
@@ -182,11 +182,11 @@ def run():
             noun_cls_t[n_id] += 1
             if topk_hit_any(gt_nouns, output["noun"], noun_map, 5): noun_cls_c5[n_id] += 1
 
-        # Action Recall@5: 找 EK100 训练集里对应的 action_id
-        # HD-EPIC verbs/nouns 的名字和 EK100 可能部分重叠
+        # Action Recall@5: look up corresponding action_id in EK100 train set
+        # HD-EPIC verb/noun names may partially overlap with EK100
         for gv in gt_verbs:
             for gn in gt_nouns:
-                # 通过名字找原始 verb/noun class id
+                # Look up original verb/noun class id by name
                 ek_v_rows = tdf[tdf["verb"]==gv]["verb_class"].values
                 ek_n_rows = tdf[tdf["noun"]==gn]["noun_class"].values
                 if len(ek_v_rows) > 0 and len(ek_n_rows) > 0:
@@ -203,7 +203,7 @@ def run():
 
         total += 1
         if total % 10 == 0:
-            print(f"  已处理 {total} 个动作...")
+            print(f"  Processed {total} actions...")
 
     v_cmr5 = class_mean_recall(verb_cls_c5, verb_cls_t)
     n_cmr5 = class_mean_recall(noun_cls_c5, noun_cls_t)
@@ -211,18 +211,18 @@ def run():
     n_act  = sum(act_cls_t.values())
 
     print(f"\n{'=' * 70}")
-    print(f"HD-EPIC {VIDEO_ID}  |  共 {total} 个动作  |  提前 {ANTICIPATION_SEC}s 预测")
+    print(f"HD-EPIC {VIDEO_ID}  |  {total} actions  |  anticipation {ANTICIPATION_SEC}s")
     print(f"{'=' * 70}")
-    print(f"{'指标':<35} {'Verb':>8} {'Noun':>8} {'Action':>8}")
+    print(f"{'Metric':<35} {'Verb':>8} {'Noun':>8} {'Action':>8}")
     print(f"{'-' * 63}")
     for k in [1, 3, 5]:
         vp  = 100 * verb_correct[k]  / total
         np_ = 100 * noun_correct[k]  / total
-        print(f"  Top-{k} (词汇命中率)             {vp:>7.1f}% {np_:>7.1f}%")
-    print(f"  Class-Mean Recall@5 (EK100词汇) {v_cmr5:>7.1f}% {n_cmr5:>7.1f}% {a_cmr5:>7.1f}%")
+        print(f"  Top-{k} (vocab hit rate)             {vp:>7.1f}% {np_:>7.1f}%")
+    print(f"  Class-Mean Recall@5 (EK100 vocab) {v_cmr5:>7.1f}% {n_cmr5:>7.1f}% {a_cmr5:>7.1f}%")
     print(f"{'=' * 70}")
     print()
-    print(f"说明: HD-EPIC 词汇表与 EK100 不同，能匹配到 Action 的动作有 {n_act} 个。")
+    print(f"Note: HD-EPIC vocabulary differs from EK100; {n_act} actions could be matched to EK100 action ids.")
 
 
 if __name__ == "__main__":
