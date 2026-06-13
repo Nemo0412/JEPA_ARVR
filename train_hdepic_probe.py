@@ -58,6 +58,13 @@ WEIGHT_DECAY     = 1e-4
 WARMUP_EPOCHS    = 2
 NUM_WORKERS      = 4
 
+# ── LoRA hyper-parameters ────────────────────────────────────────────
+# Set LORA_RANK = 0 to keep the encoder fully frozen (original behaviour).
+# Typical choices: rank ∈ {4, 8, 16}, alpha = 2 × rank.
+LORA_RANK  = 8     # rank of the low-rank adapters; 0 disables LoRA
+LORA_ALPHA = 16.0  # LoRA scaling: effective ΔW is scaled by alpha / rank
+LORA_LR    = 5e-5  # separate (smaller) learning rate for encoder LoRA params
+
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
 
@@ -145,6 +152,65 @@ def build_transforms(is_train):
         ])
 
 
+# ── LoRA ────────────────────────────────────────────────────────────
+class LoRALinear(nn.Module):
+    """Wraps a *frozen* nn.Linear with trainable low-rank delta: ΔW = B·A·(alpha/rank).
+
+    Only lora_A and lora_B require gradients; the wrapped linear is kept frozen.
+    Initialised so that B·A = 0 (identity-preserving at the start of training).
+    """
+
+    def __init__(self, linear: nn.Linear, rank: int, alpha: float):
+        super().__init__()
+        self.linear = linear                    # frozen base weight
+        self.rank   = rank
+        self.scale  = alpha / rank
+        d_in  = linear.in_features
+        d_out = linear.out_features
+        # A is randomly initialised (small), B starts at zero → ΔW = 0 initially
+        self.lora_A = nn.Parameter(torch.randn(rank, d_in)  * 0.02)
+        self.lora_B = nn.Parameter(torch.zeros(d_out, rank))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x) + (x @ self.lora_A.T @ self.lora_B.T) * self.scale
+
+    def extra_repr(self) -> str:
+        return (f"in={self.linear.in_features}, out={self.linear.out_features}, "
+                f"rank={self.rank}, scale={self.scale:.3f}")
+
+
+def apply_lora_to_encoder(encoder: nn.Module, rank: int, alpha: float) -> nn.Module:
+    """Inject LoRA adapters into every transformer block's attention qkv & proj.
+
+    After injection:
+      - All *base* encoder parameters have requires_grad=False (frozen).
+      - Only the injected lora_A / lora_B parameters have requires_grad=True.
+
+    Returns the modified encoder (in-place).
+    """
+    for block in encoder.blocks:
+        attn = block.attn
+        # Freeze the underlying Linear before wrapping so LoRALinear inherits the state
+        for p in attn.qkv.parameters():
+            p.requires_grad = False
+        for p in attn.proj.parameters():
+            p.requires_grad = False
+        attn.qkv  = LoRALinear(attn.qkv,  rank=rank, alpha=alpha)
+        attn.proj = LoRALinear(attn.proj, rank=rank, alpha=alpha)
+
+    # Double-check: only lora_A / lora_B are trainable
+    for name, p in encoder.named_parameters():
+        p.requires_grad = ("lora_A" in name or "lora_B" in name)
+
+    n_lora = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
+    n_total = sum(p.numel() for p in encoder.parameters())
+    print(f"  LoRA injected into encoder: rank={rank}, alpha={alpha:.1f}")
+    print(f"  Trainable encoder params: {n_lora / 1e6:.3f}M  "
+          f"/ total encoder params: {n_total / 1e6:.1f}M  "
+          f"({100.0 * n_lora / n_total:.2f}%)")
+    return encoder
+
+
 # ── Model ───────────────────────────────────────────────────────────
 class HDEpicProbe(nn.Module):
     """Standalone HD-EPIC classification head (num_queries=3: verb, noun, action)"""
@@ -169,8 +235,21 @@ class HDEpicProbe(nn.Module):
         return v, n, a
 
 
-def load_encoder(device):
-    print("  Loading ViT-L encoder (frozen)...")
+def load_encoder(device, lora_rank: int = 0):
+    """Load the pretrained ViT-L encoder.
+
+    If lora_rank > 0, LoRA adapters are injected into every attention block.
+    Only the LoRA parameters (lora_A, lora_B) will have requires_grad=True;
+    all pre-trained weights remain frozen.
+
+    The encoder is returned in train() mode when LoRA is active so that
+    gradients can flow through the LoRA path, and in eval() mode otherwise.
+    (ViT-L uses LayerNorm and default drop=0, so train/eval mode has no effect
+    on the frozen path; it matters only for the LoRA gradient computation.)
+    """
+    lora_active = lora_rank > 0
+    mode_str    = f"LoRA rank={lora_rank}" if lora_active else "fully frozen"
+    print(f"  Loading ViT-L encoder ({mode_str})...")
     model = vit_large_rope(
         img_size=(IMG_SIZE, IMG_SIZE),
         num_frames=FRAMES_PER_CLIP,
@@ -183,12 +262,22 @@ def load_encoder(device):
     model.load_state_dict(state, strict=False)
     for p in model.parameters():
         p.requires_grad = False
-    return model.to(device).eval()
+    model = model.to(device)
+    if lora_active:
+        apply_lora_to_encoder(model, rank=lora_rank, alpha=LORA_ALPHA)
+        model.train()   # train mode so backward passes work through LoRA params
+    else:
+        model.eval()
+    return model
 
 
 # ── Evaluation ──────────────────────────────────────────────────────
 def evaluate(encoder, probe, loader, device, num_verbs, num_nouns, num_actions):
+    # Switch both models to eval mode; remember encoder's prior mode so we can restore it.
+    was_training = encoder.training
+    encoder.eval()
     probe.eval()
+
     v_c = defaultdict(int); v_t = defaultdict(int)
     n_c = defaultdict(int); n_t = defaultdict(int)
     a_c = defaultdict(int); a_t = defaultdict(int)
@@ -228,7 +317,7 @@ def evaluate(encoder, probe, loader, device, num_verbs, num_nouns, num_actions):
                 if ai != -1 and ai in a_logits[i].topk(3).indices.tolist(): a_top3 += 1
 
     n_act = sum(a_t.values())
-    return {
+    metrics = {
         "verb_top3":   100 * v_top3   / max(total, 1),
         "noun_top3":   100 * noun_top3 / max(total, 1),
         "action_top3": 100 * a_top3   / max(n_act, 1),
@@ -236,6 +325,11 @@ def evaluate(encoder, probe, loader, device, num_verbs, num_nouns, num_actions):
         "noun_r5":     cmr(n_c, n_t),
         "action_r5":   cmr(a_c, a_t),
     }
+
+    # Restore encoder training mode (relevant when LoRA is active)
+    if was_training:
+        encoder.train()
+    return metrics
 
 
 # ── Main training loop ──────────────────────────────────────────────
@@ -290,18 +384,24 @@ def run(from_scratch=False):
 
     # Load models
     print("\n[2] Loading models...")
-    encoder = load_encoder(device)
+    encoder = load_encoder(device, lora_rank=LORA_RANK)
     probe   = HDEpicProbe(
         embed_dim=encoder.embed_dim,
         num_verbs=len(vdf),
         num_nouns=len(ndf),
         num_actions=len(action_map),
     ).to(device)
-    total_params = sum(p.numel() for p in probe.parameters()) / 1e6
-    print(f"  Probe parameters: {total_params:.1f}M")
+    probe_params = sum(p.numel() for p in probe.parameters()) / 1e6
+    print(f"  Probe parameters: {probe_params:.1f}M")
 
     # Optimizer + LR schedule
-    optimizer = optim.AdamW(probe.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    # Build param groups: probe always trains; encoder LoRA params use a separate (smaller) LR.
+    param_groups: list[dict] = [{"params": list(probe.parameters()), "lr": LR}]
+    if LORA_RANK > 0:
+        lora_params = [p for p in encoder.parameters() if p.requires_grad]
+        param_groups.append({"params": lora_params, "lr": LORA_LR})
+        print(f"  Encoder LoRA trainable params added to optimizer (lr={LORA_LR:.1e})")
+    optimizer = optim.AdamW(param_groups, weight_decay=WEIGHT_DECAY)
     total_steps = NUM_EPOCHS * len(train_loader)
     warmup_steps = WARMUP_EPOCHS * len(train_loader)
 
@@ -315,7 +415,7 @@ def run(from_scratch=False):
     criterion = nn.CrossEntropyLoss()
 
     def pack_ckpt(completed_epochs, metrics):
-        return {
+        ckpt = {
             "epoch": completed_epochs,
             "probe": probe.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -326,7 +426,16 @@ def run(from_scratch=False):
             "metrics": metrics,
             "train_video_ids": sorted(train_df["video_id"].unique().tolist()),
             "val_video_ids": sorted(val_df["video_id"].unique().tolist()),
+            "lora_rank": LORA_RANK,
+            "lora_alpha": LORA_ALPHA,
         }
+        if LORA_RANK > 0:
+            # Only persist the small LoRA delta weights, not the frozen base encoder.
+            ckpt["encoder_lora"] = {
+                k: v for k, v in encoder.state_dict().items()
+                if "lora_A" in k or "lora_B" in k
+            }
+        return ckpt
 
     # -------- Resume training --------
     start_epoch = 0
@@ -345,9 +454,29 @@ def run(from_scratch=False):
             print("=" * 65, flush=True)
             return
 
+        # Restore LoRA weights if the checkpoint contains them
+        if LORA_RANK > 0 and "encoder_lora" in ckpt:
+            ckpt_lora_rank = ckpt.get("lora_rank", LORA_RANK)
+            if ckpt_lora_rank != LORA_RANK:
+                print(f"    [WARN] Checkpoint LoRA rank={ckpt_lora_rank} != current LORA_RANK={LORA_RANK}; "
+                      f"skipping LoRA weight restore.", flush=True)
+            else:
+                missing, unexpected = encoder.load_state_dict(ckpt["encoder_lora"], strict=False)
+                print(f"    Restored encoder LoRA weights "
+                      f"(missing={len(missing)}, unexpected={len(unexpected)})", flush=True)
+        elif LORA_RANK > 0:
+            print(f"    [INFO] No encoder_lora in checkpoint; LoRA adapters start from zero.", flush=True)
+
+        # Restore optimizer — skip if the param-group structure changed (e.g. LoRA added/removed)
         if ckpt.get("optimizer"):
-            optimizer.load_state_dict(ckpt["optimizer"])
-            print(f"    Restored optimizer", flush=True)
+            ckpt_n_groups = len(ckpt["optimizer"].get("param_groups", []))
+            cur_n_groups  = len(optimizer.param_groups)
+            if ckpt_n_groups == cur_n_groups:
+                optimizer.load_state_dict(ckpt["optimizer"])
+                print(f"    Restored optimizer", flush=True)
+            else:
+                print(f"    [WARN] Optimizer param-group count changed "
+                      f"({ckpt_n_groups} → {cur_n_groups}); using fresh optimizer.", flush=True)
         else:
             print(f"    [WARN] No optimizer in ckpt; using fresh optimizer (slight momentum discontinuity)", flush=True)
 
@@ -373,13 +502,18 @@ def run(from_scratch=False):
         else:
             print("\n  [train] No last.pt found, training from scratch", flush=True)
 
-    print(f"\n[3] Starting training ({NUM_EPOCHS} epochs, batch={BATCH_SIZE}, lr={LR})...")
+    lora_active = LORA_RANK > 0
+    print(f"\n[3] Starting training ({NUM_EPOCHS} epochs, batch={BATCH_SIZE}, lr={LR}"
+          + (f", lora_lr={LORA_LR}, lora_rank={LORA_RANK}" if lora_active else ", encoder frozen")
+          + ")...")
     print(f"    Saved every epoch: {PROBE_LAST}", flush=True)
     print(f"    Saved on best Verb R@5: {PROBE_BEST}", flush=True)
     print("=" * 65, flush=True)
 
     for epoch in range(start_epoch, NUM_EPOCHS):
         probe.train()
+        if lora_active:
+            encoder.train()   # LoRA params need gradients
         epoch_loss = 0.0
         t0 = time.time()
 
@@ -388,8 +522,13 @@ def run(from_scratch=False):
             v_ids  = v_ids.to(device)
             n_ids  = n_ids.to(device)
 
-            with torch.no_grad():
+            # When LoRA is active we need a gradient graph through the encoder.
+            # Frozen base weights have requires_grad=False so they accumulate no grads.
+            if lora_active:
                 feats = encoder(clips)
+            else:
+                with torch.no_grad():
+                    feats = encoder(clips)
 
             a_ids = a_ids.to(device)
             v_logits, n_logits, a_logits = probe(feats)
@@ -400,7 +539,11 @@ def run(from_scratch=False):
 
             optimizer.zero_grad()
             loss.backward()
+            # Clip gradients for probe; also clip LoRA grads if active
             nn.utils.clip_grad_norm_(probe.parameters(), 1.0)
+            if lora_active:
+                lora_trainable = [p for p in encoder.parameters() if p.requires_grad]
+                nn.utils.clip_grad_norm_(lora_trainable, 1.0)
             optimizer.step()
             scheduler.step()
 
@@ -429,6 +572,7 @@ def run(from_scratch=False):
             torch.save(pack_ckpt(epoch + 1, metrics), PROBE_BEST)
             print(f"  ✓ Saved best (verb R@5={best_verb_r5:.1f}%) -> {PROBE_BEST}", flush=True)
 
+        # evaluate() already restored encoder.train() if needed (LoRA case)
         probe.train()
         print("", flush=True)
 
