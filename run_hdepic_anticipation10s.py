@@ -39,7 +39,7 @@ from hdepic_anticipation_ar import (
     build_anticipative_model,
     build_transforms,
     load_label_maps,
-    split_train_val,
+    split_data,
 )
 
 
@@ -75,12 +75,12 @@ def run():
         narr_df = pickle.load(f)
     p01_df = narr_df[narr_df["video_id"].str.startswith("P01")].copy()
     vdf, ndf, verb_map, noun_map, _action_map_local, _, _ = load_label_maps(p01_df, pd)
-    _, val_df = split_train_val(p01_df)
+    _, _val_df, test_df = split_data(p01_df)
 
-    val_ds = HDEpicAnticipationDataset(val_df, build_transforms(False), verb_map, noun_map, action_map, anticipation_sec)
+    val_ds = HDEpicAnticipationDataset(test_df, build_transforms(False), verb_map, noun_map, action_map, anticipation_sec)
     if max_eval > 0:
         val_ds.samples = val_ds.samples[:max_eval]
-    print(f"  Val samples: {len(val_ds)} (anticipation {anticipation_sec}s)", flush=True)
+    print(f"  Test samples: {len(val_ds)} (anticipation {anticipation_sec}s)", flush=True)
     if len(val_ds) == 0:
         print("  No valid val samples, exiting.")
         return

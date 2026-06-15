@@ -58,8 +58,13 @@ DEFAULT_AR_STEPS = 10
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
-# Videos recorded on 20240203 are used for training; the rest for validation.
+# Date-based train / val / test split (no temporal overlap between splits):
+#   Train : 20240203  (12 videos)
+#   Val   : 20240202  ( 6 videos)  — used for early stopping / hyperparameter tuning
+#   Test  : 20240204  ( 9 videos)  — held out for final evaluation
 TRAIN_DATE = "20240203"
+VAL_DATE   = "20240202"
+TEST_DATE  = "20240204"
 
 
 def get_anticipation_sec() -> float:
@@ -297,7 +302,20 @@ def load_label_maps(p01_df, pd_module):
     return vdf, ndf, verb_map, noun_map, action_map, verb_names, noun_names
 
 
-def split_train_val(p01_df):
+def split_data(p01_df):
+    """Return (train_df, val_df, test_df) using a strict date-based split.
+
+    Train : video_id contains TRAIN_DATE (20240203, 12 videos)
+    Val   : video_id contains VAL_DATE   (20240202,  6 videos)
+    Test  : video_id contains TEST_DATE  (20240204,  9 videos)
+    """
     train_df = p01_df[p01_df["video_id"].str.contains(TRAIN_DATE)]
-    val_df = p01_df[~p01_df["video_id"].str.contains(TRAIN_DATE)]
+    val_df   = p01_df[p01_df["video_id"].str.contains(VAL_DATE)]
+    test_df  = p01_df[p01_df["video_id"].str.contains(TEST_DATE)]
+    return train_df, val_df, test_df
+
+
+def split_train_val(p01_df):
+    """Backward-compatible wrapper — returns only (train_df, val_df)."""
+    train_df, val_df, _ = split_data(p01_df)
     return train_df, val_df

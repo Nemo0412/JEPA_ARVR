@@ -1,13 +1,13 @@
 """
 HD-EPIC Probe Fine-tuning on V-JEPA 2
 ======================================
-Freeze V-JEPA 2 ViT-L encoder and train a new AttentiveClassifier
-on HD-EPIC's own verb/noun vocabulary (106 verbs, 303 nouns).
+Freeze V-JEPA 2 ViT-L encoder (optionally with LoRA) and train a new
+AttentiveClassifier on HD-EPIC's own verb/noun vocabulary.
 
-Data split (HD-EPIC P01, 27 videos total):
-  Train: video_id contains '20240203' (12 videos recorded that day)
-  Val:   remaining 15 videos (20240202 + 20240204)
-  (date-based split; same day never appears in both train and val)
+Date-based split (HD-EPIC P01, 27 videos total):
+  Train : 20240203  (12 videos) — used for gradient updates
+  Val   : 20240202  ( 6 videos) — early stopping / best-checkpoint selection
+  Test  : 20240204  ( 9 videos) — final held-out evaluation (reported at end)
 
 Checkpoints:
   hdepic-vitl-probe-last.pt  — overwritten after every epoch
@@ -68,8 +68,10 @@ LORA_LR    = 5e-5  # separate (smaller) learning rate for encoder LoRA params
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
 
-# 20240203 videos used for training; others for validation
-TRAIN_DATE = "20240203"
+# Date-based split — each recording day is kept entirely in one split.
+TRAIN_DATE = "20240203"   # 12 videos → training
+VAL_DATE   = "20240202"   #  6 videos → validation (early stopping)
+TEST_DATE  = "20240204"   #  9 videos → test (final held-out evaluation)
 
 
 # ── Dataset ─────────────────────────────────────────────────────────
@@ -364,22 +366,28 @@ def run(from_scratch=False):
     action_map = {k: i for i, k in enumerate(pairs)}
     print(f"  verbs={len(vdf)}, nouns={len(ndf)}, actions={len(action_map)}")
 
-    # Train / val split
+    # Train / val / test split (strict date-based — no day appears in two splits)
     train_df = p01_df[p01_df['video_id'].str.contains(TRAIN_DATE)]
-    val_df   = p01_df[~p01_df['video_id'].str.contains(TRAIN_DATE)]
+    val_df   = p01_df[p01_df['video_id'].str.contains(VAL_DATE)]
+    test_df  = p01_df[p01_df['video_id'].str.contains(TEST_DATE)]
     train_vids = sorted(train_df["video_id"].unique())
     val_vids   = sorted(val_df["video_id"].unique())
-    print(f"  Train annotations: {len(train_df)} rows | {len(train_vids)} videos (date {TRAIN_DATE})")
-    print(f"  Val annotations: {len(val_df)} rows | {len(val_vids)} videos (other dates, used as val)", flush=True)
+    test_vids  = sorted(test_df["video_id"].unique())
+    print(f"  Train : {len(train_df):4d} rows | {len(train_vids):2d} videos ({TRAIN_DATE})")
+    print(f"  Val   : {len(val_df):4d} rows | {len(val_vids):2d} videos ({VAL_DATE})")
+    print(f"  Test  : {len(test_df):4d} rows | {len(test_vids):2d} videos ({TEST_DATE})", flush=True)
 
     # Build datasets
     train_ds = HDEpicDataset(train_df, VIDEO_DIR, build_transforms(True),  verb_map, noun_map, action_map, is_train=True)
     val_ds   = HDEpicDataset(val_df,   VIDEO_DIR, build_transforms(False), verb_map, noun_map, action_map, is_train=False)
-    print(f"  Valid train samples: {len(train_ds)}, val samples: {len(val_ds)}", flush=True)
+    test_ds  = HDEpicDataset(test_df,  VIDEO_DIR, build_transforms(False), verb_map, noun_map, action_map, is_train=False)
+    print(f"  Valid samples — train: {len(train_ds)}, val: {len(val_ds)}, test: {len(test_ds)}", flush=True)
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
+    val_loader   = DataLoader(val_ds,  batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=NUM_WORKERS, pin_memory=True)
+    test_loader  = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False,
                               num_workers=NUM_WORKERS, pin_memory=True)
 
     # Load models
@@ -425,7 +433,8 @@ def run(from_scratch=False):
             "action_map": action_map,
             "metrics": metrics,
             "train_video_ids": sorted(train_df["video_id"].unique().tolist()),
-            "val_video_ids": sorted(val_df["video_id"].unique().tolist()),
+            "val_video_ids":   sorted(val_df["video_id"].unique().tolist()),
+            "test_video_ids":  sorted(test_df["video_id"].unique().tolist()),
             "lora_rank": LORA_RANK,
             "lora_alpha": LORA_ALPHA,
         }
@@ -577,9 +586,23 @@ def run(from_scratch=False):
         print("", flush=True)
 
     print("=" * 65, flush=True)
-    print(f"Training complete! Best Verb Recall@5 = {best_verb_r5:.1f}%", flush=True)
+    print(f"Training complete! Best Val Verb Recall@5 = {best_verb_r5:.1f}%", flush=True)
     print(f"Latest: {PROBE_LAST}", flush=True)
     print(f"Best:   {PROBE_BEST}", flush=True)
+
+    # ── Final evaluation on the held-out test set (best checkpoint) ──
+    print("\n[4] Final test-set evaluation (loading best checkpoint)...", flush=True)
+    best_ck = torch.load(PROBE_BEST, map_location=device, weights_only=False)
+    probe.load_state_dict(best_ck["probe"])
+    if LORA_RANK > 0 and "encoder_lora" in best_ck:
+        encoder.load_state_dict(best_ck["encoder_lora"], strict=False)
+    test_metrics = evaluate(encoder, probe, test_loader, device,
+                            len(vdf), len(ndf), len(action_map))
+    print("  Test set results (best val checkpoint):", flush=True)
+    print(f"    Verb   Top-3={test_metrics['verb_top3']:.1f}%  Recall@5={test_metrics['verb_r5']:.1f}%", flush=True)
+    print(f"    Noun   Top-3={test_metrics['noun_top3']:.1f}%  Recall@5={test_metrics['noun_r5']:.1f}%", flush=True)
+    print(f"    Action Top-3={test_metrics['action_top3']:.1f}%  Recall@5={test_metrics['action_r5']:.1f}%", flush=True)
+    print("=" * 65, flush=True)
 
 
 if __name__ == "__main__":

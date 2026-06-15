@@ -42,7 +42,7 @@ from hdepic_anticipation_ar import (
     build_anticipative_model,
     build_transforms,
     load_label_maps,
-    split_train_val,
+    split_data,
 )
 
 # ── Training hyper-parameters ────────────────────────────────────────
@@ -114,20 +114,26 @@ def run(from_scratch=False):
     vdf, ndf, verb_map, noun_map, action_map, verb_names, noun_names = load_label_maps(p01_df, pd)
     print(f"  verbs={len(vdf)}, nouns={len(ndf)}, actions={len(action_map)}")
 
-    train_df, val_df = split_train_val(p01_df)
-    print(f"  Train annotations: {len(train_df)} rows / val: {len(val_df)} rows", flush=True)
+    train_df, val_df, test_df = split_data(p01_df)
+    print(f"  Train : {len(train_df):4d} rows | {train_df['video_id'].nunique():2d} videos ({cfg.TRAIN_DATE})")
+    print(f"  Val   : {len(val_df):4d} rows | {val_df['video_id'].nunique():2d} videos ({cfg.VAL_DATE})")
+    print(f"  Test  : {len(test_df):4d} rows | {test_df['video_id'].nunique():2d} videos ({cfg.TEST_DATE})", flush=True)
 
-    train_ds = HDEpicAnticipationDataset(train_df, build_transforms(True), verb_map, noun_map, action_map, anticipation_sec)
-    val_ds = HDEpicAnticipationDataset(val_df, build_transforms(False), verb_map, noun_map, action_map, anticipation_sec)
-    print(f"  Valid train samples: {len(train_ds)} / val: {len(val_ds)} (after {anticipation_sec}s filter)", flush=True)
+    train_ds = HDEpicAnticipationDataset(train_df, build_transforms(True),  verb_map, noun_map, action_map, anticipation_sec)
+    val_ds   = HDEpicAnticipationDataset(val_df,   build_transforms(False), verb_map, noun_map, action_map, anticipation_sec)
+    test_ds  = HDEpicAnticipationDataset(test_df,  build_transforms(False), verb_map, noun_map, action_map, anticipation_sec)
+    print(f"  Valid samples — train: {len(train_ds)}, val: {len(val_ds)}, test: {len(test_ds)} "
+          f"(after {anticipation_sec}s filter)", flush=True)
     if len(train_ds) == 0:
         print("  [ERROR] No training samples — reduce HDEPIC_ANTICIPATION_SEC.")
         return
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
-                            num_workers=NUM_WORKERS, pin_memory=True)
+    val_loader   = DataLoader(val_ds,  batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=NUM_WORKERS, pin_memory=True)
+    test_loader  = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=NUM_WORKERS, pin_memory=True)
 
     print("\n[2] Loading model (encoder + predictor frozen)...")
     model = build_anticipative_model(device, num_steps=ar_steps)
@@ -239,7 +245,18 @@ def run(from_scratch=False):
         print("", flush=True)
 
     print("=" * 70, flush=True)
-    print(f"Training complete! Best Verb R@5 = {best_verb_r5:.1f}%", flush=True)
+    print(f"Training complete! Best Val Verb R@5 = {best_verb_r5:.1f}%", flush=True)
+
+    # ── Final evaluation on the held-out test set (best checkpoint) ──
+    print("\n[4] Final test-set evaluation (loading best checkpoint)...", flush=True)
+    best_ck = torch.load(cfg.PROBE_BEST, map_location=device, weights_only=False)
+    probe.load_state_dict(best_ck["probe"])
+    test_metrics = evaluate(model, probe, test_loader, device, anticipation_sec)
+    print("  Test set results (best val checkpoint):", flush=True)
+    print(f"    Verb   Top-3={test_metrics['verb_top3']:.1f}%  R@5={test_metrics['verb_r5']:.1f}%", flush=True)
+    print(f"    Noun   Top-3={test_metrics['noun_top3']:.1f}%  R@5={test_metrics['noun_r5']:.1f}%", flush=True)
+    print(f"    Action Top-3={test_metrics['action_top3']:.1f}%  R@5={test_metrics['action_r5']:.1f}%", flush=True)
+    print("=" * 70, flush=True)
 
 
 if __name__ == "__main__":
