@@ -202,9 +202,9 @@ def run(from_scratch=False):
     vdf, ndf, verb_map, noun_map, action_map, verb_names, noun_names = load_label_maps(p01_df, pd)
     print(f"  verbs={len(vdf)}, nouns={len(ndf)}, actions={len(action_map)}")
     train_df, val_df, test_df = split_data(p01_df)
-    print(f"  Train : {len(train_df):4d} rows | {train_df['video_id'].nunique():2d} videos ({cfg.TRAIN_DATE})")
-    print(f"  Val   : {len(val_df):4d} rows | {val_df['video_id'].nunique():2d} videos ({cfg.VAL_DATE})")
-    print(f"  Test  : {len(test_df):4d} rows | {test_df['video_id'].nunique():2d} videos ({cfg.TEST_DATE})", flush=True)
+    print(f"  Train : {len(train_df):4d} rows | {train_df['video_id'].nunique():2d} videos")
+    print(f"  Val   : {len(val_df):4d} rows | {val_df['video_id'].nunique():2d} videos")
+    print(f"  Test  : {len(test_df):4d} rows | {test_df['video_id'].nunique():2d} videos", flush=True)
 
     pose_loader = PoseLoader()
 

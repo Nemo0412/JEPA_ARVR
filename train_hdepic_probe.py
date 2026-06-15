@@ -21,6 +21,7 @@ Usage:
 
 import sys, os, pickle, time, argparse
 sys.path.insert(0, "/home/ll5914/ARVR_Video/vjepa2")
+sys.path.insert(0, "/home/ll5914/ARVR_Video")
 
 import numpy as np
 import pandas as pd
@@ -35,6 +36,9 @@ import src.datasets.utils.video.transforms as video_transforms
 import src.datasets.utils.video.volume_transforms as volume_transforms
 from src.models.attentive_pooler import AttentivePooler
 from src.models.vision_transformer import vit_large_rope
+
+# Single source of truth for the train/val/test video-ID split
+from hdepic_anticipation_ar import TRAIN_VIDEO_IDS, VAL_VIDEO_IDS, TEST_VIDEO_IDS
 
 # ── Paths ───────────────────────────────────────────────────────────
 ENCODER_CKPT  = "/scratch/ll5914/models/vjepa2/vitl.pt"
@@ -68,10 +72,10 @@ LORA_LR    = 5e-5  # separate (smaller) learning rate for encoder LoRA params
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
 
-# Date-based split — each recording day is kept entirely in one split.
-TRAIN_DATE = "20240203"   # 12 videos → training
-VAL_DATE   = "20240202"   #  6 videos → validation (early stopping)
-TEST_DATE  = "20240204"   #  9 videos → test (final held-out evaluation)
+# Split sizes (defined by the explicit video-ID sets imported above):
+#   Train : 20 videos  (TRAIN_VIDEO_IDS)
+#   Val   :  2 videos  (VAL_VIDEO_IDS)   — early stopping
+#   Test  :  5 videos  (TEST_VIDEO_IDS)  — held-out final evaluation
 
 
 # ── Dataset ─────────────────────────────────────────────────────────
@@ -366,16 +370,16 @@ def run(from_scratch=False):
     action_map = {k: i for i, k in enumerate(pairs)}
     print(f"  verbs={len(vdf)}, nouns={len(ndf)}, actions={len(action_map)}")
 
-    # Train / val / test split (strict date-based — no day appears in two splits)
-    train_df = p01_df[p01_df['video_id'].str.contains(TRAIN_DATE)]
-    val_df   = p01_df[p01_df['video_id'].str.contains(VAL_DATE)]
-    test_df  = p01_df[p01_df['video_id'].str.contains(TEST_DATE)]
+    # Train / val / test split via explicit video-ID sets
+    train_df = p01_df[p01_df['video_id'].isin(TRAIN_VIDEO_IDS)]
+    val_df   = p01_df[p01_df['video_id'].isin(VAL_VIDEO_IDS)]
+    test_df  = p01_df[p01_df['video_id'].isin(TEST_VIDEO_IDS)]
     train_vids = sorted(train_df["video_id"].unique())
     val_vids   = sorted(val_df["video_id"].unique())
     test_vids  = sorted(test_df["video_id"].unique())
-    print(f"  Train : {len(train_df):4d} rows | {len(train_vids):2d} videos ({TRAIN_DATE})")
-    print(f"  Val   : {len(val_df):4d} rows | {len(val_vids):2d} videos ({VAL_DATE})")
-    print(f"  Test  : {len(test_df):4d} rows | {len(test_vids):2d} videos ({TEST_DATE})", flush=True)
+    print(f"  Train : {len(train_df):4d} rows | {len(train_vids):2d} videos")
+    print(f"  Val   : {len(val_df):4d} rows | {len(val_vids):2d} videos")
+    print(f"  Test  : {len(test_df):4d} rows | {len(test_vids):2d} videos", flush=True)
 
     # Build datasets
     train_ds = HDEpicDataset(train_df, VIDEO_DIR, build_transforms(True),  verb_map, noun_map, action_map, is_train=True)

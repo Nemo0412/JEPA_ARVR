@@ -58,13 +58,55 @@ DEFAULT_AR_STEPS = 10
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
-# Date-based train / val / test split (no temporal overlap between splits):
-#   Train : 20240203  (12 videos)
-#   Val   : 20240202  ( 6 videos)  — used for early stopping / hyperparameter tuning
-#   Test  : 20240204  ( 9 videos)  — held out for final evaluation
-TRAIN_DATE = "20240203"
-VAL_DATE   = "20240202"
-TEST_DATE  = "20240204"
+# Explicit video-ID split: 20 train / 2 val / 5 test (27 videos total, P01 only).
+#
+# Assignment strategy:
+#   - All 12 videos from 20240203 go to train (largest single recording day).
+#   - 20240202 and 20240204 are split so val/test stay small and representative.
+#   - P01-20240202-110250 (the only video with extracted gaze data) is kept in val.
+#   - Test uses the first 5 videos from 20240204 (chronologically earliest in that day).
+#
+# Train (20): 4 × 20240202  +  12 × 20240203  +  4 × 20240204
+# Val   ( 2): 2 × 20240202
+# Test  ( 5): 5 × 20240204
+TRAIN_VIDEO_IDS: frozenset[str] = frozenset({
+    # 20240202 — 4 videos
+    "P01-20240202-161948",
+    "P01-20240202-171220",
+    "P01-20240202-175627",
+    "P01-20240202-195538",
+    # 20240203 — all 12 videos
+    "P01-20240203-093333",
+    "P01-20240203-121517",
+    "P01-20240203-123350",
+    "P01-20240203-130505",
+    "P01-20240203-132119",
+    "P01-20240203-135502",
+    "P01-20240203-150506",
+    "P01-20240203-152323",
+    "P01-20240203-152956",
+    "P01-20240203-161757",
+    "P01-20240203-184045",
+    "P01-20240203-184214",
+    # 20240204 — 4 videos (last four chronologically)
+    "P01-20240204-142301",
+    "P01-20240204-145458",
+    "P01-20240204-152537",
+    "P01-20240204-160230",
+})
+
+VAL_VIDEO_IDS: frozenset[str] = frozenset({
+    "P01-20240202-110250",   # only video with extracted gaze data — keep in val
+    "P01-20240202-161354",
+})
+
+TEST_VIDEO_IDS: frozenset[str] = frozenset({
+    "P01-20240204-095114",
+    "P01-20240204-120411",
+    "P01-20240204-121042",
+    "P01-20240204-124504",
+    "P01-20240204-130448",
+})
 
 
 def get_anticipation_sec() -> float:
@@ -303,15 +345,15 @@ def load_label_maps(p01_df, pd_module):
 
 
 def split_data(p01_df):
-    """Return (train_df, val_df, test_df) using a strict date-based split.
+    """Return (train_df, val_df, test_df) using the explicit video-ID split.
 
-    Train : video_id contains TRAIN_DATE (20240203, 12 videos)
-    Val   : video_id contains VAL_DATE   (20240202,  6 videos)
-    Test  : video_id contains TEST_DATE  (20240204,  9 videos)
+    Train : TRAIN_VIDEO_IDS  (20 videos)
+    Val   : VAL_VIDEO_IDS    ( 2 videos) — early stopping / hyperparameter tuning
+    Test  : TEST_VIDEO_IDS   ( 5 videos) — held-out final evaluation
     """
-    train_df = p01_df[p01_df["video_id"].str.contains(TRAIN_DATE)]
-    val_df   = p01_df[p01_df["video_id"].str.contains(VAL_DATE)]
-    test_df  = p01_df[p01_df["video_id"].str.contains(TEST_DATE)]
+    train_df = p01_df[p01_df["video_id"].isin(TRAIN_VIDEO_IDS)]
+    val_df   = p01_df[p01_df["video_id"].isin(VAL_VIDEO_IDS)]
+    test_df  = p01_df[p01_df["video_id"].isin(TEST_VIDEO_IDS)]
     return train_df, val_df, test_df
 
 

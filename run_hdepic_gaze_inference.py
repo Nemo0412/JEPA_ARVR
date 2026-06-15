@@ -228,7 +228,7 @@ def run():
     if action_map_ck is None:
         raise KeyError("checkpoint missing action_map")
 
-    val_df = p01[p01["video_id"].str.contains(tcfg.VAL_DATE)]
+    val_df = p01[p01["video_id"].isin(tcfg.VAL_VIDEO_IDS)]
     subset = val_df[val_df["video_id"] == VIDEO_ID_FOR_GAZE]
     print(f"Evaluating video {VIDEO_ID_FOR_GAZE}, samples (filtered): {len(subset)}")
 
