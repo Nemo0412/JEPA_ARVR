@@ -77,14 +77,14 @@ def run():
     vdf, ndf, verb_map, noun_map, _action_map_local, _, _ = load_label_maps(p01_df, pd)
     _, _val_df, test_df = split_data(p01_df)
 
-    val_ds = HDEpicAnticipationDataset(test_df, build_transforms(False), verb_map, noun_map, action_map, anticipation_sec)
+    test_ds = HDEpicAnticipationDataset(test_df, build_transforms(False), verb_map, noun_map, action_map, anticipation_sec)
     if max_eval > 0:
-        val_ds.samples = val_ds.samples[:max_eval]
-    print(f"  Test samples: {len(val_ds)} (anticipation {anticipation_sec}s)", flush=True)
-    if len(val_ds) == 0:
-        print("  No valid val samples, exiting.")
+        test_ds.samples = test_ds.samples[:max_eval]
+    print(f"  Test samples: {len(test_ds)} (anticipation {anticipation_sec}s)", flush=True)
+    if len(test_ds) == 0:
+        print("  No valid test samples, exiting.")
         return
-    loader = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=0)
+    loader = DataLoader(test_ds, batch_size=bs, shuffle=False, num_workers=0)
 
     print("\n[2] Loading model (encoder + predictor frozen)...")
     model = build_anticipative_model(device, num_steps=ar_steps)

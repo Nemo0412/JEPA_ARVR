@@ -252,7 +252,15 @@ def run():
 
     loader = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=0, collate_fn=_collate)
 
-    encoder = tcfg.load_encoder(device)
+    # Load encoder — restore LoRA adapters from checkpoint if they were used during training.
+    lora_rank = int(ck.get("lora_rank", 0))
+    encoder = tcfg.load_encoder(device, lora_rank=lora_rank)
+    if lora_rank > 0 and "encoder_lora" in ck:
+        missing, unexpected = encoder.load_state_dict(ck["encoder_lora"], strict=False)
+        print(f"  Loaded encoder LoRA weights (rank={lora_rank}, "
+              f"missing={len(missing)}, unexpected={len(unexpected)})")
+    encoder.eval()
+
     amap = action_map_ck
     probe = HDEpicProbe(
         embed_dim=encoder.embed_dim,

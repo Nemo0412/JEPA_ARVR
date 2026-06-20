@@ -88,14 +88,14 @@ def run():
     _, _val_df, test_df = split_data(p01_df)
 
     pose_loader = PoseLoader()
-    val_ds = HDEpicPoseDataset(test_df, build_transforms(False), verb_map, noun_map,
-                               action_map, anticipation_sec, pose_loader)
+    test_ds = HDEpicPoseDataset(test_df, build_transforms(False), verb_map, noun_map,
+                                action_map, anticipation_sec, pose_loader)
     if max_eval > 0:
-        val_ds.samples = val_ds.samples[:max_eval]
-    print(f"  Test samples: {len(val_ds)}", flush=True)
-    if len(val_ds) == 0:
+        test_ds.samples = test_ds.samples[:max_eval]
+    print(f"  Test samples: {len(test_ds)}", flush=True)
+    if len(test_ds) == 0:
         print("  No valid samples, exiting."); return
-    loader = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=0,
+    loader = DataLoader(test_ds, batch_size=bs, shuffle=False, num_workers=0,
                         collate_fn=collate_fn)
 
     print("\n[2] Loading models...")
