@@ -45,7 +45,7 @@ mkdir -p /scratch/ll5914/logs
 mkdir -p /scratch/ll5914/models/vjepa2
 
 cd /home/ll5914/ARVR_Video/vjepa2
-python /home/ll5914/ARVR_Video/train_hdepic_qwen_probe.py
+python /home/ll5914/ARVR_Video/qwen/train_hdepic_qwen_probe.py
 
 echo ""
 echo "Done: $(date)"

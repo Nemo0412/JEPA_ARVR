@@ -25,6 +25,6 @@ conda activate /scratch/ll5914/conda_envs/SVD
 mkdir -p /scratch/ll5914/logs
 
 cd /home/ll5914/ARVR_Video/vjepa2
-python /home/ll5914/ARVR_Video/run_hdepic_anticipation10s_pose.py
+python /home/ll5914/ARVR_Video/vjepa/run_hdepic_anticipation10s_pose.py
 
 echo "Done: $(date)"
