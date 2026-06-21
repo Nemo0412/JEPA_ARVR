@@ -253,7 +253,6 @@ def prepare_batch_cpu(frames_np: np.ndarray, processor) -> dict:
     """
     B = frames_np.shape[0]
     texts, video_lists = [], []
-    clip_fps = SAMPLE_FRAMES / (FRAMES_PER_CLIP / FPS)   # effective fps of sampled frames
 
     for b in range(B):
         pil_frames = [Image.fromarray(frames_np[b, t]) for t in range(frames_np.shape[1])]
@@ -261,7 +260,7 @@ def prepare_batch_cpu(frames_np: np.ndarray, processor) -> dict:
             {
                 "role": "user",
                 "content": [
-                    {"type": "video", "video": pil_frames, "fps": clip_fps},
+                    {"type": "video", "video": pil_frames},
                     {"type": "text", "text": TASK_PROMPT},
                 ],
             }
