@@ -2,17 +2,16 @@
 #SBATCH --job-name=qwen_probe
 #SBATCH --account=torch_pr_674_tandon_advanced
 #SBATCH --partition=h200_tandon
-#SBATCH --gres=gpu:h200:2
+#SBATCH --gres=gpu:h200:1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=128G
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=80G
 #SBATCH --time=24:00:00
 #SBATCH --output=/scratch/ll5914/logs/qwen_probe_%j.out
 
-# ── Full Qwen2.5-VL-3B (LoRA) — 2× H200 DDP ─────────────────────────
-# Effective global batch = BATCH_SIZE(4) × GRAD_ACCUM(2) × GPUs(2) = 16
-# Each GPU: ~13 GB model+activations → fits well within 80 GB H200.
-# torchrun launches 2 worker processes (one per GPU) on the same node.
+# ── Full Qwen2.5-VL-3B (LoRA) — 1× H200 ─────────────────────────────
+# Account limit: 1 GPU per user.
+# Effective batch = BATCH_SIZE(4) × GRAD_ACCUM(2) = 8
 # ─────────────────────────────────────────────────────────────────────
 
 export PYTHONUNBUFFERED=1
@@ -20,11 +19,11 @@ export HF_HOME=/scratch/ll5914/hf_cache
 export TRANSFORMERS_CACHE=/scratch/ll5914/hf_cache
 mkdir -p /scratch/ll5914/hf_cache
 
-echo "=== Qwen2.5-VL-3B HD-EPIC Probe Baseline (2× H200 DDP) ==="
+echo "=== Qwen2.5-VL-3B HD-EPIC Probe Baseline (1× H200) ==="
 echo "Job ID  : $SLURM_JOB_ID"
 echo "Node    : $SLURMD_NODENAME"
-echo "GPUs    : $(nvidia-smi --query-gpu=name --format=csv,noheader | tr '\n' ' ')"
-echo "Walltime: 24h | 2× H200 | mem: 128 GB"
+echo "GPU     : $(nvidia-smi --query-gpu=name --format=csv,noheader)"
+echo "Walltime: 24h | 1× H200 | mem: 80 GB"
 echo "Start   : $(date)"
 echo ""
 
@@ -42,11 +41,7 @@ export MASTER_ADDR=$(hostname)
 
 cd /home/ll5914/ARVR_Video/vjepa2
 
-torchrun \
-  --nproc_per_node=2 \
-  --master_addr=$MASTER_ADDR \
-  --master_port=$MASTER_PORT \
-  /home/ll5914/ARVR_Video/qwen/train_hdepic_qwen_probe.py
+python /home/ll5914/ARVR_Video/qwen/train_hdepic_qwen_probe.py
 
 echo ""
 echo "Done: $(date)"
