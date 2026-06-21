@@ -258,12 +258,12 @@ class QwenVLProbe(nn.Module):
     def __init__(self, qwen_model, lm_hidden_size, num_verbs, num_nouns, num_actions):
         super().__init__()
         self.qwen = qwen_model
-        # Create heads on the same device+dtype as the Qwen model
-        dev   = next(qwen_model.parameters()).device
-        dtype = next(qwen_model.parameters()).dtype
-        self.verb_head   = nn.Linear(lm_hidden_size, num_verbs).to(device=dev, dtype=dtype)
-        self.noun_head   = nn.Linear(lm_hidden_size, num_nouns).to(device=dev, dtype=dtype)
-        self.action_head = nn.Linear(lm_hidden_size, num_actions).to(device=dev, dtype=dtype)
+        # Heads in float32 on the same device as Qwen (float32 for numerical stability;
+        # last_hidden is cast to float32 in forward before being passed here)
+        dev = next(qwen_model.parameters()).device
+        self.verb_head   = nn.Linear(lm_hidden_size, num_verbs).to(device=dev)
+        self.noun_head   = nn.Linear(lm_hidden_size, num_nouns).to(device=dev)
+        self.action_head = nn.Linear(lm_hidden_size, num_actions).to(device=dev)
 
     def forward(self, **model_inputs):
         outputs = self.qwen(
