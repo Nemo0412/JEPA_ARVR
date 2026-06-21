@@ -162,8 +162,11 @@ class LoRALinear(nn.Module):
         self.rank   = rank
         self.scale  = alpha / rank
         d_in, d_out = linear.in_features, linear.out_features
-        self.lora_A = nn.Parameter(torch.randn(rank, d_in)  * 0.02)
-        self.lora_B = nn.Parameter(torch.zeros(d_out, rank))
+        # Create on the same device AND dtype as the frozen linear to avoid cross-device errors
+        dev   = linear.weight.device
+        dtype = linear.weight.dtype
+        self.lora_A = nn.Parameter(torch.randn(rank, d_in,  device=dev, dtype=dtype) * 0.02)
+        self.lora_B = nn.Parameter(torch.zeros(d_out, rank, device=dev, dtype=dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear(x) + (x @ self.lora_A.T @ self.lora_B.T) * self.scale
