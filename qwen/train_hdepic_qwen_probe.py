@@ -172,21 +172,30 @@ class LoRALinear(nn.Module):
 def apply_lora_to_llm(model: nn.Module, rank: int, alpha: float) -> None:
     """Inject LoRA into q_proj / k_proj / v_proj / o_proj of every LLM layer.
 
-    The Qwen2.5-VL LLM backbone lives at model.model.layers.
-    Vision tower layers are left completely frozen (no LoRA needed there;
-    the pretrained Qwen vision encoder is already strong for visual features).
+    Iterates over all named modules to find attention projections, skipping the
+    vision tower (any module whose name contains 'visual').  This approach is
+    robust to the exact nesting depth of the LLM layers in the model hierarchy.
     """
     n_injected = 0
-    for layer in model.model.layers:
-        attn = layer.self_attn
+    for mod_name, module in model.named_modules():
+        # Skip vision tower entirely
+        if "visual" in mod_name:
+            continue
+        # Look for attention blocks that contain q/k/v/o projections
         for proj_name in ("q_proj", "k_proj", "v_proj", "o_proj"):
-            orig = getattr(attn, proj_name, None)
+            orig = getattr(module, proj_name, None)
             if orig is None or not isinstance(orig, nn.Linear):
                 continue
             for p in orig.parameters():
                 p.requires_grad = False
-            setattr(attn, proj_name, LoRALinear(orig, rank=rank, alpha=alpha))
+            setattr(module, proj_name, LoRALinear(orig, rank=rank, alpha=alpha))
             n_injected += 1
+
+    if n_injected == 0:
+        raise RuntimeError(
+            "No q/k/v/o projections found outside the vision tower. "
+            "Check the model architecture."
+        )
 
     # Only lora_A / lora_B params are trainable; everything else is frozen
     for name, p in model.named_parameters():
@@ -424,9 +433,9 @@ def run(from_scratch: bool = False, lora_rank: int = LORA_RANK):
         return _orig_visual_fwd(*a, **kw)
     qwen_raw.visual.forward = _visual_fwd_no_grad
 
-    # Gradient checkpointing on LLM layers: trades compute for activation
-    # memory, allowing larger batch sizes without OOM.
-    qwen_raw.model.gradient_checkpointing_enable()
+    # Gradient checkpointing on the full model: trades recompute for memory,
+    # allowing larger batch sizes without OOM.
+    qwen_raw.gradient_checkpointing_enable()
 
     processor = AutoProcessor.from_pretrained(QWEN_MODEL_NAME)
 
