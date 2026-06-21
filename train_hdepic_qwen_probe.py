@@ -31,7 +31,7 @@ Usage:
   python train_hdepic_qwen_probe.py --lora-rank 8
 """
 
-import sys, os, pickle, time, argparse
+import sys, os, pickle, time, argparse, threading, queue
 sys.path.insert(0, "/home/ll5914/ARVR_Video/vjepa2")
 sys.path.insert(0, "/home/ll5914/ARVR_Video")
 
@@ -67,13 +67,14 @@ SAMPLE_FRAMES    = 8         # frames sent to Qwen (memory-efficient; 1 every 0.
 # ── Training hyper-parameters ────────────────────────────────────────
 LORA_RANK     = 16           # LoRA rank for LLM q/k/v/o projections
 LORA_ALPHA    = 32.0         # LoRA scaling factor (alpha / rank = 2)
-BATCH_SIZE    = 2            # full VLM + LoRA grads; keep small on H200
-GRAD_ACCUM    = 4            # effective batch = BATCH_SIZE * GRAD_ACCUM = 8
+BATCH_SIZE    = 4            # H200 80 GB; vision tower no_grad frees ~3 GB extra
+GRAD_ACCUM    = 2            # effective batch = BATCH_SIZE * GRAD_ACCUM = 8
 NUM_EPOCHS    = 10
 LR            = 2e-4         # learning rate for LoRA params + classification heads
 WEIGHT_DECAY  = 1e-4
 WARMUP_EPOCHS = 2
 NUM_WORKERS   = 4
+PREFETCH_QUEUE = 3           # batches pre-processed by background thread
 
 # Task prompt prepended to every sample (no class list, model uses language prior)
 TASK_PROMPT = "Based on this video, predict what action the person will perform next."
@@ -235,15 +236,15 @@ class QwenVLProbe(nn.Module):
 
 
 # ── Batch tokenisation helper ────────────────────────────────────────
-def prepare_batch(frames_np: np.ndarray, processor, device: torch.device):
-    """Convert [B, T, H, W, 3] uint8 numpy → Qwen model inputs on `device`.
+def prepare_batch_cpu(frames_np: np.ndarray, processor) -> dict:
+    """Convert [B, T, H, W, 3] uint8 numpy → Qwen model inputs (CPU tensors).
 
-    Each sample in the batch is formatted as a chat message containing a
-    video (list of T PIL images) followed by the task prompt text.
-    Returns a dict suitable for **model_inputs.
+    Runs entirely on CPU so it can be called from a background prefetch thread.
+    Caller moves results to GPU with non_blocking=True.
     """
     B = frames_np.shape[0]
     texts, video_lists = [], []
+    clip_fps = SAMPLE_FRAMES / (FRAMES_PER_CLIP / FPS)   # effective fps of sampled frames
 
     for b in range(B):
         pil_frames = [Image.fromarray(frames_np[b, t]) for t in range(frames_np.shape[1])]
@@ -251,12 +252,7 @@ def prepare_batch(frames_np: np.ndarray, processor, device: torch.device):
             {
                 "role": "user",
                 "content": [
-                    {
-                        "type": "video",
-                        "video": pil_frames,
-                        # Qwen uses fps to set temporal position embeddings
-                        "fps": SAMPLE_FRAMES / (FRAMES_PER_CLIP / FPS),
-                    },
+                    {"type": "video", "video": pil_frames, "fps": clip_fps},
                     {"type": "text", "text": TASK_PROMPT},
                 ],
             }
@@ -267,13 +263,45 @@ def prepare_batch(frames_np: np.ndarray, processor, device: torch.device):
         texts.append(text)
         video_lists.append(pil_frames)
 
-    inputs = processor(
-        text=texts,
-        videos=video_lists,
-        return_tensors="pt",
-        padding=True,
-    )
-    return {k: v.to(device) for k, v in inputs.items()}
+    return processor(text=texts, videos=video_lists, return_tensors="pt", padding=True)
+
+
+class BatchPrefetcher:
+    """Pre-processes Qwen inputs in a background thread while the GPU runs.
+
+    The CPU-bound work (PIL conversion + Qwen image processor + tokenisation)
+    is overlapped with the GPU forward/backward pass, keeping both busy.
+
+    Usage::
+
+        for cpu_inputs, v_ids, n_ids, a_ids in BatchPrefetcher(loader, proc):
+            gpu_inputs = {k: v.to(device, non_blocking=True) for k, v in cpu_inputs.items()}
+            ...
+    """
+
+    def __init__(self, loader, processor, queue_size: int = PREFETCH_QUEUE):
+        self._q = queue.Queue(maxsize=queue_size)
+        t = threading.Thread(target=self._worker, args=(loader, processor), daemon=True)
+        t.start()
+
+    def _worker(self, loader, processor):
+        try:
+            for frames_np, v_ids, n_ids, a_ids in loader:
+                cpu_inputs = prepare_batch_cpu(frames_np, processor)
+                self._q.put((cpu_inputs, v_ids, n_ids, a_ids))
+        except Exception as exc:
+            self._q.put(exc)   # propagate error to main thread
+        finally:
+            self._q.put(None)  # sentinel
+
+    def __iter__(self):
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            if isinstance(item, Exception):
+                raise item
+            yield item
 
 
 # ── Evaluation ──────────────────────────────────────────────────────
@@ -286,8 +314,8 @@ def evaluate(model: QwenVLProbe, processor, loader, device):
     a_c = defaultdict(int); a_t = defaultdict(int)
     v_top3 = n_top3 = a_top3 = total = 0
 
-    for frames_np, v_ids, n_ids, a_ids in loader:
-        inputs = prepare_batch(frames_np, processor, device)
+    for cpu_inputs, v_ids, n_ids, a_ids in BatchPrefetcher(loader, processor):
+        inputs = {k: v.to(device, non_blocking=True) for k, v in cpu_inputs.items()}
         v_logits, n_logits, a_logits = model(**inputs)
 
         for i in range(len(v_ids)):
@@ -387,6 +415,18 @@ def run(from_scratch: bool = False, lora_rank: int = LORA_RANK):
     for p in qwen_raw.parameters():
         p.requires_grad = False
     apply_lora_to_llm(qwen_raw, rank=lora_rank, alpha=LORA_ALPHA)
+
+    # Vision tower is fully frozen → wrap in no_grad so PyTorch does NOT
+    # store intermediate activations for backward, saving ~3 GB VRAM.
+    _orig_visual_fwd = qwen_raw.visual.forward
+    @torch.no_grad()
+    def _visual_fwd_no_grad(*a, **kw):
+        return _orig_visual_fwd(*a, **kw)
+    qwen_raw.visual.forward = _visual_fwd_no_grad
+
+    # Gradient checkpointing on LLM layers: trades compute for activation
+    # memory, allowing larger batch sizes without OOM.
+    qwen_raw.model.gradient_checkpointing_enable()
 
     processor = AutoProcessor.from_pretrained(QWEN_MODEL_NAME)
 
@@ -496,11 +536,13 @@ def run(from_scratch: bool = False, lora_rank: int = LORA_RANK):
         t0 = time.time()
         optimizer.zero_grad()
 
-        for step, (frames_np, v_ids, n_ids, a_ids) in enumerate(train_loader):
-            inputs = prepare_batch(frames_np, processor, device)
-            v_ids  = v_ids.to(device)
-            n_ids  = n_ids.to(device)
-            a_ids  = a_ids.to(device)
+        prefetcher = BatchPrefetcher(train_loader, processor)
+        for step, (cpu_inputs, v_ids, n_ids, a_ids) in enumerate(prefetcher):
+            # Move pre-processed inputs to GPU non-blocking while CPU prepares next batch
+            inputs = {k: v.to(device, non_blocking=True) for k, v in cpu_inputs.items()}
+            v_ids  = v_ids.to(device, non_blocking=True)
+            n_ids  = n_ids.to(device, non_blocking=True)
+            a_ids  = a_ids.to(device, non_blocking=True)
 
             v_logits, n_logits, a_logits = model(**inputs)
             loss = criterion(v_logits, v_ids) + criterion(n_logits, n_ids)
