@@ -4,19 +4,20 @@
 #SBATCH --partition=h200_tandon
 #SBATCH --gres=gpu:h200:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --mem=80G
 #SBATCH --time=24:00:00
 #SBATCH --output=/scratch/ll5914/logs/qwen_probe_%j.out
 
-# ── Qwen2.5-VL-3B visual encoder + AttentivePooler probe ──────────────
+# ── Full Qwen2.5-VL-3B (LoRA) + classification heads ─────────────────
 # Baseline comparable to train_hdepic_probe.py (V-JEPA ViT-L):
 #   - Same HD-EPIC dataset, same 20/2/5 train/val/test split
 #   - Same 4s clip + 1s anticipation horizon
-#   - Same AttentivePooler (depth-4) + verb/noun/action heads
-#   - Only the probe is trained; Qwen visual encoder is frozen
+#   - Full VLM (vision tower + LLM) receives video frames + text prompt
+#   - LoRA fine-tunes LLM q/k/v/o projections; vision tower frozen
+#   - Same Top-3 accuracy & Recall@5 metrics
 #
-# Memory note: Qwen2.5-VL-3B visual tower ~6 GB in BF16;
-#   use 64 GB RAM and one H200 (80 GB VRAM).
+# Memory: full Qwen2.5-VL-3B in BF16 ~7 GB; with LoRA grads + activations
+#   for batch_size=2 and 8 frames → ~40 GB VRAM on one H200 (80 GB).
 # ─────────────────────────────────────────────────────────────────────
 
 export PYTHONUNBUFFERED=1
