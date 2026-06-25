@@ -1,22 +1,27 @@
 """
-HD-EPIC Probe Fine-tuning on V-JEPA 2
-======================================
+HD-EPIC Probe Fine-tuning on V-JEPA 2  (with Attention-based Token Pruning)
+=============================================================================
 Freeze V-JEPA 2 ViT-L encoder (optionally with LoRA) and train a new
 AttentiveClassifier on HD-EPIC's own verb/noun vocabulary.
 
-Date-based split (HD-EPIC P01, 27 videos total):
-  Train : 20240203  (12 videos) — used for gradient updates
-  Val   : 20240202  ( 6 videos) — early stopping / best-checkpoint selection
-  Test  : 20240204  ( 9 videos) — final held-out evaluation (reported at end)
+Attention-based token pruning (optional, PRUNE_KEEP_RATIO > 0):
+  After the encoder's last-layer self-attention we compute how much attention
+  each token receives from all other tokens across all heads:
+
+      importance[j] = Σ_{h, i}  attn[b, h, i, j]
+
+  The top-K tokens (K = N × PRUNE_KEEP_RATIO) are kept and passed to the
+  probe. Importance is computed with chunked Q matmuls so the full O(N²)
+  attention matrix never materialises in memory.
 
 Checkpoints:
-  hdepic-vitl-probe-last.pt  — overwritten after every epoch
-  hdepic-vitl-probe-best.pt  — saved when val Verb Recall@5 improves
+  hdepic-vitl-probe-pruned-last.pt  — overwritten after every epoch
+  hdepic-vitl-probe-pruned-best.pt  — saved when val Verb Recall@5 improves
 
 Usage:
   cd /home/ll5914/ARVR_Video/vjepa2
-  python ../train_hdepic_probe.py           # resumes from last.pt if present
-  python ../train_hdepic_probe.py --from-scratch
+  python ../vjepa/train_hdepic_probe.py           # resumes from last.pt if present
+  python ../vjepa/train_hdepic_probe.py --from-scratch
 """
 
 import sys, os, pickle, time, argparse
@@ -27,6 +32,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from collections import defaultdict
@@ -36,6 +42,7 @@ import src.datasets.utils.video.transforms as video_transforms
 import src.datasets.utils.video.volume_transforms as volume_transforms
 from src.models.attentive_pooler import AttentivePooler
 from src.models.vision_transformer import vit_large_rope
+from src.models.utils.modules import rotate_queries_or_keys
 
 # Single source of truth for the train/val/test video-ID split
 from hdepic_anticipation_ar import TRAIN_VIDEO_IDS, VAL_VIDEO_IDS, TEST_VIDEO_IDS
@@ -47,8 +54,8 @@ HD_VERB_CSV   = "/scratch/ll5914/datasets/HD-EPIC/hd-epic-annotations/narrations
 HD_NOUN_CSV   = "/scratch/ll5914/datasets/HD-EPIC/hd-epic-annotations/narrations-and-action-segments/HD_EPIC_noun_classes.csv"
 VIDEO_DIR     = "/scratch/ll5914/datasets/HD-EPIC/HD-EPIC/Videos/P01"
 SAVE_DIR      = "/scratch/ll5914/models/vjepa2"
-PROBE_BEST    = os.path.join(SAVE_DIR, "hdepic-vitl-probe-best.pt")
-PROBE_LAST    = os.path.join(SAVE_DIR, "hdepic-vitl-probe-last.pt")
+PROBE_BEST    = os.path.join(SAVE_DIR, "hdepic-vitl-probe-pruned-best.pt")
+PROBE_LAST    = os.path.join(SAVE_DIR, "hdepic-vitl-probe-pruned-last.pt")
 
 # ── Hyper-parameters ────────────────────────────────────────────────
 IMG_SIZE         = 256
@@ -68,6 +75,19 @@ NUM_WORKERS      = 4
 LORA_RANK  = 8     # rank of the low-rank adapters; 0 disables LoRA
 LORA_ALPHA = 16.0  # LoRA scaling: effective ΔW is scaled by alpha / rank
 LORA_LR    = 5e-5  # separate (smaller) learning rate for encoder LoRA params
+
+# ── Attention-based token pruning ────────────────────────────────────
+# After the encoder's last-layer self-attention, each token's importance
+# equals the total attention it receives from all other tokens across
+# all heads.  The top-K tokens (K = N × PRUNE_KEEP_RATIO) are selected.
+#
+# Set PRUNE_KEEP_RATIO = 0.0 to disable pruning entirely.
+# Typical choices: 0.25 (aggressive), 0.50 (moderate), 0.75 (mild).
+#
+# For ViT-L with 256×256 input and 32 frames (tubelet_size=2):
+#   N = (256/16)² × (32/2) = 256 × 16 = 4 096 tokens per clip.
+PRUNE_KEEP_RATIO = 0.5   # keep 50 % of tokens  (4 096 → 2 048)
+PRUNE_CHUNK_SIZE = 64    # chunk size for memory-efficient importance computation
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
@@ -217,6 +237,164 @@ def apply_lora_to_encoder(encoder: nn.Module, rank: int, alpha: float) -> nn.Mod
     return encoder
 
 
+# ── Attention-based Token Pruning ───────────────────────────────────
+class TokenPruner:
+    """Prune encoder tokens by how much attention each token receives.
+
+    After the encoder's last-layer self-attention we compute:
+
+        importance[b, j] = Σ_{h=0}^{H-1}  Σ_{i=0}^{N-1}  attn[b, h, i, j]
+
+    where attn[b, h, i, j] is the softmax attention weight from query
+    token i to key token j in head h.  Tokens that are attended to by
+    many other tokens (across all heads) are considered globally important.
+
+    The top-K tokens (K = N × keep_ratio) are returned to the probe in
+    their original temporal-spatial order.
+
+    Implementation notes
+    --------------------
+    * V-JEPA 2 ViT-L uses *RoPEAttention* with ``use_sdpa=True`` by default,
+      which calls ``F.scaled_dot_product_attention`` and never materialises
+      the explicit attention matrix.  We monkey-patch the last block's
+      attention forward so that we additionally compute attention weights
+      for importance scoring.
+    * To avoid allocating the full [B, H, N, N] matrix (≈ 8.5 GB for
+      B=8, H=16, N=4096), we iterate over Q in chunks of size
+      ``chunk_size`` and accumulate the per-token column sums:
+
+          for each q_chunk: imp += softmax(q_chunk @ k.T / √d).sum(dim=-2)
+
+      Memory per chunk: B × H × chunk_size × N × sizeof(float)
+      (64-chunk → ≈ 128 MB, vs 8.5 GB for the full matrix).
+    * The importance computation runs inside ``torch.no_grad()`` so it
+      never adds nodes to the autograd graph.
+    * Works transparently with LoRA: if LoRA adapters have been injected
+      into the last block's ``attn.qkv``, the patched forward uses the
+      adapted projection automatically.
+    """
+
+    def __init__(self, encoder: nn.Module, keep_ratio: float, chunk_size: int = 64):
+        if not (0.0 < keep_ratio <= 1.0):
+            raise ValueError(f"keep_ratio must be in (0, 1], got {keep_ratio}")
+        self.keep_ratio  = keep_ratio
+        self.chunk_size  = chunk_size
+        self._importance: torch.Tensor | None = None
+
+        last_attn = encoder.blocks[-1].attn  # RoPEAttention instance
+        self._attn_module = last_attn
+        self._orig_forward = last_attn.forward
+
+        m       = last_attn   # shorthand captured by closure
+        pruner  = self
+
+        def _patched_forward(x, mask=None, attn_mask=None, T=None, H_patches=None, W_patches=None):
+            B, N, C = x.size()
+            grid_depth = int(N // (m.grid_size * m.grid_size))
+
+            # ── QKV projection (uses LoRA-adapted qkv when LoRA is active) ──
+            qkv = m.qkv(x).unflatten(-1, (3, m.num_heads, -1)).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]   # each [B, H, N, D_head]
+
+            # ── 3-D RoPE positional encoding (depth / height / width) ──────
+            if mask is not None:
+                mask_p = mask.unsqueeze(1).repeat(1, m.num_heads, 1)
+                d_mask, h_mask, w_mask = m.separate_positions(mask_p, H_patches, W_patches)
+            else:
+                if T is None or H_patches is None or W_patches is None:
+                    mask_p = torch.arange(int(grid_depth * m.grid_size * m.grid_size), device=x.device)
+                else:
+                    mask_p = torch.arange(int(T * H_patches * W_patches), device=x.device)
+                d_mask, h_mask, w_mask = m.separate_positions(mask_p, H_patches, W_patches)
+
+            s = 0
+            qd = rotate_queries_or_keys(q[..., s : s + m.d_dim], pos=d_mask)
+            kd = rotate_queries_or_keys(k[..., s : s + m.d_dim], pos=d_mask)
+            s += m.d_dim
+            qh = rotate_queries_or_keys(q[..., s : s + m.h_dim], pos=h_mask)
+            kh = rotate_queries_or_keys(k[..., s : s + m.h_dim], pos=h_mask)
+            s += m.h_dim
+            qw = rotate_queries_or_keys(q[..., s : s + m.w_dim], pos=w_mask)
+            kw = rotate_queries_or_keys(k[..., s : s + m.w_dim], pos=w_mask)
+            s += m.w_dim
+            if s < m.head_dim:
+                q = torch.cat([qd, qh, qw, q[..., s:]], dim=-1)
+                k = torch.cat([kd, kh, kw, k[..., s:]], dim=-1)
+            else:
+                q = torch.cat([qd, qh, qw], dim=-1)
+                k = torch.cat([kd, kh, kw], dim=-1)
+
+            # ── Importance scoring: chunked attention column-sum ────────────
+            # importance[b, j] = Σ_{h, i} attn[b, h, i, j]
+            # Chunked over query axis to avoid O(B·H·N²) memory allocation.
+            with torch.no_grad():
+                imp = torch.zeros(B, N, device=x.device, dtype=x.dtype)
+                for ci in range(0, N, pruner.chunk_size):
+                    q_c = q[:, :, ci : ci + pruner.chunk_size, :]        # [B, H, cs, D_head]
+                    logits = (q_c @ k.transpose(-2, -1)) * m.scale        # [B, H, cs, N]
+                    imp += logits.softmax(dim=-1).sum(dim=2).sum(dim=1)   # [B, N]
+                pruner._importance = imp   # stored for prune() call
+
+            # ── Main attention output (SDPA for speed & gradient correctness)
+            if attn_mask is not None or m.use_sdpa:
+                with torch.backends.cuda.sdp_kernel():
+                    x = F.scaled_dot_product_attention(
+                        q, k, v, dropout_p=m.proj_drop_prob,
+                        is_causal=m.is_causal, attn_mask=attn_mask
+                    )
+            else:
+                attn = (q @ k.transpose(-2, -1)) * m.scale
+                attn = attn.softmax(dim=-1)
+                attn = m.attn_drop(attn)
+                x = attn @ v
+
+            x = x.transpose(1, 2).reshape(B, N, C)
+            x = m.proj(x)
+            x = m.proj_drop(x)
+            return x
+
+        last_attn.forward = _patched_forward
+
+        num_tokens = (IMG_SIZE // 16) ** 2 * (FRAMES_PER_CLIP // 2)
+        K = max(1, int(num_tokens * keep_ratio))
+        print(f"  TokenPruner attached to encoder.blocks[-1].attn")
+        print(f"    keep_ratio={keep_ratio:.2f}  →  {num_tokens} tokens → {K} tokens per clip")
+        print(f"    chunk_size={chunk_size} (importance computed without full N² matrix)")
+
+    # ------------------------------------------------------------------
+    def prune(self, feats: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Select top-K tokens by importance score.
+
+        Args:
+            feats: [B, N, D]  encoder output (all tokens from last layer)
+
+        Returns:
+            pruned:     [B, K, D]  top-K tokens kept in original order
+            importance: [B, N]    per-token importance scores
+        """
+        if self._importance is None:
+            raise RuntimeError("Call encoder.forward() before pruner.prune().")
+
+        importance = self._importance                                 # [B, N]
+        N = feats.shape[1]
+        K = max(1, int(N * self.keep_ratio))
+
+        # topk, then sort to restore original token order
+        top_k_idx, _ = importance.topk(K, dim=1)                     # [B, K] (unsorted)
+        top_k_idx    = top_k_idx.sort(dim=1).values                  # [B, K] sorted
+
+        idx_exp = top_k_idx.unsqueeze(-1).expand(-1, -1, feats.shape[-1])
+        pruned  = feats.gather(1, idx_exp)                           # [B, K, D]
+        return pruned, importance
+
+    # ------------------------------------------------------------------
+    def remove(self):
+        """Restore the original RoPEAttention.forward method."""
+        if self._orig_forward is not None:
+            self._attn_module.forward = self._orig_forward
+            self._orig_forward = None
+
+
 # ── Model ───────────────────────────────────────────────────────────
 class HDEpicProbe(nn.Module):
     """Standalone HD-EPIC classification head (num_queries=3: verb, noun, action)"""
@@ -278,8 +456,13 @@ def load_encoder(device, lora_rank: int = 0):
 
 
 # ── Evaluation ──────────────────────────────────────────────────────
-def evaluate(encoder, probe, loader, device, num_verbs, num_nouns, num_actions):
-    # Switch both models to eval mode; remember encoder's prior mode so we can restore it.
+def evaluate(encoder, probe, loader, device, num_verbs, num_nouns, num_actions,
+             pruner: "TokenPruner | None" = None):
+    """Evaluate probe on *loader*.
+
+    If *pruner* is provided, encoder tokens are pruned by attention importance
+    before being fed to the probe (mirrors the training forward pass).
+    """
     was_training = encoder.training
     encoder.eval()
     probe.eval()
@@ -293,6 +476,8 @@ def evaluate(encoder, probe, loader, device, num_verbs, num_nouns, num_actions):
         for clips, v_ids, n_ids, a_ids in loader:
             clips = clips.to(device)
             feats = encoder(clips)
+            if pruner is not None:
+                feats, _ = pruner.prune(feats)
             v_logits, n_logits, a_logits = probe(feats)
 
             for i in range(len(v_ids)):
@@ -315,6 +500,8 @@ def evaluate(encoder, probe, loader, device, num_verbs, num_nouns, num_actions):
         for clips, v_ids, n_ids, a_ids in loader:
             clips = clips.to(device)
             feats = encoder(clips)
+            if pruner is not None:
+                feats, _ = pruner.prune(feats)
             v_logits, n_logits, a_logits = probe(feats)
             for i in range(len(v_ids)):
                 vi, ni, ai = int(v_ids[i]), int(n_ids[i]), int(a_ids[i])
@@ -332,7 +519,6 @@ def evaluate(encoder, probe, loader, device, num_verbs, num_nouns, num_actions):
         "action_r5":   cmr(a_c, a_t),
     }
 
-    # Restore encoder training mode (relevant when LoRA is active)
     if was_training:
         encoder.train()
     return metrics
@@ -397,6 +583,12 @@ def run(from_scratch=False):
     # Load models
     print("\n[2] Loading models...")
     encoder = load_encoder(device, lora_rank=LORA_RANK)
+
+    # Optionally attach attention-based token pruner to the last encoder block
+    pruner: TokenPruner | None = None
+    if PRUNE_KEEP_RATIO > 0.0:
+        pruner = TokenPruner(encoder, keep_ratio=PRUNE_KEEP_RATIO, chunk_size=PRUNE_CHUNK_SIZE)
+
     probe   = HDEpicProbe(
         embed_dim=encoder.embed_dim,
         num_verbs=len(vdf),
@@ -439,8 +631,10 @@ def run(from_scratch=False):
             "train_video_ids": sorted(train_df["video_id"].unique().tolist()),
             "val_video_ids":   sorted(val_df["video_id"].unique().tolist()),
             "test_video_ids":  sorted(test_df["video_id"].unique().tolist()),
-            "lora_rank": LORA_RANK,
-            "lora_alpha": LORA_ALPHA,
+            "lora_rank":         LORA_RANK,
+            "lora_alpha":        LORA_ALPHA,
+            "prune_keep_ratio":  PRUNE_KEEP_RATIO,
+            "prune_chunk_size":  PRUNE_CHUNK_SIZE,
         }
         if LORA_RANK > 0:
             # Only persist the small LoRA delta weights, not the frozen base encoder.
@@ -516,9 +710,10 @@ def run(from_scratch=False):
             print("\n  [train] No last.pt found, training from scratch", flush=True)
 
     lora_active = LORA_RANK > 0
+    prune_info  = (f", prune_keep={PRUNE_KEEP_RATIO:.2f}" if pruner is not None else ", no pruning")
     print(f"\n[3] Starting training ({NUM_EPOCHS} epochs, batch={BATCH_SIZE}, lr={LR}"
           + (f", lora_lr={LORA_LR}, lora_rank={LORA_RANK}" if lora_active else ", encoder frozen")
-          + ")...")
+          + prune_info + ")...")
     print(f"    Saved every epoch: {PROBE_LAST}", flush=True)
     print(f"    Saved on best Verb R@5: {PROBE_BEST}", flush=True)
     print("=" * 65, flush=True)
@@ -542,6 +737,11 @@ def run(from_scratch=False):
             else:
                 with torch.no_grad():
                     feats = encoder(clips)
+
+            # Prune tokens by last-layer attention importance (if enabled).
+            # The TokenPruner captured importance scores during encoder.forward().
+            if pruner is not None:
+                feats, _ = pruner.prune(feats)
 
             a_ids = a_ids.to(device)
             v_logits, n_logits, a_logits = probe(feats)
@@ -571,7 +771,7 @@ def run(from_scratch=False):
 
         # Validate after each epoch
         metrics = evaluate(encoder, probe, val_loader, device,
-                           len(vdf), len(ndf), len(action_map))
+                           len(vdf), len(ndf), len(action_map), pruner=pruner)
         print(f"  Validation:", flush=True)
         print(f"    Verb  Top-3={metrics['verb_top3']:.1f}%  Recall@5={metrics['verb_r5']:.1f}%", flush=True)
         print(f"    Noun  Top-3={metrics['noun_top3']:.1f}%  Recall@5={metrics['noun_r5']:.1f}%", flush=True)
@@ -601,7 +801,7 @@ def run(from_scratch=False):
     if LORA_RANK > 0 and "encoder_lora" in best_ck:
         encoder.load_state_dict(best_ck["encoder_lora"], strict=False)
     test_metrics = evaluate(encoder, probe, test_loader, device,
-                            len(vdf), len(ndf), len(action_map))
+                            len(vdf), len(ndf), len(action_map), pruner=pruner)
     print("  Test set results (best val checkpoint):", flush=True)
     print(f"    Verb   Top-3={test_metrics['verb_top3']:.1f}%  Recall@5={test_metrics['verb_r5']:.1f}%", flush=True)
     print(f"    Noun   Top-3={test_metrics['noun_top3']:.1f}%  Recall@5={test_metrics['noun_r5']:.1f}%", flush=True)
