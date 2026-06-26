@@ -150,7 +150,8 @@ export POSE_SLAM_ROOT POSE_MAPPING_JSON POSE_FEATURE_SET POSE_QUALITY_MIN POSE_H
 export BINARY_INPUT_ADAPTER_FORCE_ZERO_MAP BINARY_INPUT_ADAPTER_LOAD_CHECKPOINT BINARY_INPUT_ADAPTER_AUG_AWARE
 export ENCODER_GAZE_ADAPTER_NUM_HEADS ENCODER_GAZE_ADAPTER_DROPOUT ENCODER_GAZE_ADAPTER_LR_MULT ENCODER_GAZE_ADAPTER_WEIGHT_DECAY
 export ENCODER_LORA_ENABLED ENCODER_LORA_RANK ENCODER_LORA_ALPHA ENCODER_LORA_DROPOUT ENCODER_LORA_LAST_N_BLOCKS ENCODER_LORA_LR_MULT ENCODER_LORA_WEIGHT_DECAY ENCODER_LORA_ACTIVATION_CHECKPOINTING ENCODER_LORA_TARGET_SUFFIXES
-export BACKBONE EVAL_RESOLUTION AR10S_SLIDING_PROBE HDEPIC_AR10S_SLIDING_GAZE_POSE HDEPIC_DIRECT_ROPE_10S MODEL_ROPE_SCALE_MODE EVAL_ANTICIPATION_SEC EVAL_TRAIN_ANTICIPATION_SEC_MIN EVAL_TRAIN_ANTICIPATION_SEC_MAX MODEL_RETURN_MODE MODEL_MAX_ROLLOUT_STEPS EVAL_VAL_EVERY MODEL_FAMILY VLM_MODEL_ID VLM_MODEL_CLASS VLM_NUM_FRAMES VLM_TOKEN_MODE VLM_IMAGE_SIZE VLM_TRUST_REMOTE_CODE VLM_TORCH_DTYPE VLM_LOCAL_FILES_ONLY VLM_GPU_PULSE_ITERS VLM_GPU_PULSE_SIZE
+export BACKBONE EVAL_RESOLUTION AR10S_SLIDING_PROBE HDEPIC_AR10S_SLIDING_GAZE_POSE HDEPIC_DIRECT_ROPE_10S MODEL_ROPE_SCALE_MODE EVAL_ANTICIPATION_SEC EVAL_TRAIN_ANTICIPATION_SEC_MIN EVAL_TRAIN_ANTICIPATION_SEC_MAX MODEL_RETURN_MODE MODEL_MAX_ROLLOUT_STEPS EVAL_VAL_EVERY
+export MODEL_FAMILY VLM_MODEL_ID VLM_MODEL_CLASS VLM_NUM_FRAMES VLM_TOKEN_MODE VLM_IMAGE_SIZE VLM_TRUST_REMOTE_CODE VLM_TORCH_DTYPE VLM_LOCAL_FILES_ONLY VLM_GPU_PULSE_ITERS VLM_GPU_PULSE_SIZE
 export PREDICTION_DUMP PREDICTION_DUMP_PATH
 export DEBUG_SUBSET_PATH GAZE_DATALOADER_TRACE_DIR GAZE_DATALOADER_TRACE_EVENTS
 export PERF_MONITOR PERF_INTERVAL
@@ -205,6 +206,9 @@ def _truthy(name: str) -> bool:
 if _truthy("HDEPIC_DIRECT_ROPE_10S"):
     importlib.import_module("app.hdepic_lora_action_anticipation.modelcustom.vit_encoder_predictor_direct_rope")
     print("[lora] vit_encoder_predictor_direct_rope import OK")
+elif os.environ.get("MODEL_FAMILY", "vjepa").strip().lower() == "vlm":
+    importlib.import_module("app.hdepic_lora_action_anticipation.modelcustom.vlm_video_encoder")
+    print("[lora] vlm_video_encoder import OK")
 elif _truthy("AR10S_SLIDING_PROBE") or _truthy("HDEPIC_AR10S_SLIDING_GAZE_POSE") or os.environ.get("EVAL_ANTICIPATION_SEC", "").strip():
     importlib.import_module("app.hdepic_lora_action_anticipation.modelcustom.vit_encoder_predictor_rollout")
     print("[lora] vit_encoder_predictor_rollout import OK")
@@ -500,8 +504,65 @@ if predictor_lora_targets:
         if suffix.strip()
     ]
 
+model_family = os.environ.get("MODEL_FAMILY", "vjepa").strip().lower()
 backbone = os.environ.get("BACKBONE", "vitg").strip().lower()
-if backbone in {"vitl", "vit-l", "vit_large"}:
+if model_family == "vlm":
+    model_id = os.environ.get("VLM_MODEL_ID", "").strip() or os.environ.get("CHECKPOINT", "").strip()
+    if not model_id:
+        raise SystemExit("MODEL_FAMILY=vlm requires VLM_MODEL_ID or CHECKPOINT")
+    resolution = int(os.environ.get("EVAL_RESOLUTION", os.environ.get("VLM_IMAGE_SIZE", "224")))
+    # Decode only the frames consumed by the frozen VLM while preserving the
+    # template's real-time observation window.  The old path decoded 32 frames
+    # at 8 fps, then selected 8 frames on the GPU; 24/32 decoded frames were
+    # discarded after paying the full CPU/video-I/O cost.
+    source_frames = int(data["frames_per_clip"])
+    source_fps = float(data["frames_per_second"])
+    if source_frames <= 0 or source_fps <= 0:
+        raise SystemExit(
+            f"Invalid source video sampling: frames_per_clip={source_frames} frames_per_second={source_fps}"
+        )
+    observation_sec = source_frames / source_fps
+    vlm_num_frames = int(os.environ.get("VLM_NUM_FRAMES", "8"))
+    if vlm_num_frames <= 0:
+        raise SystemExit(f"VLM_NUM_FRAMES must be positive, got {vlm_num_frames}")
+    data["frames_per_clip"] = vlm_num_frames
+    data["frames_per_second"] = vlm_num_frames / observation_sec
+    data["resolution"] = resolution
+    data["anticipation_time_sec"] = [1.0, 1.0]
+    data["train_anticipation_point"] = [1.0, 1.0]
+    data["train_anticipation_time_sec"] = [1.0, 1.0]
+    cfg["model_kwargs"]["checkpoint"] = model_id
+    cfg["model_kwargs"]["module_name"] = "app.hdepic_lora_action_anticipation.modelcustom.vlm_video_encoder"
+    cfg["model_kwargs"]["pretrain_kwargs"] = {
+        "model_id": model_id,
+        "model_class": os.environ.get("VLM_MODEL_CLASS", "auto"),
+        "num_frames": vlm_num_frames,
+        "token_mode": os.environ.get("VLM_TOKEN_MODE", "pooled"),
+        "image_size": int(os.environ.get("VLM_IMAGE_SIZE", str(resolution))),
+        "trust_remote_code": os.environ.get("VLM_TRUST_REMOTE_CODE", "0").lower() in {"1", "true", "yes", "on"},
+        "local_files_only": os.environ.get("VLM_LOCAL_FILES_ONLY", "0").lower() in {"1", "true", "yes", "on"},
+        "gpu_pulse_iters": int(os.environ.get("VLM_GPU_PULSE_ITERS", "0") or "0"),
+        "gpu_pulse_size": int(os.environ.get("VLM_GPU_PULSE_SIZE", "512") or "512"),
+        "mllama_chunk_size": int(os.environ.get("VLM_MLLAMA_CHUNK_SIZE", "8") or "8"),
+    }
+    if os.environ.get("VLM_TORCH_DTYPE", "").strip():
+        cfg["model_kwargs"]["pretrain_kwargs"]["torch_dtype"] = os.environ["VLM_TORCH_DTYPE"].strip()
+    cfg["model_kwargs"]["wrapper_kwargs"] = {}
+    cfg["experiment"]["lora"]["pretrained_probe"] = ""
+    cfg["experiment"]["lora"]["encoder_lora"]["enabled"] = False
+    cfg["experiment"]["lora"]["predictor_lora"]["enabled"] = False
+    print(
+        "[lora] Applied MODEL_FAMILY=vlm: "
+        f"model_id={model_id} class={cfg['model_kwargs']['pretrain_kwargs']['model_class']} "
+        f"num_frames={cfg['model_kwargs']['pretrain_kwargs']['num_frames']} "
+        f"data_sampling={data['frames_per_clip']}@{data['frames_per_second']:g}fps "
+        f"observation={observation_sec:g}s "
+        f"token_mode={cfg['model_kwargs']['pretrain_kwargs']['token_mode']} "
+        f"resolution={resolution} "
+        f"gpu_pulse_iters={cfg['model_kwargs']['pretrain_kwargs']['gpu_pulse_iters']}; "
+        "pretrained_probe disabled"
+    )
+elif backbone in {"vitl", "vit-l", "vit_large"}:
     vitl_template = project_root / "vjepa2" / "configs" / "eval" / "vitl" / "ek100.yaml"
     with vitl_template.open("r", encoding="utf-8") as f:
         vitl_cfg = yaml.load(f, Loader=yaml.FullLoader)
@@ -531,8 +592,8 @@ _antic_raw = os.environ.get("EVAL_ANTICIPATION_SEC", "").strip()
 if _antic_raw:
     _ar10s_triggers.append(f"EVAL_ANTICIPATION_SEC={_antic_raw!r}")
 
-ar10s_sliding = not _truthy_env("HDEPIC_DIRECT_ROPE_10S") and bool(_ar10s_triggers)
-direct_rope_10s = _truthy_env("HDEPIC_DIRECT_ROPE_10S")
+ar10s_sliding = model_family != "vlm" and not _truthy_env("HDEPIC_DIRECT_ROPE_10S") and bool(_ar10s_triggers)
+direct_rope_10s = model_family != "vlm" and _truthy_env("HDEPIC_DIRECT_ROPE_10S")
 
 if direct_rope_10s:
     val_antic = float(os.environ.get("EVAL_ANTICIPATION_SEC", "10"))
@@ -596,6 +657,12 @@ elif ar10s_sliding:
         f"clip_balanced={data.get('clip_balanced')}"
     )
     print(f"[lora] AR10s mode triggered by: {', '.join(_ar10s_triggers)}")
+elif model_family == "vlm":
+    print(
+        "[lora] Mode: 1s VLM observed-clip baseline; "
+        f"anticipation_time_sec={data.get('anticipation_time_sec')} "
+        f"module_name={cfg['model_kwargs'].get('module_name')}"
+    )
 elif not direct_rope_10s:
     print(
         "[lora] Mode: 1s concat_ar (default); "

@@ -1,6 +1,6 @@
 # Recent HPC Runs — Entry Point Reference
 
-更新日期：2026-06-24
+更新日期：2026-06-26
 
 这份文档列出 VJEPA2-EXP 近期（2026-06-14 ~ 06-24）HPC 实验的入口脚本和启动命令，方便在共享仓库中对照代码和配置。完整指标和实验历史去 VJEPA2-EXP `logs/DASHBOARD.md` 和 `logs/RUNNING.md`。
 
@@ -162,16 +162,82 @@ BACKEND=llava_onevision MAX_TRAIN_SAMPLES=16 NUM_EPOCHS=1 SLURM_TIME=00:30:00 RU
 
 ---
 
+### B12 等计算量 Qwen2.5-VL Token Pruning Sweep（V-JEPA2 对照实验）
+
+用 attention-importance 剪枝削减 Qwen2.5-VL 的视频 token 数，使其在 256px × 4s 窗口下与 V-JEPA2 的 FLOPs 对齐（等计算量点 ≈ keep_ratio=0.35）。backbone = Qwen2.5-VL-3B，不做任何时间降采样（所有 32 帧均输入模型），剪枝仅作用于 LLM 部分（36 层），视觉塔仍处理全部 token。
+
+```bash
+# 完整 sweep（keep_ratio = 1.0, 0.5, 0.35, 0.25, 0.125；每个 10 epochs）
+bash scripts/submit_b12_qwen_pruning_sweep.sh
+
+# 快速 smoke（2 个 keep_ratio，32 样本，1 epoch）
+KEEP_RATIOS="1.0 0.5" MAX_TRAIN_SAMPLES=32 NUM_EPOCHS=1 SLURM_TIME=01:00:00 \
+  RUN_PREFIX=smoke bash scripts/submit_b12_qwen_pruning_sweep.sh
+
+# 单个 keep_ratio 手动提交
+BACKEND=qwen25vl PRUNE_KEEP_RATIO=0.35 QWEN_FRAME_SIZE=256 \
+  NUM_FRAMES=32 PROBE_NUM_FRAMES=32 TARGET_FPS=8.0 NUM_EPOCHS=10 \
+  RUN_TAG=b12_qwen_prune_4s_kr0p35 bash scripts/submit_vlm_probe_lora.sh
+```
+
+| 项 | 值 |
+|---|---|
+| 入口脚本 | `scripts/submit_b12_qwen_pruning_sweep.sh`（sweep 封装）|
+| 底层提交 | `scripts/submit_vlm_probe_lora.sh`（每个 keep_ratio 单独 job）|
+| Slurm 脚本 | `scripts/run_vlm_probe_lora.slurm` |
+| Python 入口 | `app/hdepic_lora_action_anticipation/train_vlm_probe_lora.py` |
+| Pruner 实现 | `app/hdepic_lora_action_anticipation/qwen_token_pruning.py` |
+| 关键参数 | `PRUNE_KEEP_RATIO`（剪枝比例），`QWEN_FRAME_SIZE=256`（匹配 V-JEPA2），`NUM_FRAMES=PROBE_NUM_FRAMES=32`（不降采样）|
+| GPU | H100（`h100_tandon`），1 GPU |
+| Preprocessing cache | `PREPROC_CACHE_DIR` 指向共享缓存目录，epoch 0 后 tokenize 成本降为磁盘 load |
+| 说明 | keep_ratio=1.0 为未剪枝锚点；各 keep_ratio 独立 job 并行提交；preproc cache 跨 keep_ratio 共享（剪枝在模型内，预处理相同）|
+
+#### FLOPs 剖析（B12）
+
+```bash
+# 对 V-JEPA2 和 Qwen 分别测量 per-sample FLOPs
+sbatch scripts/run_b12_flops_profile.slurm
+
+# 快速 smoke（单张 GPU，< 25 分钟）
+sbatch scripts/run_smoke_qwen_pruning.slurm
+
+# V-JEPA2 encoder/predictor 最大帧数/token 探测
+sbatch scripts/run_vjepa_max_frames.slurm
+sbatch scripts/run_predictor_max_tokens.slurm
+```
+
+| 脚本 | 说明 |
+|---|---|
+| `scripts/run_b12_flops_profile.slurm` | 完整 FLOPs 剖析（V-JEPA2 + Qwen 多 keep_ratio）|
+| `scripts/run_smoke_qwen_pruning.slurm` | Qwen pruner 功能 smoke test |
+| `scripts/run_vjepa_max_frames.slurm` | V-JEPA2 encoder 最大可行帧数探测 |
+| `scripts/run_predictor_max_tokens.slurm` | V-JEPA2 predictor 最大 token 容量探测 |
+| `scripts/profile_b12_flops.py` | FLOPs 剖析主脚本（`--target all/vjepa/qwen`）|
+| `scripts/probe_vjepa_max_frames.py` | V-JEPA2 encoder 探测脚本 |
+| `scripts/probe_predictor_max_tokens.py` | V-JEPA2 predictor 探测脚本 |
+| `scripts/smoke_qwen_pruning.py` | Qwen pruner smoke 脚本 |
+
+---
+
 ### Standalone Checkpoint 评估
 
 对已训好的 probe checkpoint 做独立测试集评估（不重新训练）：
 
 ```bash
-# VLM probe checkpoint eval
+# VLM probe checkpoint eval（标准）
 python app/hdepic_lora_action_anticipation/eval_probe_checkpoint.py \
   --checkpoint /path/to/checkpoint.pt \
   --config /path/to/config.yaml \
   --split test
+
+# Qwen pruning eval（带 keep_ratio + preproc cache）
+python app/hdepic_lora_action_anticipation/eval_probe_checkpoint.py \
+  --checkpoint /path/to/checkpoint.pt \
+  --config /path/to/config.yaml \
+  --split test \
+  --prune-keep-ratio 0.35 \
+  --qwen-frame-size 256 \
+  --preproc-cache-dir /path/to/preproc_cache_qwen
 ```
 
 | Python 入口 | 说明 |
@@ -338,12 +404,13 @@ bash scripts/submit_b11_singleprobe_ar10s_direct_rope_vitl_fp32_bs8_noac_fulltra
 
 1. **对齐参考实现（V-JEPA）** → 看 p01_fixed run（#1, #2）
 2. **VLM 系列实验** → 看 VLM 实验章节：零样本 prompting、frozen-VLM probe（不加 LoRA）、LoRA SFT、LoRA+probe
-3. **复现历史 baseline** → 看 legacy run（#4, #5）
-4. **验证 predictor-LoRA** → 看 legacy predictor-LoRA（#7），启动命令见该节
-5. **Encoder-LoRA + gaze/pose** → 看 Encoder-LoRA 20head LowLR / Single-Probe 章节
-6. **AR long-horizon + gaze/pose** → 看 AR 10s Sliding Gaze+Pose 章节
-7. **Latent 诊断** → 看 D3/LTM 系列
-8. **Standalone eval（已训模型）** → `python app/hdepic_lora_action_anticipation/eval_probe_checkpoint.py --checkpoint <path> --config <path> --split test`
+3. **B12 等计算量 Qwen pruning** → 看 B12 章节，入口 `submit_b12_qwen_pruning_sweep.sh`
+4. **复现历史 baseline** → 看 legacy run（#4, #5）
+5. **验证 predictor-LoRA** → 看 legacy predictor-LoRA（#7），启动命令见该节
+6. **Encoder-LoRA + gaze/pose** → 看 Encoder-LoRA 20head LowLR / Single-Probe 章节
+7. **AR long-horizon + gaze/pose** → 看 AR 10s Sliding Gaze+Pose 章节
+8. **Latent 诊断** → 看 D3/LTM 系列
+9. **Standalone eval（已训模型）** → `python app/hdepic_lora_action_anticipation/eval_probe_checkpoint.py --checkpoint <path> --config <path> --split test`
 
 ### LoRA 方案对照
 
@@ -356,6 +423,7 @@ bash scripts/submit_b11_singleprobe_ar10s_direct_rope_vitl_fp32_bs8_noac_fulltra
 | EncoRA 20head LowLR | ✅ rank=4 last 4 | ❌ | full | 降低 probe LR |
 | **VLM frozen probe** | ❌ | ❌ | full | VLM encoder 完全冻结 |
 | VLM LoRA + Probe | ✅ (VLM LoRA) | ❌ | full | HF PEFT，非 V-JEPA |
+| **B12 Qwen pruning** | ✅ (VLM LoRA) | ❌ | full | Qwen2.5-VL，token pruning，等计算量对照 |
 | `refer_repo/JEPA_ARVR` | ✅ | ❌ | — | 参考 encoder-LoRA，无 predictor-LoRA/无 VLM |
 
 完整 run 注册表（含 checkpoint 路径、sidecar、raw log 链接）去 VJEPA2-EXP `logs/RUNNING.md`。

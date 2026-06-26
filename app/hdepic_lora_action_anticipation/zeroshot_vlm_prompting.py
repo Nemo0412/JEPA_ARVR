@@ -121,10 +121,17 @@ def compute_clip_window(start_frame: int, video_fps: float, num_frames: int, tar
     return indices
 
 
-def decode_frames(video_path: str, indices: np.ndarray):
+def decode_frames(video_path: str, indices: np.ndarray, decode_size: int = 0):
     from decord import VideoReader, cpu
 
-    vr = VideoReader(video_path, num_threads=1, ctx=cpu(0))
+    # decode_size > 0 makes decord scale frames to (decode_size, decode_size) *during* decode
+    # (FFmpeg scaler), instead of decoding native ~1400px frames and resizing later. HD-EPIC
+    # GoPro footage is square, so this preserves aspect ratio and cuts decode cost ~30x at
+    # 256px -- the fix for GPU starvation in the 32-frame VLM probe. decode_size=0 keeps native.
+    if decode_size > 0:
+        vr = VideoReader(video_path, num_threads=1, ctx=cpu(0), width=decode_size, height=decode_size)
+    else:
+        vr = VideoReader(video_path, num_threads=1, ctx=cpu(0))
     indices = np.clip(indices, 0, len(vr) - 1)
     buffer = vr.get_batch(indices).asnumpy()  # [T, H, W, C] uint8
     return buffer, vr.get_avg_fps()

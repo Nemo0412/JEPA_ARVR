@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import json
 import logging
 import random
@@ -144,6 +145,14 @@ def build_mllama_inputs_batch(processor, frames_list: list[np.ndarray]):
     return processor(images=images, text=texts, return_tensors="pt", padding=True)
 
 
+# Optional square pixel size each Qwen video frame is resized to before the AutoProcessor
+# (0 = keep native resolution). HD-EPIC frames are decoded at native ~1400x1400; at native
+# resolution Qwen is ~259x V-JEPA2's compute (B12), so the equal-compute study matches
+# V-JEPA2's 256 here. Set once in main() from --qwen-frame-size; the processor's smart_resize
+# then rounds to the nearest multiple of 28 (256 -> 252 -> an 18x18 patch grid per frame).
+_QWEN_FRAME_SIZE = 0
+
+
 def build_qwen_inputs_batch(processor, frames_list: list[np.ndarray]):
     """Matches the PhD's prepare_batch_cpu() in qwen/train_hdepic_qwen_probe.py exactly:
     one {"type": "video"} content block per sample, frames passed as PIL images."""
@@ -152,6 +161,8 @@ def build_qwen_inputs_batch(processor, frames_list: list[np.ndarray]):
     texts, video_lists = [], []
     for frames in frames_list:
         pil_frames = [Image.fromarray(frames[t]) for t in range(frames.shape[0])]
+        if _QWEN_FRAME_SIZE > 0:
+            pil_frames = [f.resize((_QWEN_FRAME_SIZE, _QWEN_FRAME_SIZE)) for f in pil_frames]
         conversation = [
             {
                 "role": "user",
@@ -195,32 +206,88 @@ class HDEpicProbeDataset(torch.utils.data.Dataset):
     well under the cluster's 60%-over-2h fair-use threshold), even with CPU/GPU overlap via
     DataLoader workers."""
 
-    def __init__(self, rows, video_root, action_map, num_frames, probe_num_frames, target_fps):
+    def __init__(self, rows, video_root, action_map, num_frames, probe_num_frames, target_fps,
+                 decode_size=0, processor=None, backend=None, cache_dir=None):
         self.rows = rows
         self.video_root = video_root
         self.action_map = action_map
         self.num_frames = num_frames
         self.probe_num_frames = probe_num_frames
         self.target_fps = target_fps
+        # decode_size > 0 -> decode frames directly at this square size (decord scaler) instead
+        # of native ~1400px, the fix for GPU starvation in the 32-frame probe. Set from
+        # --qwen-frame-size so it matches the resolution the model sees anyway.
+        self.decode_size = decode_size
+        # Preprocessing cache (cache_dir set): since there is no augmentation and the clip
+        # window is deterministic, each sample tokenizes to identical tensors every epoch. We
+        # tokenize once per sample, store the processor output to disk, and reload it on later
+        # epochs -- turning a CPU-bound (decode+tokenize 32 frames) pipeline into a cheap
+        # tensor load so the GPU stops starving. processor/backend are needed to build the
+        # tensors on a cache miss; shared by every keep_ratio run (pruning is in-model, so the
+        # preprocessing is identical across keep_ratio).
+        self.processor = processor
+        self.backend = backend
+        self.cache_dir = cache_dir
 
     def __len__(self) -> int:
         return len(self.rows)
 
-    def __getitem__(self, i: int):
+    def _cache_path(self, row):
+        return os.path.join(
+            self.cache_dir,
+            f"{row['participant_id']}__{row.get('video_id', 'x')}__{int(row['start_frame'])}.pt",
+        )
+
+    def _decode_and_tokenize(self, row):
         from decord import VideoReader, cpu
 
+        video_id = row.get("video_id", "?")
+        video_path = str(Path(self.video_root) / row["participant_id"] / f"{video_id}.MP4")
+        vr_probe = VideoReader(video_path, num_threads=1, ctx=cpu(0))
+        vfps = vr_probe.get_avg_fps()
+        indices = compute_clip_window(int(row["start_frame"]), vfps, self.num_frames, self.target_fps)
+        frames, _ = decode_frames(video_path, indices, decode_size=self.decode_size)
+        frames = _resample_frames(frames, self.probe_num_frames)
+        # One-sample processor call; leading dim is the batch/video axis (BatchCollator cats it).
+        inputs = BACKEND_BATCH_BUILDERS[self.backend](self.processor, [frames])
+        # float16 for the heavy pixel tensor halves cache size; the model recasts to its dtype.
+        return {
+            k: (v.half() if (k == "pixel_values_videos" and torch.is_floating_point(v)) else v)
+            for k, v in dict(inputs).items()
+        }
+
+    def __getitem__(self, i: int):
         row = self.rows[i]
         video_id = row.get("video_id", "?")
         try:
+            verb_id = int(row["verb_class"])
+            noun_id = int(row["noun_class"])
+            action_id = self.action_map.get((verb_id, noun_id), -1)
+
+            if self.cache_dir:
+                path = self._cache_path(row)
+                inputs = None
+                if os.path.exists(path):
+                    try:
+                        inputs = torch.load(path, map_location="cpu", weights_only=False)
+                    except Exception:  # noqa: BLE001 -- corrupt/partial cache file: recompute
+                        inputs = None
+                if inputs is None:
+                    inputs = self._decode_and_tokenize(row)
+                    tmp = f"{path}.tmp.{os.getpid()}.{i}"
+                    torch.save(inputs, tmp)
+                    os.replace(tmp, path)  # atomic on same FS; safe under concurrent workers
+                return inputs, verb_id, noun_id, action_id, video_id, i
+
+            # No cache: return raw frames; BatchCollator tokenizes the whole batch at once.
+            from decord import VideoReader, cpu
+
             video_path = str(Path(self.video_root) / row["participant_id"] / f"{video_id}.MP4")
             vr_probe = VideoReader(video_path, num_threads=1, ctx=cpu(0))
             vfps = vr_probe.get_avg_fps()
             indices = compute_clip_window(int(row["start_frame"]), vfps, self.num_frames, self.target_fps)
-            frames, _ = decode_frames(video_path, indices)
+            frames, _ = decode_frames(video_path, indices, decode_size=self.decode_size)
             frames = _resample_frames(frames, self.probe_num_frames)
-            verb_id = int(row["verb_class"])
-            noun_id = int(row["noun_class"])
-            action_id = self.action_map.get((verb_id, noun_id), -1)
             return frames, verb_id, noun_id, action_id, video_id, i
         except Exception as exc:  # noqa: BLE001 -- surfaced via logging in the training/eval loop
             return None, -1, -1, -1, f"{video_id} ({exc})", i
@@ -237,8 +304,14 @@ class BatchCollator:
         batch = [b for b in batch if b[0] is not None]
         if not batch:
             return None, None, None, None, [], []
-        frames_list, verb_ids, noun_ids, action_ids, video_ids, row_idxs = zip(*batch)
-        inputs = self.builder(self.processor, list(frames_list))
+        items, verb_ids, noun_ids, action_ids, video_ids, row_idxs = zip(*batch)
+        if isinstance(items[0], dict):
+            # Cache mode: each item is a per-sample processor output. Every key's leading dim
+            # is the batch/video axis (pixel_values_videos is patches, input_ids/grid_thw are
+            # [1, ...]), so cat along dim 0 reproduces the processor's native batched layout.
+            inputs = {k: torch.cat([it[k] for it in items], dim=0) for k in items[0]}
+        else:
+            inputs = self.builder(self.processor, list(items))
         return (
             inputs,
             torch.tensor(verb_ids, dtype=torch.long),
@@ -348,7 +421,43 @@ def main():
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--resume-from",
+        default="",
+        help="Optional probe-last.pt/probe-best.pt checkpoint to continue training from. "
+        "--num-epochs remains the total target epoch count.",
+    )
+    parser.add_argument(
+        "--prune-keep-ratio",
+        type=float,
+        default=1.0,
+        help="qwen25vl only: fraction of merged video tokens kept (attention-importance) "
+        "before the LLM. 1.0 = no pruning. See qwen_token_pruning.py (B12 equal-compute study).",
+    )
+    parser.add_argument(
+        "--prune-chunk-size",
+        type=int,
+        default=0,
+        help="qwen25vl only: query-axis chunk for the importance softmax (0 = whole per-frame segment).",
+    )
+    parser.add_argument(
+        "--qwen-frame-size",
+        type=int,
+        default=0,
+        help="qwen25vl only: resize each video frame to this square size before the processor "
+        "(0 = native). Use 256 to match V-JEPA2's resolution for the equal-compute study.",
+    )
+    parser.add_argument(
+        "--preproc-cache-dir",
+        default="",
+        help="If set, cache per-sample processor tensors under here (keyed by clip config) and "
+        "reload them on later epochs instead of re-decoding+re-tokenizing -- removes the CPU "
+        "dataloader bottleneck so the GPU stops starving. Shared across keep_ratio runs.",
+    )
     args = parser.parse_args()
+
+    global _QWEN_FRAME_SIZE
+    _QWEN_FRAME_SIZE = args.qwen_frame_size
 
     torch.manual_seed(args.seed)
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.torch_dtype]
@@ -408,6 +517,22 @@ def main():
     backbone.gradient_checkpointing_enable()
     backbone.config.use_cache = False
 
+    prune_state = None
+    if args.prune_keep_ratio < 1.0:
+        if args.backend != "qwen25vl":
+            raise ValueError("--prune-keep-ratio < 1.0 is only supported for backend=qwen25vl")
+        from app.hdepic_lora_action_anticipation.qwen_token_pruning import install_qwen_video_token_pruner
+
+        prune_state = install_qwen_video_token_pruner(
+            backbone, keep_ratio=args.prune_keep_ratio, chunk_size=args.prune_chunk_size
+        )
+        logger.info(
+            "Qwen video-token pruning ENABLED: keep_ratio=%.3f chunk_size=%d (importance = "
+            "vision-tower last-block attention received; pruned before the LLM)",
+            args.prune_keep_ratio,
+            args.prune_chunk_size,
+        )
+
     verb_vocab = load_class_vocab(args.verb_classes_csv)
     noun_vocab = load_class_vocab(args.noun_classes_csv)
     num_verbs, num_nouns = len(verb_vocab), len(noun_vocab)
@@ -433,13 +558,33 @@ def main():
 
     optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay)
 
-    train_ds = HDEpicProbeDataset(train_rows, args.video_root, action_map, args.num_frames, args.probe_num_frames, args.target_fps)
-    val_ds = HDEpicProbeDataset(val_rows, args.video_root, action_map, args.num_frames, args.probe_num_frames, args.target_fps)
+    # Preprocessing cache: a config-specific subdir so different clip settings never collide.
+    # Identical across keep_ratio (pruning is in-model), so all runs with the same clip config
+    # share one cache. Built lazily on first epoch; reused (as cheap tensor loads) thereafter.
+    cache_dir = ""
+    if args.preproc_cache_dir:
+        cache_dir = os.path.join(
+            args.preproc_cache_dir,
+            f"{args.backend}_nf{args.num_frames}_pnf{args.probe_num_frames}"
+            f"_fps{args.target_fps}_px{args.qwen_frame_size}",
+        )
+        os.makedirs(cache_dir, exist_ok=True)
+        logger.info("Preprocessing cache: %s", cache_dir)
+
+    def make_ds(rows):
+        return HDEpicProbeDataset(
+            rows, args.video_root, action_map, args.num_frames, args.probe_num_frames,
+            args.target_fps, decode_size=args.qwen_frame_size,
+            processor=processor, backend=args.backend, cache_dir=cache_dir or None,
+        )
+
+    train_ds = make_ds(train_rows)
+    val_ds = make_ds(val_rows)
     train_loader = _make_loader(train_ds, processor, args.backend, args.batch_size, args.num_workers)
     val_loader = _make_loader(val_ds, processor, args.backend, args.batch_size, args.num_workers)
     test_loader = None
     if test_rows:
-        test_ds = HDEpicProbeDataset(test_rows, args.video_root, action_map, args.num_frames, args.probe_num_frames, args.target_fps)
+        test_ds = make_ds(test_rows)
         test_loader = _make_loader(test_ds, processor, args.backend, args.batch_size, args.num_workers)
 
     batches_per_epoch = len(train_loader)
@@ -459,6 +604,7 @@ def main():
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     best_verb_r5 = 0.0
     global_step = 0
+    start_epoch = 0
 
     def save_ckpt(path, epoch, metrics):
         sd = model.state_dict()
@@ -480,7 +626,32 @@ def main():
             path,
         )
 
-    for epoch in range(args.num_epochs):
+    if args.resume_from:
+        ck = torch.load(args.resume_from, map_location=device, weights_only=False)
+        if ck.get("backend") != args.backend:
+            raise ValueError(f"Resume backend mismatch: checkpoint={ck.get('backend')} args={args.backend}")
+        if len(ck.get("action_map", {})) != len(action_map):
+            raise ValueError(
+                f"Resume action_map size mismatch: checkpoint={len(ck.get('action_map', {}))} current={len(action_map)}"
+            )
+        missing, unexpected = model.load_state_dict(ck["model_lora"], strict=False)
+        start_epoch = int(ck.get("epoch", 0))
+        global_step = start_epoch * steps_per_epoch
+        best_verb_r5 = float((ck.get("metrics") or {}).get("verb_r5", 0.0))
+        logger.info(
+            "Resumed from %s at epoch=%d global_step=%d best_verb_r5=%.2f "
+            "(missing=%d unexpected=%d)",
+            args.resume_from,
+            start_epoch,
+            global_step,
+            best_verb_r5,
+            len(missing),
+            len(unexpected),
+        )
+        for _ in range(global_step):
+            scheduler.step()
+
+    for epoch in range(start_epoch, args.num_epochs):
         model.train()
         t0 = time.time()
         epoch_loss = 0.0
@@ -504,6 +675,12 @@ def main():
                 (loss / args.grad_accum_steps).backward()
                 epoch_loss += loss.item()
                 n_loss += 1
+                if prune_state is not None and prune_state.last_stats is not None and global_step == 0 and step == 0:
+                    s = prune_state.last_stats
+                    logger.info(
+                        "Pruning realized: video tokens %d -> %d (keep_ratio=%.3f); LLM seq_len %d -> %d",
+                        s["n_tokens"], s["n_kept"], args.prune_keep_ratio, s["seq_len"], s["pruned_seq_len"],
+                    )
             except Exception:
                 logger.exception("Batch %s (epoch %d) failed, skipping", row_idxs, epoch)
                 continue
