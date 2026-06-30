@@ -111,14 +111,20 @@ def sample_few_shot_rows(csv_path: str, k: int, seed: int) -> list[dict[str, str
 
 
 def compute_clip_window(start_frame: int, video_fps: float, num_frames: int, target_fps: float) -> np.ndarray:
-    """Mirror decode_videos_to_clips with anticipation_time_sec=1.0, anticipation_point=1.0."""
+    """Mirror decode_videos_to_clips with anticipation_time_sec=1.0, anticipation_point=1.0.
+
+    For long windows (e.g. 1-min), clips near the video start may not have num_frames of
+    history available.  Out-of-bounds frames are dropped rather than clamped to 0, so the
+    returned array may be shorter than num_frames.  Variable-length output is fine: Qwen's
+    M-RoPE assigns absolute (t, y, x) positions per patch, so shorter clips get correct
+    positions without padding or duplication artifacts.
+    """
     aframes = int(1.0 * video_fps)
     af = int(start_frame) - aframes
     fstp = max(1, int(video_fps / target_fps))
     nframes = int(num_frames * fstp)
     indices = np.arange(af - nframes, af, fstp).astype(np.int64)
-    indices[indices < 0] = 0
-    return indices
+    return indices[indices >= 0]
 
 
 def decode_frames(video_path: str, indices: np.ndarray, decode_size: int = 0):

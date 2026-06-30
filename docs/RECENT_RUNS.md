@@ -1,6 +1,6 @@
 # Recent HPC Runs — Entry Point Reference
 
-更新日期：2026-06-26
+更新日期：2026-06-30
 
 这份文档列出 VJEPA2-EXP 近期（2026-06-14 ~ 06-24）HPC 实验的入口脚本和启动命令，方便在共享仓库中对照代码和配置。完整指标和实验历史去 VJEPA2-EXP `logs/DASHBOARD.md` 和 `logs/RUNNING.md`。
 
@@ -219,6 +219,152 @@ sbatch scripts/run_predictor_max_tokens.slurm
 
 ---
 
+### B12 V-JEPA2 长窗口实验（7s + 1-min）
+
+V-JEPA2 侧的长观测窗口实验。骨干为 ViT-L/256 frozen encoder + predictor-LoRA + attentive probe。与 Qwen 长窗口实验使用同一 `phd_split`（train 5214 / val 682 / test 1501），同一帧提取逻辑（compute_clip_window, 1s anticipation, drop OOB），以实现跨模型的 apple-to-apple 对比。
+
+Python 入口：`app/hdepic_lora_action_anticipation/train_vjepa_prune_anticipation.py`
+
+#### 7s 全上下文（no prune，56 frames）
+
+```bash
+# 1. 先构建 frozen-encoder 缓存（一次性，～1-2h）
+bash scripts/submit_b12_vjepa_7s_fullctx_cache.sh
+
+# 2. 读缓存训练（10 epochs，～24h）
+bash scripts/submit_b12_vjepa_7s_fullctx_train.sh
+```
+
+| 项 | 值 |
+|---|---|
+| run-tag | `b12_vjepa_7s_fullctx` |
+| 帧设置 | 56 frames @ 8fps @ 256px = ~2.5s 观测窗 + 1s 预判 |
+| 策略 | NO_PRUNE=1，全部 56×16×16 = 14336 encoder tokens 直接进 predictor |
+| GPU | H100 1卡，batch=2，grad_accum=2，eff_batch=4 |
+| 说明 | V-JEPA2 7s 基线；`submit_b12_vjepa_7s_fullctx_cache.sh` 先跑缓存再训练 |
+
+#### 1-min 全上下文（no prune，480 frames，61440 tokens）
+
+```bash
+# 1. 先并行构建缓存（4-shard array，每 shard ～2.6h；总缓存 ≈ 928 GB）
+bash scripts/submit_b12_vjepa_1min_fullctx_cache.sh
+
+# 2. 读缓存训练（8 epochs，～24h）
+bash scripts/submit_b12_vjepa_1min_fullctx_train.sh
+
+# smoke test（64 samples，2 epochs）
+bash scripts/submit_b12_vjepa_1min_fullctx_smoke.sh
+```
+
+| 项 | 值 |
+|---|---|
+| run-tag | `b12_vjepa_1min_fullctx` |
+| 帧设置 | 480 frames @ 8fps @ 256px = 60s 观测窗 |
+| 策略 | 保留全部 61440 encoder tokens；predictor 在完整上下文上做 LoRA |
+| GPU | H100 1卡，batch=1，grad_accum=4 |
+| 说明 | 无剪枝对照；与 keep4096（encoder-col-sum）和 pred0-guided 剪枝版本对比 |
+
+#### 1-min encoder-col-sum 剪枝（keep 4096，encoder attention score）
+
+4s sweep 的 1-min 扩展：encoder block-24 attention score 选 top-4096 tokens（≈6.7%）。
+
+```bash
+# 1. 此处复用 fullctx 缓存（已包含完整 61440 tokens，训练时在线剪枝）
+#    或先用 phd_split 跑: bash scripts/submit_b12_vjepa_1min_fullctx_cache.sh
+
+# 2. 训练（从缓存读，在线 keep4096 剪枝）
+bash scripts/submit_b12_vjepa_1min_fullctx_train.sh  # 需要加 KEEP_COUNT=4096 环境变量
+```
+
+#### 1-min predictor-block-0 引导剪枝（keep 4096，pred0 attn score）
+
+```bash
+# 1. 构建 pred0-guided 缓存（4-shard array，每 shard ～75 min）
+bash scripts/submit_b12_vjepa_1min_pred0_cache_build.sh
+
+# 2. 读缓存训练
+bash scripts/submit_b12_vjepa_1min_pred0_train.sh
+
+# smoke test
+bash scripts/submit_b12_vjepa_1min_pred0_train.sh --smoke
+```
+
+| 项 | 值 |
+|---|---|
+| run-tag | `b12_vjepa_1min_pred0` |
+| 缓存 key | `nf480_fps8.0_px256_pred0_keep4096_idx` |
+| 策略 | predictor block-0 attention score 选 top-4096；position_mode=rebased |
+| 对比 | vs `b12_vjepa_1min_keep4096`（encoder-col-sum）—— 相同 keep_count，不同 selection source |
+| 相关脚本 | `scripts/analyze_pred_block0_attn.py`，`scripts/run_pred_block0_attn.slurm` |
+
+---
+
+### B12 Qwen2.5-VL 长窗口实验（7s + 1-min）
+
+Qwen2.5-VL-3B 侧的长观测窗口实验。与 V-JEPA2 长窗口实验使用同一 `phd_split` 和帧提取逻辑，骨干为 Qwen2.5-VL-3B（VLM LoRA + attentive probe）。
+
+> **与 4s sweep 的关系：** 4s sweep 使用 `p01_fixed` split；长窗口实验改为 `phd_split`，以匹配 PhD 参考实现。指标不可与 p01_fixed 系列直接对比。
+
+#### 7s 窗口（56 frames，preproc cache）
+
+```bash
+# 完整训练（10 epochs，带 preproc cache）
+bash scripts/submit_b12_qwen_7s_fulltrain.sh
+
+# smoke（32 samples, 1 epoch）
+MAX_TRAIN_SAMPLES=32 NUM_EPOCHS=1 SLURM_TIME=01:00:00 \
+  RUN_TAG=smoke_qwen_7s bash scripts/submit_b12_qwen_7s_fulltrain.sh
+```
+
+| 项 | 值 |
+|---|---|
+| run-tag | `b12_qwen_7s_fullctx_kr1p0_cache` |
+| 帧设置 | 56 frames @ 8fps @ 256px → 28 temporal slots × 9×9 = 2268 Qwen video tokens |
+| 策略 | PRUNE_KEEP_RATIO=1.0，preproc cache 加速（边缘 clip 长度可变，batch_size=1）|
+| GPU | H100 1卡，eff_batch=8（grad_accum=8）|
+
+#### 1-min 窗口（480 frames，no preproc cache）
+
+```bash
+# 完整训练（10 epochs）
+bash scripts/submit_b12_qwen_1min_fulltrain.sh
+
+# smoke（32 samples，1 epoch）
+MAX_TRAIN_SAMPLES=32 NUM_EPOCHS=1 SLURM_TIME=01:00:00 \
+  bash scripts/submit_b12_qwen_1min_raw_smoke.sh
+
+# resume from checkpoint
+RUN_TAG=<tag_to_resume> bash scripts/submit_b12_qwen_1min_resume.sh
+```
+
+| 项 | 值 |
+|---|---|
+| run-tag | `b12_qwen_1min_fulltrain_kr1p0` |
+| 帧设置 | 480 frames @ 8fps @ 256px，keep_ratio=1.0（无剪枝）|
+| 策略 | 无 preproc cache（GPU-bound，3.2s/sample > decode 2.4s/sample），10 workers |
+| GPU | H100 1卡，batch=1，grad_accum=8，eff_batch=8；时间预算 ≈ 24h/run |
+| 说明 | 1-min Qwen 基线；与 V-JEPA2 1-min fullctx 等计算量对比 |
+
+#### 1-min cached-embeds 训练（vision tower 跳过，只训 LLM LoRA）
+
+```bash
+# 1. 构建 cached-embeds（post-vision-tower pruned LLM inputs）
+bash scripts/submit_b12_qwen_prune_cache.sh   # 需要先跑这个（build_qwen_prune_cache.py）
+
+# 2. 训练（仅 LLM + probe，无 vision tower，batch_size 可大幅提升）
+CACHED_EMBEDS_DIR=/path/to/preproc_cache_qwen BACKEND=qwen25vl \
+  RUN_TAG=b12_qwen_1min_cached bash scripts/submit_vlm_probe_lora.sh
+```
+
+| 相关脚本 | 说明 |
+|---|---|
+| `scripts/build_qwen_prune_cache.py` | 离线构建 cached-embeds（vision tower 正向，保存 LLM inputs）|
+| `scripts/run_b12_qwen_prune_cache.slurm` | SLURM 版本 |
+| `scripts/run_b12_qwen_1min_perf_smoke.slurm` | 性能 smoke（单 sample 吞吐测量）|
+| `scripts/run_b12_qwen_1min_val_cache.slurm` | val-only 缓存构建（val split）|
+
+---
+
 ### Standalone Checkpoint 评估
 
 对已训好的 probe checkpoint 做独立测试集评估（不重新训练）：
@@ -404,13 +550,15 @@ bash scripts/submit_b11_singleprobe_ar10s_direct_rope_vitl_fp32_bs8_noac_fulltra
 
 1. **对齐参考实现（V-JEPA）** → 看 p01_fixed run（#1, #2）
 2. **VLM 系列实验** → 看 VLM 实验章节：零样本 prompting、frozen-VLM probe（不加 LoRA）、LoRA SFT、LoRA+probe
-3. **B12 等计算量 Qwen pruning** → 看 B12 章节，入口 `submit_b12_qwen_pruning_sweep.sh`
-4. **复现历史 baseline** → 看 legacy run（#4, #5）
-5. **验证 predictor-LoRA** → 看 legacy predictor-LoRA（#7），启动命令见该节
-6. **Encoder-LoRA + gaze/pose** → 看 Encoder-LoRA 20head LowLR / Single-Probe 章节
-7. **AR long-horizon + gaze/pose** → 看 AR 10s Sliding Gaze+Pose 章节
-8. **Latent 诊断** → 看 D3/LTM 系列
-9. **Standalone eval（已训模型）** → `python app/hdepic_lora_action_anticipation/eval_probe_checkpoint.py --checkpoint <path> --config <path> --split test`
+3. **B12 等计算量 Qwen pruning（4s）** → 看 B12 Token Pruning Sweep 章节，入口 `submit_b12_qwen_pruning_sweep.sh`
+4. **B12 长窗口 V-JEPA2（7s/1-min）** → 看 B12 V-JEPA2 长窗口章节；入口 `submit_b12_vjepa_7s_fullctx_train.sh` / `submit_b12_vjepa_1min_fullctx_train.sh`
+5. **B12 长窗口 Qwen（7s/1-min）** → 看 B12 Qwen2.5-VL 长窗口章节；入口 `submit_b12_qwen_7s_fulltrain.sh` / `submit_b12_qwen_1min_fulltrain.sh`
+6. **复现历史 baseline** → 看 legacy run（#4, #5）
+7. **验证 predictor-LoRA** → 看 legacy predictor-LoRA（#7），启动命令见该节
+8. **Encoder-LoRA + gaze/pose** → 看 Encoder-LoRA 20head LowLR / Single-Probe 章节
+9. **AR long-horizon + gaze/pose** → 看 AR 10s Sliding Gaze+Pose 章节
+10. **Latent 诊断** → 看 D3/LTM 系列
+11. **Standalone eval（已训模型）** → `python app/hdepic_lora_action_anticipation/eval_probe_checkpoint.py --checkpoint <path> --config <path> --split test`
 
 ### LoRA 方案对照
 
@@ -423,7 +571,10 @@ bash scripts/submit_b11_singleprobe_ar10s_direct_rope_vitl_fp32_bs8_noac_fulltra
 | EncoRA 20head LowLR | ✅ rank=4 last 4 | ❌ | full | 降低 probe LR |
 | **VLM frozen probe** | ❌ | ❌ | full | VLM encoder 完全冻结 |
 | VLM LoRA + Probe | ✅ (VLM LoRA) | ❌ | full | HF PEFT，非 V-JEPA |
-| **B12 Qwen pruning** | ✅ (VLM LoRA) | ❌ | full | Qwen2.5-VL，token pruning，等计算量对照 |
+| **B12 Qwen pruning（4s）** | ✅ (VLM LoRA) | ❌ | full | Qwen2.5-VL，token pruning，等计算量对照，p01_fixed split |
+| **B12 Qwen 7s/1min** | ✅ (VLM LoRA) | ❌ | full | Qwen2.5-VL 长窗口，phd_split |
+| **B12 V-JEPA2 7s/1min（fullctx）** | ❌ | ✅ rank=8 | full | frozen encoder，predictor-LoRA，phd_split |
+| **B12 V-JEPA2 1min（pred0 prune）** | ❌ | ✅ rank=8 | full | pred0-attn 选 top-4096，phd_split |
 | `refer_repo/JEPA_ARVR` | ✅ | ❌ | — | 参考 encoder-LoRA，无 predictor-LoRA/无 VLM |
 
 完整 run 注册表（含 checkpoint 路径、sidecar、raw log 链接）去 VJEPA2-EXP `logs/RUNNING.md`。

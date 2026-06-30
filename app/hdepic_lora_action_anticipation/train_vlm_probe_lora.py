@@ -53,7 +53,10 @@ _VISION_SUBSTRINGS = ("vision", "visual", "projector")
 
 
 def _resample_frames(frames: np.ndarray, n: int) -> np.ndarray:
-    if frames.shape[0] == n:
+    if frames.shape[0] <= n:
+        # Already at or below target: return as-is (no upsampling / frame duplication).
+        # For variable-length windows (e.g. 1-min clips near video start that have less than
+        # n frames of history), the honest choice is to pass only what's available.
         return frames
     idx = np.linspace(0, frames.shape[0] - 1, n).round().astype(np.int64)
     return frames[idx]
@@ -293,6 +296,48 @@ class HDEpicProbeDataset(torch.utils.data.Dataset):
             return None, -1, -1, -1, f"{video_id} ({exc})", i
 
 
+class CachedEmbedsDataset(torch.utils.data.Dataset):
+    """Loads pre-pruned post-vision-tower LLM inputs (B12 1-min→4s-token Qwen study).
+
+    Built by ``scripts/build_qwen_prune_cache.py``: each sample's frozen-vision-tower output,
+    pruned to the 4s-level token budget, is saved as ``inputs_embeds`` (+ M-RoPE
+    ``position_ids``). Training loads these and runs ONLY the LLM (LoRA) + heads — the vision
+    tower (61% of step time) never runs during training. Mirrors the V-JEPA2 1-min side, which
+    caches its frozen-encoder pruned tokens. ``action_id`` is derived here from ``action_map``
+    so the cache stays independent of the action vocabulary.
+
+    Each item is ``({"inputs_embeds", "position_ids"}, verb_id, noun_id, action_id, video_id, i)``;
+    with batch_size=1 the stock ``BatchCollator`` dict path passes the tensors through unchanged.
+    """
+
+    def __init__(self, rows, cache_dir: str, action_map):
+        self.rows = rows
+        self.cache_dir = cache_dir
+        self.action_map = action_map
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def _cache_path(self, row):
+        return os.path.join(
+            self.cache_dir,
+            f"{row['participant_id']}__{row.get('video_id', 'x')}__{int(row['start_frame'])}.pt",
+        )
+
+    def __getitem__(self, i: int):
+        row = self.rows[i]
+        video_id = row.get("video_id", "?")
+        try:
+            verb_id = int(row["verb_class"])
+            noun_id = int(row["noun_class"])
+            action_id = self.action_map.get((verb_id, noun_id), -1)
+            payload = torch.load(self._cache_path(row), map_location="cpu", weights_only=False)
+            inputs = {"inputs_embeds": payload["inputs_embeds"], "position_ids": payload["position_ids"]}
+            return inputs, verb_id, noun_id, action_id, video_id, i
+        except Exception as exc:  # noqa: BLE001 -- surfaced via logging in the training/eval loop
+            return None, -1, -1, -1, f"{video_id} ({exc})", i
+
+
 class BatchCollator:
     """Tokenizes a whole batch at once (runs in the DataLoader worker process)."""
 
@@ -322,13 +367,49 @@ class BatchCollator:
         )
 
 
-def _make_loader(dataset, processor, backend: str, batch_size: int, num_workers: int):
+def cached_embeds_collate(batch):
+    """Left-pad a batch of pre-pruned LLM inputs to the batch's max sequence length.
+
+    Pruned clips vary in length (edge clips keep fewer tokens), so we pad on the LEFT and
+    build an attention_mask: left-padding keeps each sample's real last token at index -1, so
+    the probe's ``hidden_states[-1][:, -1, :]`` read stays valid for every row. Pad position_ids
+    are dummy (0) and excluded by the mask. Lets the cheap LLM-only step run at batch_size>1 so
+    the GPU is well-fed (avoids the low-util cancellation that bs=1 micro-steps would risk).
+    """
+    batch = [b for b in batch if b[0] is not None]
+    if not batch:
+        return None, None, None, None, [], []
+    items, verb_ids, noun_ids, action_ids, video_ids, row_idxs = zip(*batch)
+    lengths = [it["inputs_embeds"].shape[1] for it in items]
+    max_l = max(lengths)
+    B = len(items)
+    D = items[0]["inputs_embeds"].shape[-1]
+    emb = items[0]["inputs_embeds"].new_zeros(B, max_l, D)
+    pos = items[0]["position_ids"].new_zeros(3, B, max_l)
+    attn = torch.zeros(B, max_l, dtype=torch.long)
+    for i, it in enumerate(items):
+        l = lengths[i]
+        emb[i, max_l - l:, :] = it["inputs_embeds"][0]
+        pos[:, i, max_l - l:] = it["position_ids"][:, 0, :]
+        attn[i, max_l - l:] = 1
+    inputs = {"inputs_embeds": emb, "position_ids": pos, "attention_mask": attn}
+    return (
+        inputs,
+        torch.tensor(verb_ids, dtype=torch.long),
+        torch.tensor(noun_ids, dtype=torch.long),
+        torch.tensor(action_ids, dtype=torch.long),
+        list(video_ids),
+        list(row_idxs),
+    )
+
+
+def _make_loader(dataset, processor, backend: str, batch_size: int, num_workers: int, cached: bool = False):
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        collate_fn=BatchCollator(processor, backend),
+        collate_fn=cached_embeds_collate if cached else BatchCollator(processor, backend),
         prefetch_factor=4 if num_workers > 0 else None,
         persistent_workers=num_workers > 0,
     )
@@ -454,6 +535,14 @@ def main():
         "reload them on later epochs instead of re-decoding+re-tokenizing -- removes the CPU "
         "dataloader bottleneck so the GPU stops starving. Shared across keep_ratio runs.",
     )
+    parser.add_argument(
+        "--cached-embeds-dir",
+        default="",
+        help="qwen25vl only: if set, load pre-pruned post-vision-tower LLM inputs from here "
+        "(built by scripts/build_qwen_prune_cache.py) and train ONLY the LLM (LoRA)+heads, "
+        "skipping the vision tower entirely. Forces batch_size=1; pruning must already be baked "
+        "into the cache (use --prune-keep-ratio 1.0). The B12 1-min->4s-token Qwen experiment.",
+    )
     args = parser.parse_args()
 
     global _QWEN_FRAME_SIZE
@@ -533,6 +622,19 @@ def main():
             args.prune_chunk_size,
         )
 
+    if args.cached_embeds_dir:
+        if args.backend != "qwen25vl":
+            raise ValueError("--cached-embeds-dir is only supported for backend=qwen25vl")
+        if args.prune_keep_ratio < 1.0:
+            raise ValueError(
+                "--cached-embeds-dir already holds pruned tokens; set --prune-keep-ratio 1.0 "
+                "(do not also install the in-model pruner)"
+            )
+        logger.info(
+            "Cached pruned-embeds training from: %s (vision tower skipped; batch_size=%d, "
+            "left-padded variable-length collation)", args.cached_embeds_dir, args.batch_size,
+        )
+
     verb_vocab = load_class_vocab(args.verb_classes_csv)
     noun_vocab = load_class_vocab(args.noun_classes_csv)
     num_verbs, num_nouns = len(verb_vocab), len(noun_vocab)
@@ -572,20 +674,23 @@ def main():
         logger.info("Preprocessing cache: %s", cache_dir)
 
     def make_ds(rows):
+        if args.cached_embeds_dir:
+            return CachedEmbedsDataset(rows, args.cached_embeds_dir, action_map)
         return HDEpicProbeDataset(
             rows, args.video_root, action_map, args.num_frames, args.probe_num_frames,
             args.target_fps, decode_size=args.qwen_frame_size,
             processor=processor, backend=args.backend, cache_dir=cache_dir or None,
         )
 
+    cached = bool(args.cached_embeds_dir)
     train_ds = make_ds(train_rows)
     val_ds = make_ds(val_rows)
-    train_loader = _make_loader(train_ds, processor, args.backend, args.batch_size, args.num_workers)
-    val_loader = _make_loader(val_ds, processor, args.backend, args.batch_size, args.num_workers)
+    train_loader = _make_loader(train_ds, processor, args.backend, args.batch_size, args.num_workers, cached)
+    val_loader = _make_loader(val_ds, processor, args.backend, args.batch_size, args.num_workers, cached)
     test_loader = None
     if test_rows:
         test_ds = make_ds(test_rows)
-        test_loader = _make_loader(test_ds, processor, args.backend, args.batch_size, args.num_workers)
+        test_loader = _make_loader(test_ds, processor, args.backend, args.batch_size, args.num_workers, cached)
 
     batches_per_epoch = len(train_loader)
     steps_per_epoch = max(1, batches_per_epoch // args.grad_accum_steps)
