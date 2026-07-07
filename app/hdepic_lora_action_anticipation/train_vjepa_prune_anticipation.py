@@ -49,6 +49,8 @@ from src.models.utils.modules import rotate_queries_or_keys  # noqa: E402
 from evals.action_anticipation_frozen.modelcustom.vit_encoder_predictor_concat_ar import (  # noqa: E402
     init_module as init_anticipative_module,
 )
+from loss_aware_pruning import LossAwarePruningConfig, simulate_cascade_keep_counts  # noqa: E402
+from models.vit_encoder_pruning import LossAwareEncoderPruner  # noqa: E402
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1, 1)
@@ -269,6 +271,33 @@ def parse_encoder_prune_schedule(spec: str, full_n: int, gp: int) -> list[tuple[
     if any(b < 0 for b, _ in schedule):
         raise ValueError("--encoder-prune-schedule uses 1-indexed block numbers; got block <= 0")
     return schedule
+
+
+def build_loss_aware_pruning_config(args, full_n: int) -> LossAwarePruningConfig:
+    if not args.loss_aware_pruning_config:
+        raise ValueError(
+            "--enable-loss-aware-pruning requires --loss-aware-pruning-config "
+            "(run scripts/calibrate_loss_aware_pruning.py first)"
+        )
+    cfg = LossAwarePruningConfig.load(args.loss_aware_pruning_config)
+    cfg.enable_loss_aware_pruning = True
+    if cfg.num_tokens_full and cfg.num_tokens_full != full_n:
+        raise ValueError(
+            f"calibrated num_tokens_full={cfg.num_tokens_full} != runtime full_n={full_n}"
+        )
+    if not cfg.num_tokens_full:
+        cfg.num_tokens_full = full_n
+    return cfg
+
+
+def build_loss_aware_pruner(encoder, args, full_n: int, gp: int) -> LossAwareEncoderPruner:
+    cfg = build_loss_aware_pruning_config(args, full_n)
+    return LossAwareEncoderPruner(
+        encoder,
+        cfg,
+        gp=gp,
+        num_tokens_full=full_n,
+    )
 
 
 class MidEncoderPruner:
@@ -519,6 +548,9 @@ def cache_key(args):
     if args.encoder_prune_schedule:
         sched = args.encoder_prune_schedule.replace(":", "x").replace(",", "_").replace(".", "p")
         suffix = f"_mid{args.encoder_prune_metric}_{sched}"
+    elif getattr(args, "enable_loss_aware_pruning", False):
+        cfg_tag = Path(args.loss_aware_pruning_config).stem
+        suffix = f"_lapcfg_{cfg_tag}"
     return f"nf{args.num_frames}_fps{args.target_fps}_px{args.img_size}_keep{args.keep_count}{suffix}_idx"
 
 
@@ -722,6 +754,10 @@ def main():
     ap.add_argument("--encoder-prune-metric", choices=["next_attn", "feature_norm"], default="next_attn",
                     help="mid-encoder score. next_attn uses the scheduled block's attention-received "
                          "column sum; feature_norm uses ||h_i||_2 after the scheduled block.")
+    ap.add_argument("--enable-loss-aware-pruning", action="store_true",
+                    help="use offline-calibrated loss-aware cascade pruning (requires --loss-aware-pruning-config)")
+    ap.add_argument("--loss-aware-pruning-config", default="",
+                    help="calibrated LossAwarePruningConfig JSON from calibrate_loss_aware_pruning.py")
     ap.add_argument("--no-prune", action="store_true",
                     help="full-context experiment: keep ALL encoder tokens (no pruning), forces "
                          "position-mode=true. Cache stores the full ~61440-token output per sample.")
@@ -783,11 +819,31 @@ def main():
     if args.no_prune:
         if args.encoder_prune_schedule:
             raise ValueError("--no-prune and --encoder-prune-schedule are mutually exclusive")
+        if args.enable_loss_aware_pruning:
+            raise ValueError("--no-prune and --enable-loss-aware-pruning are mutually exclusive")
         # full-context experiment: keep every token, real positions over the whole window.
         args.keep_count = full_n            # -> distinct cache key keep{full_n}; W = full_n//gp slots
         args.position_mode = "true"
         pruner = None
         print(f"  NO-PRUNE: keeping all {full_n} tokens, position_mode forced to 'true'", flush=True)
+    elif args.enable_loss_aware_pruning:
+        if args.encoder_prune_schedule:
+            raise ValueError("--enable-loss-aware-pruning and --encoder-prune-schedule are mutually exclusive")
+        pruner = build_loss_aware_pruner(model.encoder, args, full_n, gp)
+        args.keep_count = pruner.keep_count
+        cascade = simulate_cascade_keep_counts(
+            full_n,
+            pruner.prune_ratio_schedule,
+            gp=gp,
+            round_to_frame_tokens=pruner.config.round_to_frame_tokens,
+        )
+        ratio_desc = ", ".join(
+            f"block{l}:r={pruner.prune_ratio_schedule[l]:.4f}" for l in sorted(pruner.prune_ratio_schedule)
+        )
+        cascade_desc = ", ".join(f"after{l}->{k}" for l, k in cascade.items())
+        print(f"  LOSS-AWARE calibrated cascade | {ratio_desc}", flush=True)
+        print(f"  cascade keep counts | {cascade_desc}", flush=True)
+        print(f"  final keep_count={args.keep_count} -> W={args.keep_count // gp} slots", flush=True)
     elif args.encoder_prune_schedule:
         schedule = parse_encoder_prune_schedule(args.encoder_prune_schedule, full_n=full_n, gp=gp)
         max_block = len(model.encoder.blocks) - 1
