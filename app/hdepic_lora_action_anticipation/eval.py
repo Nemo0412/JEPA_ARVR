@@ -963,7 +963,7 @@ def _make_lora_init_classifier(
                 _freeze_for_lora(classifier, train_heads=train_heads)
             else:
                 for param in classifier.parameters():
-                    param.requires_grad = True
+                    param.requires_grad = train_heads
             if token_gate is not None and head_idx == 0:
                 classifier.gaze_token_gate = token_gate
                 for param in classifier.gaze_token_gate.parameters():
@@ -1610,10 +1610,18 @@ def _patch_init_module_for_binary_input_adapter(base_eval, gaze_cfg: dict):
         wrapped.embed_dim = model.embed_dim
         for param in wrapped.base_model.parameters():
             param.requires_grad = False
-        for param in wrapped.input_adapter.parameters():
-            param.requires_grad = True
+        if cfg.get("freeze", False):
+            for param in wrapped.input_adapter.parameters():
+                param.requires_grad = False
+            logger.info("Froze binary input adapter params for stage-2 warm start")
+        else:
+            for param in wrapped.input_adapter.parameters():
+                param.requires_grad = True
         restored_encoder_lora = set_encoder_lora_trainable(wrapped.base_model, trainable=True)
-        if restored_encoder_lora:
+        if restored_encoder_lora and cfg.get("freeze_encoder_lora", False):
+            set_encoder_lora_trainable(wrapped.base_model, trainable=False)
+            logger.info("Froze encoder LoRA params after binary adapter init")
+        elif restored_encoder_lora:
             logger.info("Restored encoder-LoRA trainable params after binary adapter freeze: %d", restored_encoder_lora)
         if bool(cfg.get("activation_checkpointing", False)):
             if hasattr(wrapped.base_model.encoder, "use_activation_checkpointing"):
@@ -1748,6 +1756,20 @@ def _patch_for_encoder_lora(base_eval, enc_cfg: dict, baseline_train_loop: bool)
             if enc is not None and hasattr(enc, "use_activation_checkpointing"):
                 enc.use_activation_checkpointing = True
                 logger.info("Enabled encoder activation checkpointing for encoder LoRA")
+        warm_path = enc_cfg.get("load_checkpoint_path")
+        if enc_cfg.get("warm_start_at_init") and warm_path and Path(warm_path).exists():
+            missing, unexpected = load_encoder_lora_checkpoint(model, str(warm_path), strict=False)
+            logger.info(
+                "Warm-started encoder LoRA from %s; missing=%d unexpected=%d",
+                warm_path,
+                len(missing),
+                len(unexpected),
+            )
+        elif enc_cfg.get("warm_start_at_init") and warm_path:
+            logger.warning("Encoder LoRA warm-start checkpoint not found: %s", warm_path)
+        if enc_cfg.get("freeze"):
+            frozen = set_encoder_lora_trainable(model, trainable=False)
+            logger.info("Froze encoder LoRA params after init: %d", frozen)
         assert_encoder_lora_device_consistency(model)
         base_eval._encoder_lora_model = model
         return model

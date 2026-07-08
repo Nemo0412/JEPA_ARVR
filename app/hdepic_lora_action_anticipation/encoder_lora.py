@@ -311,6 +311,10 @@ def parse_encoder_lora_cfg(lora_cfg: dict) -> dict | None:
     for key in ("checkpoint_path", "load_checkpoint_path"):
         if key in cfg:
             parsed[key] = cfg[key]
+    if "warm_start_at_init" in cfg:
+        parsed["warm_start_at_init"] = bool(cfg.get("warm_start_at_init"))
+    if "freeze" in cfg:
+        parsed["freeze"] = bool(cfg.get("freeze"))
     return parsed
 
 
