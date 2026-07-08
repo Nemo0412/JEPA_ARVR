@@ -691,6 +691,15 @@ def _patch_best_checkpointing_and_early_stop(base_eval, args_eval):
         if predictor_lora_model is not None:
             save_predictor_lora_checkpoint(predictor_lora_model, path.parent / "predictor_lora_latest.pt")
 
+        # Video-only / encoder-LoRA baseline path also needs sidecars: previously only the
+        # binary_input_adapter validate wrappers wrote encoder_lora_latest.pt, so
+        # gaze:none runs left encoder LoRA unrecoverable after preempt/cancel.
+        encoder_lora_model = getattr(base_eval, "_encoder_lora_model", None)
+        if encoder_lora_model is None:
+            encoder_lora_model = getattr(base_eval, "_binary_input_adapter_model", None)
+        if encoder_lora_model is not None:
+            save_encoder_lora_checkpoint(encoder_lora_model, path.parent / "encoder_lora_latest.pt")
+
         if improved:
             best_path = path.with_name("best.pt")
             original_torch_save(obj, best_path, *args, **kwargs)
@@ -1162,6 +1171,12 @@ def main(args_eval, resume_preempt=False):
     encoder_lora_cfg = parse_encoder_lora_cfg(lora_cfg)
     if encoder_lora_cfg is not None:
         logger.info("Encoder LoRA enabled: %s", encoder_lora_cfg)
+        # Must set these outside the gaze/metadata branch: video-only (gaze:none)
+        # never entered that block, so encoder_lora_latest.pt was never written/loaded.
+        encoder_run_dir = _run_dir(args_eval)
+        encoder_lora_cfg.setdefault("checkpoint_path", str(encoder_run_dir / "encoder_lora_latest.pt"))
+        if args_eval.get("resume_checkpoint", False):
+            encoder_lora_cfg.setdefault("load_checkpoint_path", str(encoder_lora_cfg["checkpoint_path"]))
 
     # Predictor LoRA: same strategy as encoder LoRA (same LoRALinear, same
     # default rank/alpha/dropout/target_suffixes) but targets model.predictor
@@ -1170,11 +1185,9 @@ def main(args_eval, resume_preempt=False):
     predictor_lora_cfg = parse_predictor_lora_cfg(lora_cfg)
     if predictor_lora_cfg is not None:
         logger.info("Predictor LoRA enabled: %s", predictor_lora_cfg)
-        # Unlike encoder_lora's checkpoint_path (only set inside the gaze/metadata
-        # branch further down), default this unconditionally so the no-gaze
-        # baseline path can also resume predictor LoRA weights via
-        # RESUME_CHECKPOINT=1 -- see the save hook in
-        # _patch_best_checkpointing_and_early_stop, which now also writes
+        # Default this unconditionally so the no-gaze baseline path can also
+        # resume predictor LoRA weights via RESUME_CHECKPOINT=1 -- see the save
+        # hook in _patch_best_checkpointing_and_early_stop, which also writes
         # predictor_lora_latest.pt on every latest.pt save.
         predictor_run_dir = _run_dir(args_eval)
         predictor_lora_cfg.setdefault("checkpoint_path", str(predictor_run_dir / "predictor_lora_latest.pt"))
