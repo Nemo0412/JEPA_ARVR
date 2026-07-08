@@ -47,6 +47,7 @@ from app.hdepic_lora_action_anticipation.encoder_lora import (
     load_encoder_lora_checkpoint,
     make_grad_scaler,
     parse_encoder_lora_cfg,
+    save_encoder_lora_checkpoint,
     set_encoder_lora_trainable,
     train_one_epoch_encoder_lora,
     trainable_encoder_lora_params,
