@@ -108,6 +108,19 @@ ENCODER_GAZE_ADAPTER_NUM_HEADS="${ENCODER_GAZE_ADAPTER_NUM_HEADS:-4}"
 ENCODER_GAZE_ADAPTER_DROPOUT="${ENCODER_GAZE_ADAPTER_DROPOUT:-0.0}"
 ENCODER_GAZE_ADAPTER_LR_MULT="${ENCODER_GAZE_ADAPTER_LR_MULT:-0.05}"
 ENCODER_GAZE_ADAPTER_WEIGHT_DECAY="${ENCODER_GAZE_ADAPTER_WEIGHT_DECAY:-0.0001}"
+TRI_MODAL_USE_GAZE_BRANCH="${TRI_MODAL_USE_GAZE_BRANCH:-1}"
+TRI_MODAL_USE_IMU_BRANCH="${TRI_MODAL_USE_IMU_BRANCH:-1}"
+TRI_MODAL_GAZE_TOKEN_RATIO="${TRI_MODAL_GAZE_TOKEN_RATIO:-0.5}"
+TRI_MODAL_IMU_TOKEN_RATIO="${TRI_MODAL_IMU_TOKEN_RATIO:-0.1}"
+TRI_MODAL_GAZE_GRID_SIZE="${TRI_MODAL_GAZE_GRID_SIZE:-10}"
+TRI_MODAL_IMU_ENCODER_TYPE="${TRI_MODAL_IMU_ENCODER_TYPE:-gru}"
+TRI_MODAL_FUSION_NUM_HEADS="${TRI_MODAL_FUSION_NUM_HEADS:-4}"
+TRI_MODAL_FUSION_ATTN_DIM="${TRI_MODAL_FUSION_ATTN_DIM:-}"
+TRI_MODAL_FUSION_NUM_LAYERS="${TRI_MODAL_FUSION_NUM_LAYERS:-1}"
+TRI_MODAL_USE_GATED_RESIDUAL="${TRI_MODAL_USE_GATED_RESIDUAL:-1}"
+TRI_MODAL_FUSION_LR_MULT="${TRI_MODAL_FUSION_LR_MULT:-0.05}"
+TRI_MODAL_FUSION_WEIGHT_DECAY="${TRI_MODAL_FUSION_WEIGHT_DECAY:-0.0001}"
+TRI_MODAL_IMU_HIDDEN_DIM="${TRI_MODAL_IMU_HIDDEN_DIM:-128}"
 ENCODER_LORA_ENABLED="${ENCODER_LORA_ENABLED:-0}"
 ENCODER_LORA_RANK="${ENCODER_LORA_RANK:-${LORA_RANK}}"
 ENCODER_LORA_ALPHA="${ENCODER_LORA_ALPHA:-${LORA_ALPHA}}"
@@ -149,6 +162,7 @@ export GAZE_RNN_USE_VIDEO_TOKEN GAZE_RNN_VIDEO_FUSION GAZE_RNN_VIDEO_PROJ_DIM GA
 export POSE_SLAM_ROOT POSE_MAPPING_JSON POSE_FEATURE_SET POSE_QUALITY_MIN POSE_HISTORY_SEC
 export BINARY_INPUT_ADAPTER_FORCE_ZERO_MAP BINARY_INPUT_ADAPTER_LOAD_CHECKPOINT BINARY_INPUT_ADAPTER_AUG_AWARE
 export ENCODER_GAZE_ADAPTER_NUM_HEADS ENCODER_GAZE_ADAPTER_DROPOUT ENCODER_GAZE_ADAPTER_LR_MULT ENCODER_GAZE_ADAPTER_WEIGHT_DECAY
+export TRI_MODAL_USE_GAZE_BRANCH TRI_MODAL_USE_IMU_BRANCH TRI_MODAL_GAZE_TOKEN_RATIO TRI_MODAL_IMU_TOKEN_RATIO TRI_MODAL_GAZE_GRID_SIZE TRI_MODAL_IMU_ENCODER_TYPE TRI_MODAL_FUSION_NUM_HEADS TRI_MODAL_FUSION_ATTN_DIM TRI_MODAL_FUSION_NUM_LAYERS TRI_MODAL_USE_GATED_RESIDUAL TRI_MODAL_FUSION_LR_MULT TRI_MODAL_FUSION_WEIGHT_DECAY TRI_MODAL_IMU_HIDDEN_DIM
 export ENCODER_LORA_ENABLED ENCODER_LORA_RANK ENCODER_LORA_ALPHA ENCODER_LORA_DROPOUT ENCODER_LORA_LAST_N_BLOCKS ENCODER_LORA_LR_MULT ENCODER_LORA_WEIGHT_DECAY ENCODER_LORA_ACTIVATION_CHECKPOINTING ENCODER_LORA_TARGET_SUFFIXES
 export BACKBONE EVAL_RESOLUTION AR10S_SLIDING_PROBE HDEPIC_AR10S_SLIDING_GAZE_POSE HDEPIC_DIRECT_ROPE_10S MODEL_ROPE_SCALE_MODE EVAL_ANTICIPATION_SEC EVAL_TRAIN_ANTICIPATION_SEC_MIN EVAL_TRAIN_ANTICIPATION_SEC_MAX MODEL_RETURN_MODE MODEL_MAX_ROLLOUT_STEPS EVAL_VAL_EVERY
 export MODEL_FAMILY VLM_MODEL_ID VLM_MODEL_CLASS VLM_NUM_FRAMES VLM_TOKEN_MODE VLM_IMAGE_SIZE VLM_TRUST_REMOTE_CODE VLM_TORCH_DTYPE VLM_LOCAL_FILES_ONLY VLM_GPU_PULSE_ITERS VLM_GPU_PULSE_SIZE
@@ -167,7 +181,7 @@ export PYTHONPATH="${PROJECT_ROOT}:${VJEPA_ROOT}:${PYTHONPATH:-}"
 cd "${PROJECT_ROOT}"
 
 case "${GAZE_MODE}" in
-  none|token_gate|rnn_fuse|mlp_fuse|pose_rnn_fuse|multimodal_rnn_fuse|binary_input_adapter|binary_input_adapter_pose_rnn_fuse|binary_input_adapter_gaze_pose_matrix|encoder_output_inject)
+  none|token_gate|rnn_fuse|mlp_fuse|pose_rnn_fuse|multimodal_rnn_fuse|binary_input_adapter|binary_input_adapter_pose_rnn_fuse|binary_input_adapter_gaze_pose_matrix|encoder_output_inject|projected_tri_modal_cross_attention)
     ;;
   overlay_video)
     if [[ ! -d "${GAZE_VIDEO_ROOT}" ]]; then
@@ -178,7 +192,7 @@ case "${GAZE_MODE}" in
     export ADAPTED_VIDEO_ROOT="${GAZE_VIDEO_ROOT}"
     ;;
   *)
-    echo "[lora] Unknown GAZE_MODE=${GAZE_MODE}; expected none, overlay_video, token_gate, rnn_fuse, mlp_fuse, pose_rnn_fuse, multimodal_rnn_fuse, binary_input_adapter, binary_input_adapter_pose_rnn_fuse, binary_input_adapter_gaze_pose_matrix, or encoder_output_inject" >&2
+    echo "[lora] Unknown GAZE_MODE=${GAZE_MODE}; expected none, overlay_video, token_gate, rnn_fuse, mlp_fuse, pose_rnn_fuse, multimodal_rnn_fuse, binary_input_adapter, binary_input_adapter_pose_rnn_fuse, binary_input_adapter_gaze_pose_matrix, encoder_output_inject, or projected_tri_modal_cross_attention" >&2
     exit 1
     ;;
 esac
@@ -199,6 +213,9 @@ importlib.import_module("app.hdepic_lora_action_anticipation.eval")
 print("[lora] app.hdepic_lora_action_anticipation import OK")
 importlib.import_module("app.hdepic_lora_action_anticipation.encoder_lora")
 print("[lora] encoder_lora import OK")
+if os.environ.get("GAZE_MODE", "none") == "projected_tri_modal_cross_attention":
+    importlib.import_module("app.hdepic_lora_action_anticipation.tri_modal_fusion")
+    print("[lora] tri_modal_fusion import OK")
 
 def _truthy(name: str) -> bool:
     return os.environ.get(name, "0").lower() in {"1", "true", "yes", "on"}
@@ -417,7 +434,12 @@ cfg["experiment"]["lora"] = {
             "BINARY_INPUT_ADAPTER_DISABLE_TRAIN_AUG",
             "1"
             if os.environ["GAZE_MODE"]
-            in {"binary_input_adapter", "binary_input_adapter_pose_rnn_fuse", "binary_input_adapter_gaze_pose_matrix"}
+            in {
+                "binary_input_adapter",
+                "binary_input_adapter_pose_rnn_fuse",
+                "binary_input_adapter_gaze_pose_matrix",
+                "projected_tri_modal_cross_attention",
+            }
             else "0",
         )
         == "1",
@@ -456,6 +478,27 @@ cfg["experiment"]["lora"] = {
             "lr_mult": float(os.environ.get("ENCODER_GAZE_ADAPTER_LR_MULT", "0.05")),
             "weight_decay": float(os.environ.get("ENCODER_GAZE_ADAPTER_WEIGHT_DECAY", "0.0001")),
         },
+        "fusion": {
+            "fusion_type": "projected_tri_modal_cross_attention",
+            "use_gaze_branch": os.environ.get("TRI_MODAL_USE_GAZE_BRANCH", "1") == "1",
+            "use_imu_branch": os.environ.get("TRI_MODAL_USE_IMU_BRANCH", "1") == "1",
+            "token_budget_ratio": [
+                1.0,
+                float(os.environ.get("TRI_MODAL_GAZE_TOKEN_RATIO", "0.5")),
+                float(os.environ.get("TRI_MODAL_IMU_TOKEN_RATIO", "0.1")),
+            ],
+            "gaze_token_ratio": float(os.environ.get("TRI_MODAL_GAZE_TOKEN_RATIO", "0.5")),
+            "imu_token_ratio": float(os.environ.get("TRI_MODAL_IMU_TOKEN_RATIO", "0.1")),
+            "gaze_grid_size": int(os.environ.get("TRI_MODAL_GAZE_GRID_SIZE", "10")),
+            "imu_encoder_type": os.environ.get("TRI_MODAL_IMU_ENCODER_TYPE", "gru"),
+            "fusion_num_heads": int(os.environ.get("TRI_MODAL_FUSION_NUM_HEADS", "4")),
+            "fusion_num_layers": int(os.environ.get("TRI_MODAL_FUSION_NUM_LAYERS", "1")),
+            "use_gated_residual": os.environ.get("TRI_MODAL_USE_GATED_RESIDUAL", "1") == "1",
+            "imu_hidden_dim": int(os.environ.get("TRI_MODAL_IMU_HIDDEN_DIM", "128")),
+            "lr_mult": float(os.environ.get("TRI_MODAL_FUSION_LR_MULT", "0.05")),
+            "weight_decay": float(os.environ.get("TRI_MODAL_FUSION_WEIGHT_DECAY", "0.0001")),
+            "dropout": float(os.environ.get("ENCODER_GAZE_ADAPTER_DROPOUT", "0.0")),
+        },
         "pose": {
             "enabled": os.environ["GAZE_MODE"]
             in {
@@ -463,6 +506,7 @@ cfg["experiment"]["lora"] = {
                 "multimodal_rnn_fuse",
                 "binary_input_adapter_pose_rnn_fuse",
                 "binary_input_adapter_gaze_pose_matrix",
+                "projected_tri_modal_cross_attention",
             },
             "slam_root": os.environ.get(
                 "POSE_SLAM_ROOT",
@@ -674,7 +718,7 @@ val_every_raw = os.environ.get("EVAL_VAL_EVERY", "").strip()
 if val_every_raw:
     cfg["experiment"]["optimization"]["val_every_epochs"] = int(val_every_raw)
     print(f"[lora] Applied EVAL_VAL_EVERY={cfg['experiment']['optimization']['val_every_epochs']}")
-cfg["experiment"]["optimization"]["best_metric"] = os.environ.get("EVAL_BEST_METRIC", "val-action-acc")
+cfg["experiment"]["optimization"]["best_metric"] = os.environ.get("EVAL_BEST_METRIC", "val-action-top5")
 cfg["experiment"]["optimization"]["early_stopping_patience"] = int(
     os.environ.get("EVAL_EARLY_STOPPING_PATIENCE", "0") or "0"
 )

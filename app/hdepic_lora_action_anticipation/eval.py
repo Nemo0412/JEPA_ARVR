@@ -70,6 +70,19 @@ from app.hdepic_lora_action_anticipation.encoder_output_gaze_adapter import (
     trainable_encoder_output_gaze_params,
     validate_with_encoder_output_gaze,
 )
+from app.hdepic_lora_action_anticipation.tri_modal_fusion import (
+    GazeSpatialEncoder,
+    ImuTemporalEncoder,
+    ImuTrajectoryLoader,
+    ProjectedTriModalCrossAttention,
+    TriModalFusionAdaptedModel,
+    compute_token_budgets,
+    load_tri_modal_fusion_checkpoint,
+    save_tri_modal_fusion_checkpoint,
+    train_one_epoch_with_tri_modal_fusion,
+    trainable_tri_modal_fusion_params,
+    validate_with_tri_modal_fusion,
+)
 
 logger = logging.getLogger(__name__)
 logging.raiseExceptions = False
@@ -289,6 +302,32 @@ def _unwrap_ddp(module: nn.Module) -> nn.Module:
     return module.module if isinstance(module, DistributedDataParallel) else module
 
 
+def _adapt_state_dict_for_module(state_dict: dict, module: nn.Module) -> dict:
+    """Align checkpoint keys with DDP wrapping (module. prefix).
+
+    Checkpoints may be saved under world_size>1 (keys prefixed with ``module.``)
+    and later resumed under world_size==1 (or the reverse). Match keys to the
+    live module instead of failing strict load_state_dict.
+    """
+    if not state_dict:
+        return state_dict
+    is_ddp = isinstance(module, DistributedDataParallel)
+    has_module = any(str(k).startswith("module.") for k in state_dict)
+    if is_ddp and not has_module:
+        return {f"module.{k}": v for k, v in state_dict.items()}
+    if (not is_ddp) and has_module:
+        return {str(k).removeprefix("module."): v for k, v in state_dict.items()}
+    return state_dict
+
+
+def _load_classifier_state_dicts(classifiers, state_dicts):
+    messages = []
+    for classifier, state in zip(classifiers, state_dicts):
+        adapted = _adapt_state_dict_for_module(state, classifier)
+        messages.append(classifier.load_state_dict(adapted))
+    return messages
+
+
 def _wrap_trainable_model_for_ddp(model: nn.Module) -> nn.Module:
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
         kwargs = {}
@@ -376,12 +415,16 @@ def _run_dir(args_eval: dict) -> Path:
 
 
 def _extract_best_metric(val_metrics: dict, metric_name: str) -> float:
+    # With align_reference_metrics, "accuracy" is Top-3; use *-top5 for Top-5.
     metric_map = {
         "val-action-acc": ("action", "accuracy"),
+        "val-action-top5": ("action", "top5_accuracy"),
         "val-action-recall": ("action", "recall"),
         "val-verb-acc": ("verb", "accuracy"),
+        "val-verb-top5": ("verb", "top5_accuracy"),
         "val-verb-recall": ("verb", "recall"),
         "val-noun-acc": ("noun", "accuracy"),
+        "val-noun-top5": ("noun", "top5_accuracy"),
         "val-noun-recall": ("noun", "recall"),
     }
     if metric_name not in metric_map:
@@ -389,6 +432,11 @@ def _extract_best_metric(val_metrics: dict, metric_name: str) -> float:
     group, key = metric_map[metric_name]
     if group not in val_metrics:
         raise ValueError(f"best_metric={metric_name!r} requires {group!r} metrics")
+    if key not in val_metrics[group]:
+        raise ValueError(
+            f"best_metric={metric_name!r} requires {group!r}.{key}; "
+            f"available={sorted(val_metrics[group])}"
+        )
     return _metric_scalar(val_metrics[group][key])
 
 
@@ -458,14 +506,19 @@ def _patch_top5_epoch_reporting(base_eval, args_eval):
 
 
 def _resolve_test_annotations_path(data_cfg: dict) -> Path | None:
-    raw = data_cfg.get("dataset_test") or data_cfg.get("test_dataset")
-    if raw:
-        return Path(raw).expanduser()
-    val_path = data_cfg.get("dataset_val")
-    if not val_path:
-        return None
-    candidate = Path(val_path).expanduser().with_name("HD_EPIC_test_vjepa.csv")
-    return candidate if candidate.exists() else None
+    """Return test CSV path only when explicitly configured in YAML.
+
+    Do not auto-discover HD_EPIC_test_vjepa.csv next to dataset_val: P01
+    clip_split runs omit dataset_test because train_only classifiers cannot
+    score OOD action pairs in that file.
+    """
+    if "dataset_test" in data_cfg:
+        raw = data_cfg.get("dataset_test")
+        return Path(raw).expanduser() if raw else None
+    if "test_dataset" in data_cfg:
+        raw = data_cfg.get("test_dataset")
+        return Path(raw).expanduser() if raw else None
+    return None
 
 
 def _split_valid_classes_from_csv(path: Path, action_is_verb_noun: bool, verb_classes, noun_classes, action_classes):
@@ -548,7 +601,7 @@ def _patch_post_train_test_eval(base_eval, args_eval, dumper=None):
 
     test_path = _resolve_test_annotations_path(data_cfg)
     if test_path is None or not test_path.exists():
-        logger.info("Post-train test eval disabled: no dataset_test/HD_EPIC_test_vjepa.csv found")
+        logger.info("Post-train test eval disabled: dataset_test not configured")
         return (lambda: None), (lambda: None)
 
     original_validate = base_eval.validate
@@ -641,9 +694,45 @@ def _patch_post_train_test_eval(base_eval, args_eval, dumper=None):
     return restore, run_pending
 
 
+def _load_best_tracking_state(run_dir: Path, metric_name: str | None = None) -> dict | None:
+    """Read best-tracker metadata embedded in latest.pt or best.pt."""
+    for name in ("latest.pt", "best.pt"):
+        path = run_dir / name
+        if not path.is_file():
+            continue
+        try:
+            ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            logger.warning("Failed to read best-tracking metadata from %s: %s", path, exc)
+            continue
+        if not isinstance(ckpt, dict):
+            continue
+        best_metric = ckpt.get("best_metric")
+        if best_metric is None:
+            continue
+        ckpt_metric_name = ckpt.get("best_metric_name")
+        if metric_name is not None and ckpt_metric_name is not None and str(ckpt_metric_name) != str(metric_name):
+            logger.warning(
+                "Skipping best-tracker restore from %s: checkpoint metric=%s current=%s",
+                path,
+                ckpt_metric_name,
+                metric_name,
+            )
+            continue
+        best_epoch = ckpt.get("best_epoch")
+        if best_epoch is None:
+            best_epoch = ckpt.get("epoch", 0)
+        return {
+            "best_metric": float(best_metric),
+            "best_epoch": int(best_epoch or 0),
+            "bad_validations": int(ckpt.get("bad_validations", 0) or 0),
+        }
+    return None
+
+
 def _patch_best_checkpointing_and_early_stop(base_eval, args_eval):
     opt_cfg = dict(args_eval.get("experiment", {}).get("optimization", {}) or {})
-    metric_name = str(opt_cfg.get("best_metric", "val-action-acc"))
+    metric_name = str(opt_cfg.get("best_metric", "val-action-top5"))
     patience = int(opt_cfg.get("early_stopping_patience", 0) or 0)
     original_validate = base_eval.validate
     original_torch_save = torch.save
@@ -653,6 +742,17 @@ def _patch_best_checkpointing_and_early_stop(base_eval, args_eval):
         "best_epoch": None,
         "bad_validations": 0,
     }
+    if args_eval.get("resume_checkpoint"):
+        disk_state = _load_best_tracking_state(_run_dir(args_eval), metric_name=metric_name)
+        if disk_state is not None:
+            state.update(disk_state)
+            logger.info(
+                "Restored best-tracker state from checkpoint: best_metric=%.5f best_epoch=%s bad_validations=%d metric=%s",
+                state["best_metric"],
+                state["best_epoch"],
+                state["bad_validations"],
+                metric_name,
+            )
 
     def validate_with_best_tracking(*args, **kwargs):
         val_metrics = original_validate(*args, **kwargs)
@@ -660,7 +760,12 @@ def _patch_best_checkpointing_and_early_stop(base_eval, args_eval):
         return val_metrics
 
     def copy_best_sidecars(run_dir: Path):
-        for filename in ("binary_input_adapter_latest.pt", "encoder_lora_latest.pt", "predictor_lora_latest.pt"):
+        for filename in (
+            "binary_input_adapter_latest.pt",
+            "tri_modal_fusion_latest.pt",
+            "encoder_lora_latest.pt",
+            "predictor_lora_latest.pt",
+        ):
             src = run_dir / filename
             if src.exists():
                 dst = run_dir / filename.replace("_latest.pt", "_best.pt")
@@ -686,6 +791,7 @@ def _patch_best_checkpointing_and_early_stop(base_eval, args_eval):
         obj["best_metric"] = state["best_metric"]
         obj["best_metric_name"] = metric_name
         obj["best_epoch"] = state["best_epoch"]
+        obj["bad_validations"] = state["bad_validations"]
         original_torch_save(obj, f, *args, **kwargs)
 
         predictor_lora_model = getattr(base_eval, "_predictor_lora_model", None)
@@ -698,8 +804,17 @@ def _patch_best_checkpointing_and_early_stop(base_eval, args_eval):
         encoder_lora_model = getattr(base_eval, "_encoder_lora_model", None)
         if encoder_lora_model is None:
             encoder_lora_model = getattr(base_eval, "_binary_input_adapter_model", None)
+        if encoder_lora_model is None:
+            encoder_lora_model = getattr(base_eval, "_tri_modal_fusion_model", None)
         if encoder_lora_model is not None:
             save_encoder_lora_checkpoint(encoder_lora_model, path.parent / "encoder_lora_latest.pt")
+
+        tri_modal_model = getattr(base_eval, "_tri_modal_fusion_model", None)
+        if tri_modal_model is not None:
+            save_tri_modal_fusion_checkpoint(
+                _unwrap_ddp(tri_modal_model),
+                str(path.parent / "tri_modal_fusion_latest.pt"),
+            )
 
         if improved:
             best_path = path.with_name("best.pt")
@@ -850,7 +965,20 @@ def _replace_linears_with_lora(module: nn.Module, rank: int, alpha: float, dropo
     return replaced
 
 
-def _load_pooler_from_probe(classifier: AttentiveClassifier, checkpoint_path: str):
+_PROBE_STATE_PREFIXES = (
+    "pooler.",
+    "verb_classifier.",
+    "noun_classifier.",
+    "action_classifier.",
+)
+
+
+def _load_pooler_from_probe(
+    classifier: AttentiveClassifier,
+    checkpoint_path: str,
+    *,
+    load_heads: bool = False,
+):
     if not checkpoint_path:
         return
     path = Path(checkpoint_path)
@@ -866,20 +994,30 @@ def _load_pooler_from_probe(classifier: AttentiveClassifier, checkpoint_path: st
 
     source = state_dicts[0]
     target = classifier.state_dict()
-    pooler_state = {}
+    allowed_prefixes = _PROBE_STATE_PREFIXES if load_heads else ("pooler.",)
+    probe_state = {}
     for key, value in source.items():
         clean_key = key.removeprefix("module.")
-        if clean_key.startswith("pooler.") and clean_key in target and target[clean_key].shape == value.shape:
-            pooler_state[clean_key] = value
+        if clean_key.startswith(allowed_prefixes) and clean_key in target and target[clean_key].shape == value.shape:
+            probe_state[clean_key] = value
 
-    missing, unexpected = classifier.load_state_dict(pooler_state, strict=False)
-    logger.info(
-        "Loaded %d pooler tensors from %s; ignored heads and mismatches. missing=%d unexpected=%d",
-        len(pooler_state),
-        checkpoint_path,
-        len(missing),
-        len(unexpected),
-    )
+    missing, unexpected = classifier.load_state_dict(probe_state, strict=False)
+    if load_heads:
+        logger.info(
+            "Loaded %d probe tensors (pooler+heads) from %s; missing=%d unexpected=%d",
+            len(probe_state),
+            checkpoint_path,
+            len(missing),
+            len(unexpected),
+        )
+    else:
+        logger.info(
+            "Loaded %d pooler tensors from %s; ignored heads and mismatches. missing=%d unexpected=%d",
+            len(probe_state),
+            checkpoint_path,
+            len(missing),
+            len(unexpected),
+        )
 
 
 def _freeze_for_lora(classifier: AttentiveClassifier, train_heads: bool):
@@ -960,7 +1098,17 @@ def _make_lora_init_classifier(
                 use_activation_checkpointing=True,
             )
             if pretrained_probe:
-                _load_pooler_from_probe(classifier, pretrained_probe)
+                load_probe_heads = bool(
+                    lora_cfg.get(
+                        "load_probe_heads",
+                        (not train_heads),
+                    )
+                )
+                _load_pooler_from_probe(
+                    classifier,
+                    pretrained_probe,
+                    load_heads=load_probe_heads,
+                )
             replaced = []
             if probe_train_mode == "lora":
                 replaced = _replace_linears_with_lora(classifier.pooler, rank=rank, alpha=alpha, dropout=dropout)
@@ -1038,10 +1186,11 @@ def _patch_load_checkpoint_for_learnable_token_gate(base_eval):
         checkpoint = robust_checkpoint_loader(r_path, map_location=torch.device("cpu"))
         messages = []
         for classifier, state in zip(classifiers, checkpoint["classifiers"]):
+            adapted = _adapt_state_dict_for_module(state, classifier)
             try:
-                messages.append(classifier.load_state_dict(state))
+                messages.append(classifier.load_state_dict(adapted))
             except RuntimeError as exc:
-                msg = classifier.load_state_dict(state, strict=False)
+                msg = classifier.load_state_dict(adapted, strict=False)
                 logger.warning(
                     "Loaded classifier checkpoint with strict=False for learnable token gate compatibility: %s; msg=%s",
                     exc,
@@ -1083,7 +1232,8 @@ def _patch_load_checkpoint_for_binary_input_adapter(base_eval, gaze_cfg: dict):
         checkpoint = robust_checkpoint_loader(r_path, map_location=torch.device("cpu"))
 
         # Restore classifiers (includes pose GRU encoder inside classifier state).
-        msg = [c.load_state_dict(pd) for c, pd in zip(classifiers, checkpoint["classifiers"])]
+        # Strip/add module. so DDP↔single-process resume works.
+        msg = _load_classifier_state_dicts(classifiers, checkpoint["classifiers"])
         model = getattr(base_eval, "_binary_input_adapter_model", None)
         if model is None:
             logger.warning("binary_input_adapter model missing during resume; skipping adapter weight restore")
@@ -1099,6 +1249,27 @@ def _patch_load_checkpoint_for_binary_input_adapter(base_eval, gaze_cfg: dict):
             logger.info(f"loaded pretrained classifier from epoch with msg: {msg}")
             return classifiers, opt, scaler, 0
 
+        epoch = checkpoint["epoch"]
+        logger.info(f"loaded pretrained classifier from epoch {epoch} with msg: {msg}")
+        [o.load_state_dict(c) for o, c in zip(opt, checkpoint["opt"])]
+        if scaler is not None:
+            [s.load_state_dict(c) for s, c in zip(scaler, checkpoint["scaler"])]
+        logger.info(f"loaded optimizers from epoch {epoch}")
+        return classifiers, opt, scaler, epoch
+
+    base_eval.load_checkpoint = load_checkpoint
+
+
+def _patch_load_checkpoint_ddp_key_compat(base_eval):
+    """Replace upstream load_checkpoint so DDP↔single-process resume works."""
+
+    def load_checkpoint(device, r_path, classifiers, opt, scaler, val_only=False):
+        logger.info(f"read-path: {r_path}")
+        checkpoint = robust_checkpoint_loader(r_path, map_location=torch.device("cpu"))
+        msg = _load_classifier_state_dicts(classifiers, checkpoint["classifiers"])
+        if val_only:
+            logger.info(f"loaded pretrained classifier from epoch with msg: {msg}")
+            return classifiers, opt, scaler, 0
         epoch = checkpoint["epoch"]
         logger.info(f"loaded pretrained classifier from epoch {epoch} with msg: {msg}")
         [o.load_state_dict(c) for o, c in zip(opt, checkpoint["opt"])]
@@ -1147,6 +1318,10 @@ def main(args_eval, resume_preempt=False):
         raise ValueError("app.hdepic_lora_action_anticipation requires experiment.lora.enabled=true")
 
     import evals.action_anticipation_frozen.eval as base_eval
+
+    # Install before path-specific load_checkpoint patches so video-only and any
+    # wrapper that delegates to the upstream loader can resume across DDP/single.
+    _patch_load_checkpoint_ddp_key_compat(base_eval)
 
     # Capture the upstream train loop before any path patches it, so encoder LoRA
     # can tell whether it must supply its own grad-flowing baseline loop.
@@ -1267,6 +1442,7 @@ def main(args_eval, resume_preempt=False):
     }
     # encoder_output_inject: zero-init encoder-output gaze inject (B8, design phase, never trained).
     encoder_output_inject_enabled = gaze_mode == "encoder_output_inject"
+    tri_modal_fusion_enabled = gaze_mode == "projected_tri_modal_cross_attention"
     # past_window_baseline: B3 long-horizon past-window curriculum (pre-ViT-L, archived).
     # Not used in current ViT-L singleprobe; kept for reproducing B3 runs.
     past_window_cfg = dict(lora_cfg.get("past_window_baseline", {}))
@@ -1367,6 +1543,7 @@ def main(args_eval, resume_preempt=False):
         "binary_input_adapter_pose_rnn_fuse",
         "binary_input_adapter_gaze_pose_matrix",
         "encoder_output_inject",
+        "projected_tri_modal_cross_attention",
     } or bool(pred_dump_cfg.get("enabled", False))
     debug_subset_path = os.environ.get("DEBUG_SUBSET_PATH", "").strip() or None
     if debug_subset_path:
@@ -1481,6 +1658,35 @@ def main(args_eval, resume_preempt=False):
                 base_eval.validate = lambda **kwargs: validate_with_binary_input_adapter(
                     base_eval, map_builder, dumper, **val_metric_kwargs, **kwargs
                 )
+            local_validate_patched = True
+
+        elif tri_modal_fusion_enabled:
+            fusion_cfg = dict(gaze_cfg.get("fusion", {}))
+            logger.info(
+                "Enabling projected_tri_modal_cross_attention: separate video/gaze/IMU encoders + "
+                "projected cross-attn fusion before predictor (use_gaze=%s use_imu=%s)",
+                fusion_cfg.get("use_gaze_branch", True),
+                fusion_cfg.get("use_imu_branch", True),
+            )
+            gaze_cfg.setdefault("fusion_checkpoint_path", str(run_dir / "tri_modal_fusion_latest.pt"))
+            if args_eval.get("resume_checkpoint", False):
+                gaze_cfg.setdefault("fusion", {})
+                gaze_cfg["fusion"].setdefault("load_checkpoint_path", str(gaze_cfg["fusion_checkpoint_path"]))
+            gaze_cfg.setdefault("pose", {})
+            gaze_cfg["pose"].setdefault("enabled", True)
+            gaze_cfg["pose"].setdefault("interframe_k_max", 128)
+            _patch_init_module_for_tri_modal_fusion(base_eval, gaze_cfg)
+            _patch_opt_for_tri_modal_fusion(base_eval, gaze_cfg)
+            if args_eval.get("resume_checkpoint", False):
+                _patch_load_checkpoint_for_tri_modal_fusion(base_eval, gaze_cfg)
+            gaze_map_builder = BinaryGazeMapBuilder(gaze_cfg, gate=gate)
+            imu_loader = ImuTrajectoryLoader(gaze_cfg, gate=gate)
+            base_eval.train_one_epoch = lambda **kwargs: train_one_epoch_with_tri_modal_fusion(
+                base_eval, gaze_map_builder, imu_loader, **kwargs
+            )
+            base_eval.validate = lambda **kwargs: validate_with_tri_modal_fusion(
+                base_eval, dumper, gaze_map_builder, imu_loader, **val_metric_kwargs, **kwargs
+            )
             local_validate_patched = True
 
         elif encoder_output_inject_enabled:
@@ -1800,6 +2006,8 @@ def _patch_for_encoder_lora(base_eval, enc_cfg: dict, baseline_train_loop: bool)
         )
         model = getattr(base_eval, "_binary_input_adapter_model", None)
         if model is None:
+            model = getattr(base_eval, "_tri_modal_fusion_model", None)
+        if model is None:
             model = getattr(base_eval, "_encoder_output_gaze_model", None)
         if model is None:
             model = getattr(base_eval, "_encoder_lora_model", None)
@@ -1807,6 +2015,11 @@ def _patch_for_encoder_lora(base_eval, enc_cfg: dict, baseline_train_loop: bool)
             raise RuntimeError("encoder_lora model was not registered before init_opt")
         enc_params = trainable_encoder_lora_params(model)
         if not enc_params:
+            if enc_cfg.get("freeze"):
+                logger.info(
+                    "Encoder LoRA is frozen for stage-2; skipping encoder-LoRA optimizer group"
+                )
+                return optimizers, scalers, schedulers, wd_schedulers
             raise RuntimeError("encoder LoRA is enabled but no trainable encoder-LoRA params were found")
         first_kwargs = opt_kwargs[0]
         lr_mult = enc_cfg["lr_mult"]
@@ -2130,3 +2343,167 @@ def _patch_opt_for_encoder_output_gaze(base_eval, gaze_cfg: dict, rnn_cfg: dict)
         return [optimizer], [scaler], [scheduler], [wd_scheduler]
 
     base_eval.init_opt = init_opt
+
+
+def _patch_init_module_for_tri_modal_fusion(base_eval, gaze_cfg: dict):
+    original_init_module = base_eval.init_module
+    fusion_cfg = dict(gaze_cfg.get("fusion", {}))
+    use_gaze = bool(fusion_cfg.get("use_gaze_branch", True))
+    use_imu = bool(fusion_cfg.get("use_imu_branch", True))
+    gaze_grid_size = int(fusion_cfg.get("gaze_grid_size", 10))
+
+    def init_module_with_tri_modal_fusion(*args, **kwargs):
+        model = original_init_module(*args, **kwargs)
+        device = next(model.parameters()).device
+        embed_dim = int(model.embed_dim)
+        grid_size = int(model.grid_size)
+        n_v, n_g, n_i = compute_token_budgets(
+            grid_size * grid_size,
+            gaze_grid_size=gaze_grid_size,
+            gaze_token_ratio=float(fusion_cfg.get("gaze_token_ratio", 0.5)),
+            imu_token_ratio=float(fusion_cfg.get("imu_token_ratio", 0.1)),
+        )
+        raw_attn = fusion_cfg.get("fusion_attn_dim")
+        attn_dim = int(raw_attn) if raw_attn not in (None, "", 0) else embed_dim
+        fusion = ProjectedTriModalCrossAttention(
+            embed_dim=embed_dim,
+            attn_dim=attn_dim,
+            num_heads=int(fusion_cfg.get("fusion_num_heads", 4)),
+            num_layers=int(fusion_cfg.get("fusion_num_layers", 1)),
+            dropout=float(fusion_cfg.get("dropout", 0.0)),
+            use_gated_residual=bool(fusion_cfg.get("use_gated_residual", True)),
+            use_gaze_branch=use_gaze,
+            use_imu_branch=use_imu,
+        ).to(device)
+        gaze_encoder = (
+            GazeSpatialEncoder(embed_dim=embed_dim, grid_size=gaze_grid_size).to(device)
+            if use_gaze
+            else None
+        )
+        imu_encoder = (
+            ImuTemporalEncoder(
+                embed_dim=embed_dim,
+                input_dim=6,
+                hidden_dim=int(fusion_cfg.get("imu_hidden_dim", 128)),
+                num_imu_tokens=n_i,
+                encoder_type=str(fusion_cfg.get("imu_encoder_type", "gru")),
+                num_layers=int(fusion_cfg.get("imu_num_layers", 1)),
+                dropout=float(fusion_cfg.get("imu_dropout", 0.1)),
+            ).to(device)
+            if use_imu
+            else None
+        )
+        wrapped = TriModalFusionAdaptedModel(
+            model,
+            fusion=fusion,
+            gaze_encoder=gaze_encoder,
+            imu_encoder=imu_encoder,
+            fusion_cfg=fusion_cfg,
+        )
+        wrapped.embed_dim = model.embed_dim
+        for param in wrapped.base_model.parameters():
+            param.requires_grad = False
+        for param in trainable_tri_modal_fusion_params(wrapped):
+            param.requires_grad = True
+        load_path = fusion_cfg.get("load_checkpoint_path")
+        if load_path and Path(load_path).exists():
+            load_tri_modal_fusion_checkpoint(wrapped, str(load_path))
+            logger.info("Loaded tri-modal fusion checkpoint: %s", load_path)
+        fusion_n = sum(p.numel() for p in trainable_tri_modal_fusion_params(wrapped))
+        logger.info(
+            "Attached TriModalFusion: embed_dim=%d n_video=%d n_gaze=%d n_imu=%d "
+            "attn_dim=%d heads=%d layers=%d trainable_params=%d",
+            embed_dim,
+            n_v,
+            n_g,
+            n_i,
+            attn_dim,
+            int(fusion_cfg.get("fusion_num_heads", 4)),
+            int(fusion_cfg.get("fusion_num_layers", 1)),
+            fusion_n,
+        )
+        wrapped = _wrap_trainable_model_for_ddp(wrapped)
+        base_eval._tri_modal_fusion_model = wrapped
+        return wrapped
+
+    base_eval.init_module = init_module_with_tri_modal_fusion
+
+
+def _patch_opt_for_tri_modal_fusion(base_eval, gaze_cfg: dict):
+    from evals.action_anticipation_frozen.utils import CosineWDSchedule, WarmupCosineLRSchedule
+
+    fusion_cfg = dict(gaze_cfg.get("fusion", {}))
+    lr_mult = float(fusion_cfg.get("lr_mult", 0.05))
+    wd = float(fusion_cfg.get("weight_decay", 0.0001))
+
+    def init_opt(classifiers, iterations_per_epoch, opt_kwargs, num_epochs, use_bfloat16=False):
+        if not classifiers:
+            raise ValueError("projected_tri_modal_cross_attention requires at least one classifier")
+        model = getattr(base_eval, "_tri_modal_fusion_model", None)
+        if model is None:
+            raise RuntimeError("tri_modal_fusion model was not registered before init_opt")
+        fusion_params = trainable_tri_modal_fusion_params(model)
+        param_groups = []
+        classifier_param_count = 0
+        first_kwargs = opt_kwargs[0]
+        for classifier, kwargs in zip(classifiers, opt_kwargs):
+            head_idx = len(param_groups)
+            base_params = [p for p in classifier.parameters() if p.requires_grad]
+            classifier_param_count += sum(p.numel() for p in base_params)
+            warmup_steps = int((kwargs.get("warmup") or 0.0) * iterations_per_epoch)
+            param_groups.append(
+                {
+                    "diagnostic_name": f"classifier_head_{head_idx}",
+                    "params": base_params,
+                    "mc_warmup_steps": warmup_steps,
+                    "mc_start_lr": kwargs.get("start_lr"),
+                    "mc_ref_lr": _opt_ref_lr(kwargs),
+                    "mc_final_lr": kwargs.get("final_lr"),
+                    "mc_ref_wd": kwargs.get("ref_wd"),
+                    "mc_final_wd": kwargs.get("final_wd"),
+                }
+            )
+        adapter_warmup_steps = int((first_kwargs.get("warmup") or 0.0) * iterations_per_epoch)
+        adapter_ref_lr = _opt_ref_lr(first_kwargs)
+        param_groups.append(
+            {
+                "diagnostic_name": "tri_modal_fusion",
+                "params": fusion_params,
+                "mc_warmup_steps": adapter_warmup_steps,
+                "mc_start_lr": (first_kwargs.get("start_lr") or 0.0) * lr_mult,
+                "mc_ref_lr": (adapter_ref_lr or 0.0) * lr_mult,
+                "mc_final_lr": (first_kwargs.get("final_lr") or 0.0) * lr_mult,
+                "mc_ref_wd": wd,
+                "mc_final_wd": wd,
+            }
+        )
+        logger.info(
+            "Optimizer split: classifiers=%d params across %d heads, tri_modal_fusion=%d params, lr_mult=%.3f",
+            classifier_param_count,
+            len(classifiers),
+            sum(p.numel() for p in fusion_params),
+            lr_mult,
+        )
+        optimizer = torch.optim.AdamW(param_groups)
+        scheduler = WarmupCosineLRSchedule(optimizer, T_max=int(num_epochs * iterations_per_epoch))
+        wd_scheduler = CosineWDSchedule(optimizer, T_max=int(num_epochs * iterations_per_epoch))
+        scaler = make_grad_scaler(use_bfloat16)
+        return [optimizer], [scaler], [scheduler], [wd_scheduler]
+
+    base_eval.init_opt = init_opt
+
+
+def _patch_load_checkpoint_for_tri_modal_fusion(base_eval, gaze_cfg: dict):
+    original_load = base_eval.load_checkpoint
+
+    def load_checkpoint_with_tri_modal(*args, **kwargs):
+        out = original_load(*args, **kwargs)
+        model = getattr(base_eval, "_tri_modal_fusion_model", None)
+        fusion_cfg = dict(gaze_cfg.get("fusion", {}))
+        load_path = fusion_cfg.get("load_checkpoint_path")
+        if model is not None and load_path and Path(load_path).exists():
+            load_tri_modal_fusion_checkpoint(_unwrap_ddp(model), str(load_path))
+            logger.info("Restored tri-modal fusion sidecar from %s", load_path)
+        return out
+
+    base_eval.load_checkpoint = load_checkpoint_with_tri_modal

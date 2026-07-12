@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=egtea_gaze_pred
+#SBATCH --job-name=egtea_gaze_ep5
 #SBATCH --account=torch_pr_674_tandon_advanced
 #SBATCH --partition=h100_tandon
 #SBATCH --nodes=1
@@ -8,42 +8,30 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=384GB
 #SBATCH --time=03:00:00
-#SBATCH --output=/scratch/ll5914/logs/egtea_gaze_pred_%j.out
-#SBATCH --error=/scratch/ll5914/logs/egtea_gaze_pred_%j.err
+#SBATCH --output=/scratch/ll5914/logs/egtea_gaze_ep5_recovery_%j.out
+#SBATCH --error=/scratch/ll5914/logs/egtea_gaze_ep5_recovery_%j.err
 
 set -euo pipefail
 
-# Stage 2 (gaze): predictor LoRA on top of stage-1 encoder+probe+gaze adapter ckpt.
-# Stage-1 dir must contain best.pt, encoder_lora_best.pt, binary_input_adapter_best.pt.
+# Re-train EGTEA gaze stage-1 for exactly 5 epochs into a fresh output dir.
+# Job 12986096 peaked at epoch 5 (val-action-top3=54.51, top5~65.8) but resume
+# job 13006291 reset the best tracker and overwrote best.pt at epoch 8. The ep5
+# weights were not preserved in any archive.
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
 PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
 EGTEA_ROOT="/scratch/ll5914/datasets/EGTEA"
-# Default to ep5 recovery ckpt (job 12986096 peak). The old gaze_fixed/best.pt was
-# corrupted to epoch 8 by resume best-tracker reset (job 13006291).
-STAGE1_DIR="${STAGE1_DIR:-/scratch/ll5914/experiments/egtea_split1_gaze_ep5_recovery/action_anticipation_frozen/egtea-split1-gaze-ep5-recovery-vitl16-256-5ep}"
-STAGE1_PROBE="${STAGE1_DIR}/best.pt"
-STAGE1_ENCODER_LORA="${STAGE1_DIR}/encoder_lora_best.pt"
-STAGE1_ADAPTER="${STAGE1_DIR}/binary_input_adapter_best.pt"
 
-for f in "${STAGE1_PROBE}" "${STAGE1_ENCODER_LORA}" "${STAGE1_ADAPTER}"; do
-    if [[ ! -f "${f}" ]]; then
-        echo "ERROR: stage-1 checkpoint missing: ${f}" >&2
-        exit 1
-    fi
-done
-
-echo "Stage-1 checkpoints found under ${STAGE1_DIR}"
 "${PYTHON}" "${PROJECT_ROOT}/scripts/prepare_egtea_split1.py" --egtea-root "${EGTEA_ROOT}"
 
 ANN_DIR="${EGTEA_ROOT}/hdepic_vjepa_annotations/split1"
 VIDEO_ROOT="${EGTEA_ROOT}/egtea_vjepa_videos"
 GAZE_EXTRACT="${EGTEA_ROOT}/gaze_extract"
 CHECKPOINT="/scratch/ll5914/models/vjepa2/vitl.pt"
-OUTPUT_DIR="/scratch/ll5914/experiments/egtea_split1_gaze_predictor"
-CONFIG_PATH="/scratch/ll5914/logs/egtea_split1_gaze_predictor_config.yaml"
-TAG="egtea-split1-gaze-pred-vitl16-256-10ep"
+OUTPUT_DIR="/scratch/ll5914/experiments/egtea_split1_gaze_ep5_recovery"
+CONFIG_PATH="/scratch/ll5914/logs/egtea_split1_gaze_ep5_recovery_config.yaml"
+TAG="egtea-split1-gaze-ep5-recovery-vitl16-256-5ep"
 
 export PYTHONPATH="${PROJECT_ROOT}:${VJEPA_ROOT}:${PYTHONPATH:-}"
 
@@ -62,7 +50,7 @@ cfg['cpus_per_task'] = 16
 cfg['tag']  = '${TAG}'
 cfg['eval_name'] = 'app.hdepic_lora_action_anticipation'
 cfg['folder'] = '${OUTPUT_DIR}'
-cfg['resume_checkpoint'] = True
+cfg['resume_checkpoint'] = False
 cfg['val_only'] = False
 data = cfg['experiment']['data']
 data.update({
@@ -71,51 +59,34 @@ data.update({
     'dataset_train': '${ANN_DIR}/EGTEA_train_vjepa.csv',
     'dataset_val': '${ANN_DIR}/EGTEA_val_vjepa.csv',
     'dataset_test': '${ANN_DIR}/EGTEA_test_vjepa.csv',
-    'num_workers': 8, 'val_num_workers': 4, 'clip_balanced': True,
+    'num_workers': 12, 'val_num_workers': 8, 'clip_balanced': True,
     'resolution': 256, 'frames_per_clip': 32, 'frames_per_second': 8,
     'anticipation_time_sec': [1.0, 1.0],
     'train_anticipation_time_sec': [0.25, 1.75],
 })
 opt = cfg['experiment']['optimization']
-opt.update({'batch_size': 16, 'num_epochs': 10, 'use_bfloat16': True,
+opt.update({'batch_size': 16, 'num_epochs': 5, 'use_bfloat16': True,
     'use_focal_loss': False, 'val_every_epochs': 1, 'best_metric': 'val-action-top5',
-    'early_stopping_patience': 3, 'grad_clip': 1.0,
+    'early_stopping_patience': 0, 'grad_clip': 1.0,
     'multihead_kwargs': [{'weight_decay': 0.0001, 'final_weight_decay': 0.0001,
         'lr': 0.0001, 'start_lr': 0.0, 'final_lr': 0.0, 'warmup': 2}]})
 cfg['model_kwargs']['checkpoint'] = '${CHECKPOINT}'
 cfg['experiment']['lora'] = {
     'enabled': True, 'rank': 8, 'alpha': 16.0, 'dropout': 0.05,
-    'probe_train_mode': 'full', 'train_heads': False,
-    'load_probe_heads': True,
-    'pretrained_probe': '${STAGE1_PROBE}',
+    'probe_train_mode': 'full', 'train_heads': True, 'pretrained_probe': '',
     'align_reference_metrics': True, 'val_metric_scope': 'native',
     'val_metric_aggregation': 'metric_wise_max', 'class_space': 'train_only',
     'temporal_sampling': 'phd_reference', 'output_regularization': {'enabled': False},
-    'encoder_lora': {
-        'enabled': True, 'rank': 8, 'alpha': 16.0, 'dropout': 0.05,
+    'encoder_lora': {'enabled': True, 'rank': 8, 'alpha': 16.0, 'dropout': 0.05,
         'last_n_blocks': 0, 'lr_mult': 0.5, 'weight_decay': 0.0001,
-        'activation_checkpointing': True, 'target_suffixes': ['attn.qkv', 'attn.proj'],
-        'load_checkpoint_path': '${STAGE1_ENCODER_LORA}',
-        'warm_start_at_init': True, 'freeze': True,
-    },
-    'predictor_lora': {
-        'enabled': True, 'rank': 8, 'alpha': 16.0, 'dropout': 0.05,
-        'last_n_blocks': 0, 'lr_mult': 0.5, 'weight_decay': 0.0001,
-        'activation_checkpointing': True, 'target_suffixes': ['attn.qkv', 'attn.proj'],
-    },
-    'gaze': {
-        'mode': 'binary_input_adapter', 'extract_root': '${GAZE_EXTRACT}',
+        'activation_checkpointing': True, 'target_suffixes': ['attn.qkv', 'attn.proj']},
+    'predictor_lora': {'enabled': False},
+    'gaze': {'mode': 'binary_input_adapter', 'extract_root': '${GAZE_EXTRACT}',
         'slam_root': '${EGTEA_ROOT}',
-        'input_adapter': {
-            # Must match stage-1 adapter weights: stage-1 YAML put tk under
-            # binary_input_adapter (ignored); eval reads input_adapter and defaulted to 1.
-            'in_channels': 4, 'temporal_kernel': 1, 'hidden_dim': 8,
+        'input_adapter': {'in_channels': 4, 'temporal_kernel': 1, 'hidden_dim': 8,
             'lr_mult': 1.0, 'weight_decay': 0.0001, 'activation_checkpointing': True,
-            'load_checkpoint_path': '${STAGE1_ADAPTER}',
-            'freeze': True, 'freeze_encoder_lora': True,
-        },
-        'pose_slam': {'enabled': False},
-    },
+            'disable_train_aug': True},
+        'pose_slam': {'enabled': False}},
 }
 config_path.parent.mkdir(parents=True, exist_ok=True)
 with config_path.open('w') as f:
@@ -125,4 +96,6 @@ PY
 
 cd "${VJEPA_ROOT}"
 "${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0 cuda:1 --debugmode false
-echo "EGTEA split1 gaze+predictor-lora stage-2 complete: $(date)"
+RUN_DIR="${OUTPUT_DIR}/action_anticipation_frozen/${TAG}"
+touch "${RUN_DIR}/.stage1_complete"
+echo "EGTEA gaze ep5 recovery complete: $(date)"

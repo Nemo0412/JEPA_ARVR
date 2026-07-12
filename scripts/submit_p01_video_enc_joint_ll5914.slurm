@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=egtea_video_pred
+#SBATCH --job-name=p01_video_enc
 #SBATCH --account=torch_pr_674_tandon_advanced
 #SBATCH --partition=h100_tandon
 #SBATCH --nodes=1
@@ -8,37 +8,31 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=384GB
 #SBATCH --time=03:00:00
-#SBATCH --output=/scratch/ll5914/logs/egtea_video_pred_%j.out
-#SBATCH --error=/scratch/ll5914/logs/egtea_video_pred_%j.err
+#SBATCH --output=/scratch/ll5914/logs/p01_video_enc_%j.out
+#SBATCH --error=/scratch/ll5914/logs/p01_video_enc_%j.err
 
 set -euo pipefail
 
-# Stage 2 (video-only): predictor LoRA on top of stage-1 encoder+probe ckpt.
+# HD-EPIC P01: video-only, joint probe (full) + encoder LoRA. Same recipe as EGTEA.
+# 2x H100, 3h (cluster low-GPU util kill often hits ~2h; resume_checkpoint keeps progress).
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
 PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
-EGTEA_ROOT="/scratch/ll5914/datasets/EGTEA"
-STAGE1_DIR="${STAGE1_DIR:-/scratch/ll5914/experiments/egtea_split1_video_enc_fixed/action_anticipation_frozen/egtea-split1-video-enc-fixed-vitl16-256-10ep}"
-STAGE1_PROBE="${STAGE1_DIR}/best.pt"
-STAGE1_ENCODER_LORA="${STAGE1_DIR}/encoder_lora_best.pt"
 
-for f in "${STAGE1_PROBE}" "${STAGE1_ENCODER_LORA}"; do
-    if [[ ! -f "${f}" ]]; then
-        echo "ERROR: stage-1 checkpoint missing: ${f}" >&2
-        exit 1
-    fi
-done
-
-echo "Stage-1 checkpoints found under ${STAGE1_DIR}"
-"${PYTHON}" "${PROJECT_ROOT}/scripts/prepare_egtea_split1.py" --egtea-root "${EGTEA_ROOT}"
-
-ANN_DIR="${EGTEA_ROOT}/hdepic_vjepa_annotations/split1"
-VIDEO_ROOT="${EGTEA_ROOT}/egtea_vjepa_videos"
+ANN_DIR="/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/clip_split"
+VIDEO_ROOT="/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_videos"
+HDEPIC_ANN_ROOT="/scratch/ll5914/datasets/HD-EPIC/hd-epic-annotations/narrations-and-action-segments"
 CHECKPOINT="/scratch/ll5914/models/vjepa2/vitl.pt"
-OUTPUT_DIR="/scratch/ll5914/experiments/egtea_split1_video_predictor"
-CONFIG_PATH="/scratch/ll5914/logs/egtea_split1_video_predictor_config.yaml"
-TAG="egtea-split1-video-pred-vitl16-256-10ep"
+OUTPUT_DIR="/scratch/ll5914/experiments/p01_video_enc_clip"
+CONFIG_PATH="/scratch/ll5914/logs/p01_video_enc_clip_config.yaml"
+TAG="p01-video-enc-clip-vitl16-256-10ep"
+
+echo "========================================================"
+echo "P01 video-only joint: probe full + encoder LoRA (2x H100, 3h)"
+echo "Job  : ${SLURM_JOB_ID:-manual}  Node: $(hostname)"
+echo "Start: $(date)"
+echo "========================================================"
 
 export PYTHONPATH="${PROJECT_ROOT}:${VJEPA_ROOT}:${PYTHONPATH:-}"
 
@@ -63,10 +57,10 @@ data = cfg['experiment']['data']
 data.update({
     'dataset': 'EK100', 'file_format': 1,
     'base_path': '${VIDEO_ROOT}',
-    'dataset_train': '${ANN_DIR}/EGTEA_train_vjepa.csv',
-    'dataset_val': '${ANN_DIR}/EGTEA_val_vjepa.csv',
-    'dataset_test': '${ANN_DIR}/EGTEA_test_vjepa.csv',
-    'num_workers': 8, 'val_num_workers': 4, 'clip_balanced': True,
+    'dataset_train': '${ANN_DIR}/HD_EPIC_train_vjepa.csv',
+    'dataset_val': '${ANN_DIR}/HD_EPIC_val_vjepa.csv',
+    # Omit dataset_test: post-train test crashes on OOD action pairs under train_only.
+    'num_workers': 6, 'val_num_workers': 4, 'clip_balanced': True,
     'resolution': 256, 'frames_per_clip': 32, 'frames_per_second': 8,
     'anticipation_time_sec': [1.0, 1.0],
     'train_anticipation_time_sec': [0.25, 1.75],
@@ -80,24 +74,19 @@ opt.update({'batch_size': 16, 'num_epochs': 10, 'use_bfloat16': True,
 cfg['model_kwargs']['checkpoint'] = '${CHECKPOINT}'
 cfg['experiment']['lora'] = {
     'enabled': True, 'rank': 8, 'alpha': 16.0, 'dropout': 0.05,
-    'probe_train_mode': 'full', 'train_heads': False,
-    'load_probe_heads': True,
-    'pretrained_probe': '${STAGE1_PROBE}',
+    'probe_train_mode': 'full', 'train_heads': True, 'pretrained_probe': '',
     'align_reference_metrics': True, 'val_metric_scope': 'native',
     'val_metric_aggregation': 'metric_wise_max', 'class_space': 'train_only',
     'temporal_sampling': 'phd_reference', 'output_regularization': {'enabled': False},
-    'encoder_lora': {
-        'enabled': True, 'rank': 8, 'alpha': 16.0, 'dropout': 0.05,
-        'last_n_blocks': 0, 'lr_mult': 0.5, 'weight_decay': 0.0001,
-        'activation_checkpointing': True, 'target_suffixes': ['attn.qkv', 'attn.proj'],
-        'load_checkpoint_path': '${STAGE1_ENCODER_LORA}',
-        'warm_start_at_init': True, 'freeze': True,
+    'hdepic_reference': {
+        'annotations_pkl': '${HDEPIC_ANN_ROOT}/HD_EPIC_Narrations.pkl',
+        'verb_classes_csv': '${HDEPIC_ANN_ROOT}/HD_EPIC_verb_classes.csv',
+        'noun_classes_csv': '${HDEPIC_ANN_ROOT}/HD_EPIC_noun_classes.csv',
     },
-    'predictor_lora': {
-        'enabled': True, 'rank': 8, 'alpha': 16.0, 'dropout': 0.05,
+    'encoder_lora': {'enabled': True, 'rank': 8, 'alpha': 16.0, 'dropout': 0.05,
         'last_n_blocks': 0, 'lr_mult': 0.5, 'weight_decay': 0.0001,
-        'activation_checkpointing': True, 'target_suffixes': ['attn.qkv', 'attn.proj'],
-    },
+        'activation_checkpointing': True, 'target_suffixes': ['attn.qkv', 'attn.proj']},
+    'predictor_lora': {'enabled': False},
     'gaze': {'mode': 'none'},
 }
 config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -108,4 +97,7 @@ PY
 
 cd "${VJEPA_ROOT}"
 "${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0 cuda:1 --debugmode false
-echo "EGTEA split1 video+predictor-lora stage-2 complete: $(date)"
+RUN_DIR="${OUTPUT_DIR}/action_anticipation_frozen/${TAG}"
+touch "${RUN_DIR}/.stage1_complete"
+echo "P01 video-only joint training complete: $(date)"
+echo "Stage-1 checkpoints: ${RUN_DIR}/{best.pt,encoder_lora_best.pt}"
