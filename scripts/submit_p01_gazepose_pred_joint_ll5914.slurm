@@ -13,9 +13,10 @@
 
 set -euo pipefail
 
-# P01 joint stage-2 (gaze+pose): predictor LoRA + continue training probe heads at small LR.
+# P01 joint stage-2 (gaze+pose): predictor LoRA + classifier heads @ small LR.
+# Pooler frozen (freeze_pooler) — full-probe joint collapsed (37.4%→28%).
 # Encoder LoRA + binary adapter frozen from stage-1 best.
-# resume_checkpoint=True continues from OUTPUT_DIR/.../latest.pt (epoch>=3 partial).
+# Fresh output dir (do not resume collapsed full-probe run).
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
 PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
@@ -29,9 +30,9 @@ STAGE1_DIR="${STAGE1_DIR:-/scratch/ll5914/experiments/p01_gazepose_clip/action_a
 STAGE1_PROBE="${STAGE1_DIR}/best.pt"
 STAGE1_ENCODER_LORA="${STAGE1_DIR}/encoder_lora_best.pt"
 STAGE1_ADAPTER="${STAGE1_DIR}/binary_input_adapter_best.pt"
-OUTPUT_DIR="/scratch/ll5914/experiments/p01_gazepose_pred_joint_clip"
-CONFIG_PATH="/scratch/ll5914/logs/p01_gazepose_pred_joint_clip_config.yaml"
-TAG="p01-gazepose-pred-joint-vitl16-256-10ep"
+OUTPUT_DIR="/scratch/ll5914/experiments/p01_gazepose_pred_joint_heads_clip"
+CONFIG_PATH="/scratch/ll5914/logs/p01_gazepose_pred_joint_heads_clip_config.yaml"
+TAG="p01-gazepose-pred-joint-heads-vitl16-256-10ep"
 
 GAZE_EXTRACT_ROOT="/scratch/ll5914/datasets/HD-EPIC/_gaze_extract"
 GAZE_ROOT="/scratch/ll5914/datasets/HD-EPIC/SLAM-and-Gaze"
@@ -71,7 +72,7 @@ cfg['cpus_per_task'] = 24
 cfg['tag']  = '${TAG}'
 cfg['eval_name'] = 'app.hdepic_lora_action_anticipation'
 cfg['folder'] = '${OUTPUT_DIR}'
-cfg['resume_checkpoint'] = True
+cfg['resume_checkpoint'] = False
 cfg['val_only'] = False
 data = cfg['experiment']['data']
 data.update({
@@ -88,7 +89,7 @@ data.update({
     'train_anticipation_time_sec': [0.25, 1.75],
 })
 opt = cfg['experiment']['optimization']
-# Probe LR 2e-5 (5x smaller than stage-1); batch 6 for gaze+pose memory.
+# Heads LR 2e-5 (5x smaller than stage-1); batch 6 for gaze+pose memory.
 opt.update({'batch_size': 6, 'num_epochs': 10, 'use_bfloat16': True,
     'use_focal_loss': False, 'val_every_epochs': 1, 'best_metric': 'val-action-top5',
     'early_stopping_patience': 3, 'grad_clip': 1.0,
@@ -99,6 +100,7 @@ cfg['experiment']['lora'] = {
     'enabled': True, 'rank': 8, 'alpha': 16.0, 'dropout': 0.05,
     'probe_train_mode': 'full',
     'train_heads': True,
+    'freeze_pooler': True,
     'load_probe_heads': True,
     'pretrained_probe': '${STAGE1_PROBE}',
     'align_reference_metrics': True, 'val_metric_scope': 'native',
@@ -153,5 +155,6 @@ print(f'Config: {config_path}')
 PY
 
 cd "${VJEPA_ROOT}"
-"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0 cuda:1 --debugmode false
-echo "P01 gaze+pose joint predictor+probe complete: $(date)"
+# Do NOT pass --debugmode false: argparse type=bool treated any string as True (single-GPU).
+"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0 cuda:1
+echo "P01 gaze+pose joint predictor+heads complete: $(date)"

@@ -131,7 +131,7 @@ print(f'Config: {config_path} depth={depth}')
 PY
 
 cd "${VJEPA_ROOT}"
-"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0 cuda:1 --debugmode false
+"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0 cuda:1
 
 # Write a small summary line for the sweep aggregator.
 RUN_DIR="${OUTPUT_DIR}/action_anticipation_frozen/${TAG}"

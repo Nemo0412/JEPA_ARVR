@@ -146,7 +146,7 @@ print(f'Config written: {config_path}')
 PY
 
 cd "${VJEPA_ROOT}"
-"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0 cuda:1 --debugmode false
+"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0 cuda:1
 
 RUN_DIR="${OUTPUT_DIR}/action_anticipation_frozen/${TAG}"
 echo "Tri-modal fusion training complete: $(date)"

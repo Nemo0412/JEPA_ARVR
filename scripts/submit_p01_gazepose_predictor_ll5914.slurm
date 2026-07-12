@@ -143,5 +143,5 @@ print(f'Config: {config_path}')
 PY
 
 cd "${VJEPA_ROOT}"
-"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0 cuda:1 --debugmode false
+"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0 cuda:1
 echo "P01 gaze+pose+predictor-lora stage-2 complete: $(date)"

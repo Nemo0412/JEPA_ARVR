@@ -100,5 +100,5 @@ print(f'Config: {config_path}')
 PY
 
 cd "${VJEPA_ROOT}"
-"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0 cuda:1 --debugmode false
+"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0 cuda:1
 echo "EGTEA split1 video+encoder-lora training complete: $(date)"

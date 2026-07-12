@@ -1120,8 +1120,20 @@ def _make_lora_init_classifier(
             if probe_train_mode == "lora":
                 _freeze_for_lora(classifier, train_heads=train_heads)
             else:
-                for param in classifier.parameters():
-                    param.requires_grad = train_heads
+                freeze_pooler = bool(lora_cfg.get("freeze_pooler", False))
+                if freeze_pooler:
+                    # Safer joint recipe: keep stage-1 pooler fixed, adapt heads only.
+                    head_prefixes = ("verb_classifier.", "noun_classifier.", "action_classifier.")
+                    for name, param in classifier.named_parameters():
+                        param.requires_grad = bool(train_heads) and name.startswith(head_prefixes)
+                    logger.info(
+                        "Full-probe mode with freeze_pooler=True: training classifier heads only "
+                        "(train_heads=%s)",
+                        train_heads,
+                    )
+                else:
+                    for param in classifier.parameters():
+                        param.requires_grad = train_heads
             if token_gate is not None and head_idx == 0:
                 classifier.gaze_token_gate = token_gate
                 for param in classifier.gaze_token_gate.parameters():
