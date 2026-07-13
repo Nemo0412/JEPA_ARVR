@@ -1,0 +1,119 @@
+#!/bin/bash
+#SBATCH --job-name=VJEPA2-EXP__hdepic_ar10s_ddp_smoke
+#SBATCH --account=your_slurm_account
+#SBATCH --partition=h100_tandon
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:h100:2
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=768GB
+#SBATCH --time=24:00:00
+#SBATCH --output=/path/to/VJEPA2-EXP/logs/hdepic_ar10s_ddp_smoke_%j.out
+#SBATCH --error=/path/to/VJEPA2-EXP/logs/hdepic_ar10s_ddp_smoke_%j.err
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=<email>
+
+set -euo pipefail
+
+# 2-GPU DDP smoke: 10s AR sliding + 5ch gaze/pose + encoder LoRA.
+# EVAL_BATCH_SIZE is per-GPU; default 8 x 2 ranks = effective global batch 16.
+
+PROJECT_ROOT="${PROJECT_ROOT:-/path/to/VJEPA2-EXP}"
+
+export PROJECT_ROOT
+export GAZE_MODE=binary_input_adapter_gaze_pose_matrix
+export GAZE_ROOT="${GAZE_ROOT:-${PROJECT_ROOT}/data/raw/HD-EPIC/SLAM-and-Gaze}"
+export GAZE_EXTRACT_ROOT="${GAZE_EXTRACT_ROOT:-${PROJECT_ROOT}/outputs/hdepic_gaze_token_gate/extracted}"
+export GAZE_SYNC_ROOT="${GAZE_SYNC_ROOT:-${PROJECT_ROOT}/data/raw/HD-EPIC/Videos}"
+
+export HDEPIC_AR10S_SLIDING_GAZE_POSE=1
+export BACKBONE="${BACKBONE:-vitl}"
+export CHECKPOINT="${CHECKPOINT:-${PROJECT_ROOT}/checkpoints/vitl.pt}"
+export EVAL_RESOLUTION="${EVAL_RESOLUTION:-256}"
+export EVAL_ANTICIPATION_SEC="${EVAL_ANTICIPATION_SEC:-10}"
+export MODEL_RETURN_MODE="${MODEL_RETURN_MODE:-final_window}"
+export MODEL_MAX_ROLLOUT_STEPS="${MODEL_MAX_ROLLOUT_STEPS:-512}"
+
+export LORA_PROBE_TRAIN_MODE="${LORA_PROBE_TRAIN_MODE:-full}"
+export EVAL_SINGLE_PROBE="${EVAL_SINGLE_PROBE:-1}"
+export EVAL_LR="${EVAL_LR:-0.0004}"
+export EVAL_START_LR="${EVAL_START_LR:-0.0}"
+export EVAL_FINAL_LR="${EVAL_FINAL_LR:-0.0}"
+export EVAL_WARMUP_EPOCHS="${EVAL_WARMUP_EPOCHS:-2}"
+export EVAL_WEIGHT_DECAY="${EVAL_WEIGHT_DECAY:-0.0001}"
+export EVAL_FINAL_WEIGHT_DECAY="${EVAL_FINAL_WEIGHT_DECAY:-0.0001}"
+export EVAL_USE_FOCAL_LOSS="${EVAL_USE_FOCAL_LOSS:-0}"
+export EVAL_GRAD_CLIP="${EVAL_GRAD_CLIP:-1.0}"
+export EVAL_NUM_EPOCHS="${EVAL_NUM_EPOCHS:-1}"
+export EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-8}"
+export LORA_PRETRAINED_PROBE="${LORA_PRETRAINED_PROBE-}"
+
+export LORA_RANK="${LORA_RANK:-8}"
+export LORA_ALPHA="${LORA_ALPHA:-16.0}"
+export LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
+
+export ENCODER_LORA_ENABLED=1
+export ENCODER_LORA_RANK="${ENCODER_LORA_RANK:-8}"
+export ENCODER_LORA_ALPHA="${ENCODER_LORA_ALPHA:-16.0}"
+export ENCODER_LORA_DROPOUT="${ENCODER_LORA_DROPOUT:-0.05}"
+export ENCODER_LORA_LAST_N_BLOCKS="${ENCODER_LORA_LAST_N_BLOCKS:-0}"
+export ENCODER_LORA_LR_MULT="${ENCODER_LORA_LR_MULT:-0.5}"
+export ENCODER_LORA_WEIGHT_DECAY="${ENCODER_LORA_WEIGHT_DECAY:-0.0001}"
+export ENCODER_LORA_ACTIVATION_CHECKPOINTING="${ENCODER_LORA_ACTIVATION_CHECKPOINTING:-1}"
+export ENCODER_LORA_TARGET_SUFFIXES="${ENCODER_LORA_TARGET_SUFFIXES:-attn.qkv,attn.proj}"
+
+export POSE_SLAM_ROOT="${POSE_SLAM_ROOT:-${GAZE_ROOT}/P01/SLAM/multi}"
+export POSE_MAPPING_JSON="${POSE_MAPPING_JSON:-${POSE_SLAM_ROOT}/vrs_to_multi_slam.json}"
+export POSE_FEATURE_SET="${POSE_FEATURE_SET:-pose_6d}"
+export POSE_QUALITY_MIN="${POSE_QUALITY_MIN:-0.0}"
+export POSE_HISTORY_SEC="${POSE_HISTORY_SEC:-0}"
+export POSE_INTERFRAME_K_MAX="${POSE_INTERFRAME_K_MAX:-128}"
+export POSE_MAP_PATCH_HEIGHT="${POSE_MAP_PATCH_HEIGHT:-128}"
+export POSE_MAP_PATCH_WIDTH="${POSE_MAP_PATCH_WIDTH:-9}"
+export POSE_MAP_LAYOUT="${POSE_MAP_LAYOUT:-topleft}"
+export POSE_MAP_NORMALIZE="${POSE_MAP_NORMALIZE:-none}"
+
+export BINARY_INPUT_ADAPTER_IN_CHANNELS="${BINARY_INPUT_ADAPTER_IN_CHANNELS:-5}"
+export BINARY_INPUT_ADAPTER_TEMPORAL_KERNEL="${BINARY_INPUT_ADAPTER_TEMPORAL_KERNEL:-3}"
+export BINARY_INPUT_ADAPTER_HIDDEN_DIM="${BINARY_INPUT_ADAPTER_HIDDEN_DIM:-8}"
+export BINARY_INPUT_ADAPTER_LR_MULT="${BINARY_INPUT_ADAPTER_LR_MULT:-1.0}"
+export BINARY_INPUT_ADAPTER_WEIGHT_DECAY="${BINARY_INPUT_ADAPTER_WEIGHT_DECAY:-0.0001}"
+export BINARY_INPUT_ADAPTER_ACTIVATION_CHECKPOINTING="${BINARY_INPUT_ADAPTER_ACTIVATION_CHECKPOINTING:-1}"
+export BINARY_INPUT_ADAPTER_AUG_AWARE="${BINARY_INPUT_ADAPTER_AUG_AWARE:-0}"
+export BINARY_INPUT_ADAPTER_DISABLE_TRAIN_AUG="${BINARY_INPUT_ADAPTER_DISABLE_TRAIN_AUG:-1}"
+
+export EVAL_GPUS="${EVAL_GPUS:-2}"
+export EVAL_DEBUGMODE="${EVAL_DEBUGMODE:-auto}"
+export EVAL_CPUS_PER_TASK="${EVAL_CPUS_PER_TASK:-24}"
+export EVAL_NUM_WORKERS="${EVAL_NUM_WORKERS:-4}"
+export EVAL_VAL_NUM_WORKERS="${EVAL_VAL_NUM_WORKERS:-4}"
+export EVAL_MAX_TRAIN_ITERS="${EVAL_MAX_TRAIN_ITERS:-150}"
+export EVAL_VAL_EVERY="${EVAL_VAL_EVERY:-1}"
+export EVAL_USE_BFLOAT16="${EVAL_USE_BFLOAT16:-0}"
+export EVAL_CLIP_BALANCED="${EVAL_CLIP_BALANCED:-1}"
+
+export GAZE_DECODER_CACHE_READER="${GAZE_DECODER_CACHE_READER:-1}"
+export GAZE_DECODER_NUM_THREADS="${GAZE_DECODER_NUM_THREADS:-2}"
+
+export PERF_MONITOR="${PERF_MONITOR:-1}"
+export PERF_INTERVAL="${PERF_INTERVAL:-15}"
+
+export DEBUG_SUBSET_PATH="${DEBUG_SUBSET_PATH:-}"
+export LORA_TAG="${LORA_TAG:-hdepic-ar10s-vitl-ddp2-bs16-w4-smoke-i150}"
+export CONFIG_PATH="${CONFIG_PATH:-${PROJECT_ROOT}/configs/generated/hdepic_singleprobe_ar10s_vitl_ddp_smoke.yaml}"
+export RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-0}"
+
+if [[ ! -s "${CHECKPOINT}" ]]; then
+  echo "[ar10s-ddp-smoke] Missing ViT-L checkpoint: ${CHECKPOINT}" >&2
+  echo "[ar10s-ddp-smoke] Run: bash ${PROJECT_ROOT}/scripts/download_vitl_checkpoint.sh" >&2
+  exit 1
+fi
+
+effective_bs=$(( EVAL_BATCH_SIZE * EVAL_GPUS ))
+echo "[ar10s-ddp-smoke] backbone=${BACKBONE} checkpoint=${CHECKPOINT} resolution=${EVAL_RESOLUTION}"
+echo "[ar10s-ddp-smoke] gpus=${EVAL_GPUS} batch_per_gpu=${EVAL_BATCH_SIZE} effective_global_bs=${effective_bs}"
+echo "[ar10s-ddp-smoke] workers=${EVAL_NUM_WORKERS}/rank val_workers=${EVAL_VAL_NUM_WORKERS} lr=${EVAL_LR} iters=${EVAL_MAX_TRAIN_ITERS}"
+echo "[ar10s-ddp-smoke] anticipation=${EVAL_ANTICIPATION_SEC}s return_mode=${MODEL_RETURN_MODE} fp32=${EVAL_USE_BFLOAT16}"
+echo "[ar10s-ddp-smoke] PERF_MONITOR=${PERF_MONITOR} interval=${PERF_INTERVAL}s (watch GPU util in perf_*_nvidia_smi.csv)"
+
+bash "${PROJECT_ROOT}/scripts/run_hdepic_single_probe_encoder_lora_gaze_pose_matrix_h100.slurm"

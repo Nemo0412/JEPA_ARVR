@@ -1,0 +1,74 @@
+nodes: 1
+tasks_per_node: 1
+cpus_per_task: 12
+tag: ref-egoexo-vitg384-motion30-scratch-probe
+eval_name: app.ref_egoexo4d_motion_prediction
+folder: /path/to/VJEPA2-EXP/outputs/ref_egoexo4d_motion_prediction
+resume_checkpoint: false
+val_only: false
+experiment:
+  probe:
+    pretrained_probe: null
+  classifier:
+    num_probe_blocks: 4
+    num_heads: 16
+  motion_prediction:
+    context_video_frames: 5
+    context_motion_frames: 5
+    future_motion_frames: 15
+    motion_fps: 30
+    use_past_pose: true
+  data:
+    dataset_train: /path/to/VJEPA2-EXP/data/egoexo4d_motion_index/egoexo_motion_train_fps30.csv
+    dataset_val: /path/to/VJEPA2-EXP/data/egoexo4d_motion_index/egoexo_motion_val_fps30.csv
+    frames_per_clip: 5
+    frames_per_second: 8
+    resolution: 384
+    num_workers: 4
+    val_num_workers: 4
+    pin_memory: true
+    auto_augment: true
+    reprob: 0.25
+    random_resize_scale:
+    - 0.08
+    - 1.0
+  optimization:
+    batch_size: 2
+    num_epochs: 20
+    use_bfloat16: true
+    optimizer_kwargs:
+      weight_decay: 0.0001
+      final_weight_decay: 0.0001
+      lr: 0.001
+      start_lr: 0.001
+      final_lr: 0.0
+      warmup: 0.0
+model_kwargs:
+  checkpoint: /path/to/VJEPA2-EXP/checkpoints/vitg-384.pt
+  module_name: evals.action_anticipation_frozen.modelcustom.vit_encoder_predictor_concat_ar
+  wrapper_kwargs:
+    no_predictor: true
+    num_output_frames: 2
+    num_steps: 1
+  pretrain_kwargs:
+    encoder:
+      model_name: vit_giant_xformers
+      checkpoint_key: target_encoder
+      tubelet_size: 2
+      patch_size: 16
+      uniform_power: true
+      use_rope: true
+    predictor:
+      model_name: vit_predictor
+      checkpoint_key: predictor
+      num_frames: 64
+      depth: 12
+      num_heads: 12
+      predictor_embed_dim: 384
+      num_mask_tokens: 10
+      uniform_power: true
+      use_mask_tokens: true
+      use_sdpa: true
+      use_silu: false
+      wide_silu: false
+      use_rope: true

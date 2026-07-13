@@ -1,0 +1,103 @@
+#!/bin/bash
+set -euo pipefail
+
+# Submit wrapper for the LoRA + classification-head probe (run_vlm_probe_lora.slurm /
+# train_vlm_probe_lora.py), mirroring the PhD's Qwen2.5-VL-3B probe approach.
+#
+# Usage:
+#   BACKEND=llava_onevision bash scripts/submit_vlm_probe_lora.sh
+#   BACKEND=llama32vision bash scripts/submit_vlm_probe_lora.sh
+#   BACKEND=qwen25vl bash scripts/submit_vlm_probe_lora.sh
+#
+# Smoke test (few samples, 1 epoch, short time limit):
+#   BACKEND=llava_onevision MAX_TRAIN_SAMPLES=16 NUM_EPOCHS=1 SLURM_TIME=00:30:00 \
+#     RUN_TAG=smoke bash scripts/submit_vlm_probe_lora.sh
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROJECT_ROOT="${PROJECT_ROOT:-${DEFAULT_PROJECT_ROOT}}"
+SHARED_PROJECT_ROOT="${SHARED_PROJECT_ROOT:-/scratch/yh6416/VJEPA2-EXP}"
+RUN_SCRIPT="${PROJECT_ROOT}/scripts/run_vlm_probe_lora.slurm"
+OVERLAY="${OVERLAY:-${SHARED_PROJECT_ROOT}/overlay-15GB-500K.ext3}"
+
+BACKEND="${BACKEND:?Set BACKEND=llama32vision, llava_onevision, or qwen25vl}"
+MODEL_ID="${MODEL_ID:-}"
+HDEPIC_ANN_ROOT="${HDEPIC_ANN_ROOT:-${SHARED_PROJECT_ROOT}/data/hd-epic-annotations/narrations-and-action-segments}"
+TRAIN_CSV="${TRAIN_CSV:-${SHARED_PROJECT_ROOT}/data/hdepic_vjepa_annotations/p01_fixed/HD_EPIC_train_vjepa.csv}"
+VAL_CSV="${VAL_CSV:-${SHARED_PROJECT_ROOT}/data/hdepic_vjepa_annotations/p01_fixed/HD_EPIC_val_vjepa.csv}"
+TEST_CSV="${TEST_CSV:-${SHARED_PROJECT_ROOT}/data/hdepic_vjepa_annotations/p01_fixed/HD_EPIC_test_vjepa.csv}"
+VIDEO_ROOT="${VIDEO_ROOT:-${SHARED_PROJECT_ROOT}/data/hdepic_vjepa_videos}"
+VERB_CLASSES_CSV="${VERB_CLASSES_CSV:-${HDEPIC_ANN_ROOT}/HD_EPIC_verb_classes.csv}"
+NOUN_CLASSES_CSV="${NOUN_CLASSES_CSV:-${HDEPIC_ANN_ROOT}/HD_EPIC_noun_classes.csv}"
+NUM_FRAMES="${NUM_FRAMES:-32}"
+PROBE_NUM_FRAMES="${PROBE_NUM_FRAMES:-8}"
+TARGET_FPS="${TARGET_FPS:-8.0}"
+MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
+NUM_EPOCHS="${NUM_EPOCHS:-10}"
+LR="${LR:-2e-4}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
+WARMUP_EPOCHS="${WARMUP_EPOCHS:-2}"
+LORA_RANK="${LORA_RANK:-16}"
+LORA_ALPHA="${LORA_ALPHA:-32.0}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-2}"
+LOG_EVERY="${LOG_EVERY:-20}"
+TORCH_DTYPE="${TORCH_DTYPE:-bfloat16}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
+SEED="${SEED:-0}"
+PRUNE_KEEP_RATIO="${PRUNE_KEEP_RATIO:-1.0}"
+PRUNE_CHUNK_SIZE="${PRUNE_CHUNK_SIZE:-0}"
+QWEN_FRAME_SIZE="${QWEN_FRAME_SIZE:-0}"
+PREPROC_CACHE_DIR="${PREPROC_CACHE_DIR:-}"
+RESUME_FROM="${RESUME_FROM:-}"
+LOCAL_FILES_ONLY="${LOCAL_FILES_ONLY:-0}"
+SLURM_TIME="${SLURM_TIME:-24:00:00}"
+RUN_TAG="${RUN_TAG:-${BACKEND}_probe_lora}"
+OUTPUT_DIR="${OUTPUT_DIR:-${SHARED_PROJECT_ROOT}/outputs/vlm_probe_lora/${RUN_TAG}}"
+
+export_csv="ALL"
+export_csv+=",PROJECT_ROOT=${PROJECT_ROOT}"
+export_csv+=",SHARED_PROJECT_ROOT=${SHARED_PROJECT_ROOT}"
+export_csv+=",OVERLAY=${OVERLAY}"
+export_csv+=",BACKEND=${BACKEND}"
+export_csv+=",MODEL_ID=${MODEL_ID}"
+export_csv+=",TRAIN_CSV=${TRAIN_CSV}"
+export_csv+=",VAL_CSV=${VAL_CSV}"
+export_csv+=",TEST_CSV=${TEST_CSV}"
+export_csv+=",VIDEO_ROOT=${VIDEO_ROOT}"
+export_csv+=",VERB_CLASSES_CSV=${VERB_CLASSES_CSV}"
+export_csv+=",NOUN_CLASSES_CSV=${NOUN_CLASSES_CSV}"
+export_csv+=",OUTPUT_DIR=${OUTPUT_DIR}"
+export_csv+=",NUM_FRAMES=${NUM_FRAMES}"
+export_csv+=",PROBE_NUM_FRAMES=${PROBE_NUM_FRAMES}"
+export_csv+=",TARGET_FPS=${TARGET_FPS}"
+export_csv+=",MAX_TRAIN_SAMPLES=${MAX_TRAIN_SAMPLES}"
+export_csv+=",NUM_EPOCHS=${NUM_EPOCHS}"
+export_csv+=",LR=${LR}"
+export_csv+=",WEIGHT_DECAY=${WEIGHT_DECAY}"
+export_csv+=",WARMUP_EPOCHS=${WARMUP_EPOCHS}"
+export_csv+=",LORA_RANK=${LORA_RANK}"
+export_csv+=",LORA_ALPHA=${LORA_ALPHA}"
+export_csv+=",BATCH_SIZE=${BATCH_SIZE}"
+export_csv+=",GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS}"
+export_csv+=",LOG_EVERY=${LOG_EVERY}"
+export_csv+=",TORCH_DTYPE=${TORCH_DTYPE}"
+export_csv+=",NUM_WORKERS=${NUM_WORKERS}"
+export_csv+=",SEED=${SEED}"
+export_csv+=",PRUNE_KEEP_RATIO=${PRUNE_KEEP_RATIO}"
+export_csv+=",PRUNE_CHUNK_SIZE=${PRUNE_CHUNK_SIZE}"
+export_csv+=",QWEN_FRAME_SIZE=${QWEN_FRAME_SIZE}"
+export_csv+=",PREPROC_CACHE_DIR=${PREPROC_CACHE_DIR}"
+export_csv+=",RESUME_FROM=${RESUME_FROM}"
+export_csv+=",LOCAL_FILES_ONLY=${LOCAL_FILES_ONLY}"
+export_csv+=",HF_HOME=${HF_HOME:-/scratch/yh6416/.huggingface}"
+
+PARTITION="${SLURM_PARTITION:-h100_tandon}"
+GRES="${SLURM_GRES:-gpu:h100:1}"
+MEM="${SLURM_MEM:-128GB}"
+CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-8}"
+
+echo "[submit-vlm-probe-lora] backend=${BACKEND} max_train_samples=${MAX_TRAIN_SAMPLES} epochs=${NUM_EPOCHS}"
+echo "[submit-vlm-probe-lora] output_dir=${OUTPUT_DIR}"
+echo "[submit-vlm-probe-lora] partition=${PARTITION} gres=${GRES} mem=${MEM} cpus-per-task=${CPUS_PER_TASK} time=${SLURM_TIME}"
+sbatch --time="${SLURM_TIME}" --partition="${PARTITION}" --gres="${GRES}" --mem="${MEM}" --cpus-per-task="${CPUS_PER_TASK}" --export="${export_csv}" "${RUN_SCRIPT}"

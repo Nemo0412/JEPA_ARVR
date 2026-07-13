@@ -1,0 +1,170 @@
+nodes: 1
+tasks_per_node: 2
+cpus_per_task: 24
+tag: hdepic-ar10s-vitl-ddp2-bs16-w4-smoke-i150
+eval_name: app.hdepic_lora_action_anticipation
+folder: /path/to/VJEPA2-EXP/outputs/hdepic_lora_action_anticipation
+resume_checkpoint: false
+experiment:
+  classifier:
+    num_probe_blocks: 4
+    num_heads: 16
+  data:
+    anticipation_time_sec:
+    - 10.0
+    - 10.0
+    auto_augment: true
+    file_format: 1
+    dataset: EK100
+    base_path: /path/to/VJEPA2-EXP/data/hdepic_vjepa_videos
+    dataset_train: /path/to/VJEPA2-EXP/data/hdepic_vjepa_annotations/HD_EPIC_train_vjepa.csv
+    dataset_val: /path/to/VJEPA2-EXP/data/hdepic_vjepa_annotations/HD_EPIC_val_vjepa.csv
+    frames_per_clip: 32
+    frames_per_second: 8
+    motion_shift: false
+    num_workers: 4
+    pin_memory: true
+    random_resize_scale:
+    - 0.08
+    - 1.0
+    reprob: 0.25
+    resolution: 256
+    train_anticipation_point:
+    - 0.0
+    - 0.0
+    train_anticipation_time_sec:
+    - 10.0
+    - 10.0
+    val_num_workers: 4
+    clip_balanced: true
+  optimization:
+    num_epochs: 1
+    batch_size: 8
+    use_bfloat16: false
+    use_focal_loss: false
+    multihead_kwargs:
+    - weight_decay: 0.0001
+      final_weight_decay: 0.0001
+      lr: 0.0004
+      start_lr: 0.0
+      final_lr: 0.0
+      warmup: 2.0
+    val_every_epochs: 1
+  lora:
+    enabled: true
+    rank: 8
+    alpha: 16.0
+    dropout: 0.05
+    probe_train_mode: full
+    train_heads: true
+    pretrained_probe: ''
+    align_reference_metrics: true
+    val_metric_scope: native
+    encoder_lora:
+      enabled: true
+      rank: 8
+      alpha: 16.0
+      dropout: 0.05
+      last_n_blocks: 0
+      lr_mult: 0.5
+      weight_decay: 0.0001
+      activation_checkpointing: true
+      target_suffixes:
+      - attn.qkv
+    gaze:
+      mode: binary_input_adapter_gaze_pose_matrix
+      gaze_root: /path/to/VJEPA2-EXP/data/raw/HD-EPIC/SLAM-and-Gaze
+      extract_root: /path/to/VJEPA2-EXP/outputs/hdepic_gaze_token_gate/extracted
+      sync_root: /path/to/VJEPA2-EXP/data/raw/HD-EPIC/Videos
+      gamma: 0.7
+      sigma_px: 40.0
+      learnable_gate: true
+      use_motion: false
+      traj_len: 1024
+      rnn:
+        hidden_dim: 256
+        num_layers: 2
+        bidirectional: true
+        dropout: 0.1
+        num_tokens: 64
+        use_video_tokens: false
+        video_fusion: nearest_concat
+        video_proj_dim: 128
+        local_temporal_radius: 0
+        local_spatial_radius: 1
+        residual_alpha_init: 0.01
+        history_sec: 0.0
+        gaze_lr_mult: 5.0
+      hidden_dump:
+        enabled: false
+        max_batches: 4
+      binary_radius_px: 64.0
+      binary_map_type: binary
+      fallback_full_frame: false
+      force_zero_map: false
+      aug_aware: false
+      disable_train_aug: true
+      input_adapter:
+        hidden_dim: 8
+        scale: 1.0
+        temporal_kernel: 3
+        binary_center: 0.0
+        residual_clamp: 1.0
+        lr_mult: 1.0
+        weight_decay: 0.0001
+        activation_checkpointing: true
+        in_channels: 5
+      pose_map:
+        patch_height: 128
+        patch_width: 9
+        layout: topleft
+        normalize: none
+        force_zero_pose: false
+      encoder_output_adapter:
+        num_heads: 4
+        dropout: 0.0
+        lr_mult: 0.05
+        weight_decay: 0.0001
+      pose:
+        enabled: true
+        slam_root: /path/to/VJEPA2-EXP/data/raw/HD-EPIC/SLAM-and-Gaze/P01/SLAM/multi
+        mapping_json: /path/to/VJEPA2-EXP/data/raw/HD-EPIC/SLAM-and-Gaze/P01/SLAM/multi/vrs_to_multi_slam.json
+        trajectory_file: closed_loop_trajectory.csv
+        feature_set: pose_6d
+        quality_min: 0.0
+        history_sec: 0.0
+        interframe_k_max: 128
+    prediction_dump:
+      enabled: false
+model_kwargs:
+  checkpoint: /path/to/VJEPA2-EXP/checkpoints/vitl.pt
+  module_name: app.hdepic_lora_action_anticipation.modelcustom.vit_encoder_predictor_rollout
+  wrapper_kwargs:
+    no_predictor: false
+    num_output_frames: 2
+    num_steps: 1
+    return_mode: final_window
+    max_rollout_steps: 512
+  pretrain_kwargs:
+    encoder:
+      model_name: vit_large
+      checkpoint_key: target_encoder
+      tubelet_size: 2
+      patch_size: 16
+      uniform_power: true
+      use_rope: true
+    predictor:
+      model_name: vit_predictor
+      checkpoint_key: predictor
+      num_frames: 64
+      depth: 12
+      num_heads: 12
+      predictor_embed_dim: 384
+      num_mask_tokens: 10
+      uniform_power: true
+      use_mask_tokens: true
+      use_sdpa: true
+      use_silu: false
+      wide_silu: false
+      use_rope: true
+val_only: false

@@ -8,3 +8,7 @@ venv/
 *.egg-info/
 dist/
 build/
+.cursor/
+outputs/
+*.pt
+*.pth

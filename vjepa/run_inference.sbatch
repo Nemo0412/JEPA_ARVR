@@ -5,7 +5,7 @@
 #SBATCH --mem=32G
 #SBATCH --partition=a100_tandon
 #SBATCH --gres=gpu:1
-#SBATCH --account=torch_pr_674_tandon_advanced
+#SBATCH --account=YOUR_SLURM_ACCOUNT
 #SBATCH -o /scratch/ll5914/logs/vjepa2_inference_%j.out
 #SBATCH -e /scratch/ll5914/logs/vjepa2_inference_%j.err
 

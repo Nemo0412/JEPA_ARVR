@@ -1,0 +1,106 @@
+nodes: 1
+tasks_per_node: 1
+cpus_per_task: 12
+tag: hdepic-encoderlora-baseline-last12-5ep
+eval_name: app.hdepic_lora_action_anticipation
+folder: /path/to/VJEPA2-EXP/outputs/hdepic_lora_action_anticipation
+resume_checkpoint: false
+experiment:
+  classifier:
+    num_probe_blocks: 4
+    num_heads: 16
+  data:
+    anticipation_time_sec:
+    - 1.0
+    - 1.0
+    auto_augment: true
+    file_format: 1
+    dataset: EK100
+    base_path: /path/to/VJEPA2-EXP/data/hdepic_vjepa_videos
+    dataset_train: /path/to/VJEPA2-EXP/data/hdepic_vjepa_annotations/HD_EPIC_train_vjepa.csv
+    dataset_val: /path/to/VJEPA2-EXP/data/hdepic_vjepa_annotations/HD_EPIC_val_vjepa.csv
+    frames_per_clip: 32
+    frames_per_second: 8
+    motion_shift: false
+    num_workers: 12
+    pin_memory: true
+    random_resize_scale:
+    - 0.08
+    - 1.0
+    reprob: 0.25
+    resolution: 384
+    train_anticipation_point:
+    - 0.0
+    - 0.25
+    train_anticipation_time_sec:
+    - 0.25
+    - 1.75
+    val_num_workers: 4
+    clip_balanced: true
+  optimization:
+    num_epochs: 5
+    batch_size: 2
+    use_bfloat16: true
+    use_focal_loss: true
+    # Single head so the encoder-LoRA optimizer group is stepped on optimizer[0]
+    # by the grad-flowing baseline train loop. Matches the gaze run exactly so
+    # the only difference is the absence of the binary gaze map.
+    multihead_kwargs:
+    - weight_decay: 0.01
+      final_weight_decay: 0.01
+      lr: 0.001
+      start_lr: 0.001
+      final_lr: 0.0
+      warmup: 0.1
+  lora:
+    enabled: true
+    rank: 16
+    alpha: 32.0
+    dropout: 0.05
+    train_heads: true
+    pretrained_probe: /path/to/VJEPA2-EXP/outputs/ek100_vitg384_probe/action_anticipation_frozen/ek100-vitg16-384/latest.pt
+    align_reference_metrics: true
+    val_metric_scope: native
+    # Same encoder LoRA as the gaze run; no gaze map injected (gaze.mode unset =>
+    # "none"), so this is the matched baseline with a fine-tuned encoder.
+    encoder_lora:
+      enabled: true
+      rank: 16
+      alpha: 32.0
+      dropout: 0.05
+      last_n_blocks: 12
+      lr_mult: 0.5
+      weight_decay: 0.0001
+      activation_checkpointing: true
+    prediction_dump:
+      enabled: false
+model_kwargs:
+  checkpoint: /path/to/VJEPA2-EXP/checkpoints/vitg-384.pt
+  module_name: evals.action_anticipation_frozen.modelcustom.vit_encoder_predictor_concat_ar
+  wrapper_kwargs:
+    no_predictor: false
+    num_output_frames: 2
+    num_steps: 1
+  pretrain_kwargs:
+    encoder:
+      model_name: vit_giant_xformers
+      checkpoint_key: target_encoder
+      tubelet_size: 2
+      patch_size: 16
+      uniform_power: true
+      use_rope: true
+    predictor:
+      model_name: vit_predictor
+      checkpoint_key: predictor
+      num_frames: 64
+      depth: 12
+      num_heads: 12
+      predictor_embed_dim: 384
+      num_mask_tokens: 10
+      uniform_power: true
+      use_mask_tokens: true
+      use_sdpa: true
+      use_silu: false
+      wide_silu: false
+      use_rope: true
+val_only: false
