@@ -4,10 +4,10 @@
 #SBATCH --partition=h100_tandon
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:h100:2
+#SBATCH --gres=gpu:h100:1
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=384GB
-#SBATCH --time=06:00:00
+#SBATCH --time=03:00:00
 #SBATCH --output=/scratch/ll5914/logs/p01_gaze_jpred_%j.out
 #SBATCH --error=/scratch/ll5914/logs/p01_gaze_jpred_%j.err
 
@@ -67,12 +67,12 @@ config_path   = Path('${CONFIG_PATH}')
 with template_path.open() as f:
     cfg = yaml.safe_load(f)
 cfg['nodes'] = 1
-cfg['tasks_per_node'] = 2
+cfg['tasks_per_node'] = 1
 cfg['cpus_per_task'] = 24
 cfg['tag']  = '${TAG}'
 cfg['eval_name'] = 'app.hdepic_lora_action_anticipation'
 cfg['folder'] = '${OUTPUT_DIR}'
-cfg['resume_checkpoint'] = False
+cfg['resume_checkpoint'] = True
 cfg['val_only'] = False
 data = cfg['experiment']['data']
 data.update({
@@ -83,7 +83,7 @@ data.update({
     # Feed GPUs harder to avoid ~2h low-util kill; keep 2 GPUs.
     # Cap workers vs prior 8/4 — too many workers raised host pressure and coincided
     # with DDP port collisions when another job held MASTER_PORT.
-    'num_workers': 6, 'val_num_workers': 3, 'clip_balanced': True,
+    'num_workers': 10, 'val_num_workers': 6, 'clip_balanced': True,
     'resolution': 256, 'frames_per_clip': 32, 'frames_per_second': 8,
     'anticipation_time_sec': [1.0, 1.0],
     'train_anticipation_time_sec': [0.25, 1.75],
@@ -156,5 +156,5 @@ PY
 
 cd "${VJEPA_ROOT}"
 # Do NOT pass --debugmode false: argparse type=bool treated any string as True (single-GPU).
-"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0 cuda:1
+"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0
 echo "P01 gaze+pose joint predictor+heads complete: $(date)"

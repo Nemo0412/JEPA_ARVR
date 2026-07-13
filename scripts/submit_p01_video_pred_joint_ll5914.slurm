@@ -4,10 +4,10 @@
 #SBATCH --partition=h100_tandon
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:h100:2
+#SBATCH --gres=gpu:h100:1
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=384GB
-#SBATCH --time=06:00:00
+#SBATCH --time=03:00:00
 #SBATCH --output=/scratch/ll5914/logs/p01_video_jpred_%j.out
 #SBATCH --error=/scratch/ll5914/logs/p01_video_jpred_%j.err
 
@@ -55,12 +55,13 @@ config_path   = Path('${CONFIG_PATH}')
 with template_path.open() as f:
     cfg = yaml.safe_load(f)
 cfg['nodes'] = 1
-cfg['tasks_per_node'] = 2
+cfg['tasks_per_node'] = 1
 cfg['cpus_per_task'] = 24
 cfg['tag']  = '${TAG}'
 cfg['eval_name'] = 'app.hdepic_lora_action_anticipation'
 cfg['folder'] = '${OUTPUT_DIR}'
-cfg['resume_checkpoint'] = False
+# Resume from latest.pt if present (e.g. after Slurm SIGNAL Terminated).
+cfg['resume_checkpoint'] = True
 cfg['val_only'] = False
 data = cfg['experiment']['data']
 data.update({
@@ -119,5 +120,5 @@ PY
 
 cd "${VJEPA_ROOT}"
 # Do NOT pass --debugmode false: argparse type=bool treated any string as True (single-GPU).
-"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0 cuda:1
+"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0
 echo "P01 video joint predictor+heads complete: $(date)"

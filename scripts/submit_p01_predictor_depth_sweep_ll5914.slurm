@@ -4,8 +4,8 @@
 #SBATCH --partition=h100_tandon
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:h100:2
-#SBATCH --cpus-per-task=16
+#SBATCH --gres=gpu:h100:1
+#SBATCH --cpus-per-task=24
 #SBATCH --mem=384GB
 #SBATCH --time=03:00:00
 #SBATCH --array=0-5
@@ -68,8 +68,8 @@ depth = int('${DEPTH}')
 with template_path.open() as f:
     cfg = yaml.safe_load(f)
 cfg['nodes'] = 1
-cfg['tasks_per_node'] = 2
-cfg['cpus_per_task'] = 16
+cfg['tasks_per_node'] = 1
+cfg['cpus_per_task'] = 24
 cfg['tag']  = '${TAG}'
 cfg['eval_name'] = 'app.hdepic_lora_action_anticipation'
 cfg['folder'] = '${OUTPUT_DIR}'
@@ -81,7 +81,7 @@ data.update({
     'base_path': '${VIDEO_ROOT}',
     'dataset_train': '${ANN_DIR}/HD_EPIC_train_vjepa.csv',
     'dataset_val': '${ANN_DIR}/HD_EPIC_val_vjepa.csv',
-    'num_workers': 6, 'val_num_workers': 4, 'clip_balanced': True,
+    'num_workers': 10, 'val_num_workers': 6, 'clip_balanced': True,
     'resolution': 256, 'frames_per_clip': 32, 'frames_per_second': 8,
     'anticipation_time_sec': [1.0, 1.0],
     'train_anticipation_time_sec': [0.25, 1.75],
@@ -131,7 +131,7 @@ print(f'Config: {config_path} depth={depth}')
 PY
 
 cd "${VJEPA_ROOT}"
-"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0 cuda:1
+"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0
 
 # Write a small summary line for the sweep aggregator.
 RUN_DIR="${OUTPUT_DIR}/action_anticipation_frozen/${TAG}"

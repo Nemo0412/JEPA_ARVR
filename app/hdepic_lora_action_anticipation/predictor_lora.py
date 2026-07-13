@@ -88,6 +88,11 @@ def inject_predictor_lora(
 ) -> int:
     from app.hdepic_lora_action_anticipation.eval import LoRALinear
 
+    # last_n_blocks < 0 means skip LoRA (used with full_ft_last_n_blocks for extra depth).
+    if int(last_n_blocks) < 0:
+        logger.info("predictor_lora.last_n_blocks=%d < 0; skipping LoRA injection", last_n_blocks)
+        return 0
+
     predictor = _find_predictor(model)
     blocks = _iter_blocks(predictor)
     n_total = len(blocks)
@@ -126,6 +131,65 @@ def inject_predictor_lora(
             target_suffixes,
         )
     return wrapped
+
+
+def copy_init_extra_predictor_blocks(model: nn.Module, n_pretrained: int = 12) -> int:
+    """Warm-start extra predictor blocks (depth > checkpoint) from the last pretrained block."""
+    predictor = _find_predictor(model)
+    blocks = _iter_blocks(predictor)
+    if len(blocks) <= int(n_pretrained):
+        return 0
+    src_sd = blocks[int(n_pretrained) - 1].state_dict()
+    n_copied = 0
+    for block in blocks[int(n_pretrained) :]:
+        block.load_state_dict(src_sd, strict=True)
+        n_copied += 1
+    logger.info(
+        "Copy-initialized %d extra predictor block(s) from block %d (total depth=%d)",
+        n_copied,
+        int(n_pretrained) - 1,
+        len(blocks),
+    )
+    return n_copied
+
+
+def set_predictor_full_ft_last_n(model: nn.Module, last_n: int) -> int:
+    """Fully unfreeze the last ``last_n`` predictor blocks."""
+    if last_n <= 0:
+        return 0
+    predictor = _find_predictor(model)
+    blocks = _iter_blocks(predictor)
+    n_total = len(blocks)
+    last_n = min(int(last_n), n_total)
+    for p in predictor.parameters():
+        p.requires_grad = False
+    n_params = 0
+    for block in blocks[n_total - last_n :]:
+        for p in block.parameters():
+            p.requires_grad = True
+            n_params += p.numel()
+    # Re-enable any LoRA adapters that may have been frozen above.
+    set_predictor_lora_trainable(model, trainable=True)
+    logger.info(
+        "Enabled full fine-tune on last %d/%d predictor blocks (%d params)",
+        last_n,
+        n_total,
+        n_params,
+    )
+    return n_params
+
+
+def trainable_predictor_full_ft_params(model: nn.Module) -> list[nn.Parameter]:
+    """Trainable non-LoRA predictor params (extra-depth full-FT blocks)."""
+    predictor = _find_predictor(model)
+    params: list[nn.Parameter] = []
+    for name, p in predictor.named_parameters():
+        if not p.requires_grad:
+            continue
+        if "lora_A" in name or "lora_B" in name:
+            continue
+        params.append(p)
+    return params
 
 
 def _predictor_lora_modules(model: nn.Module):
@@ -250,6 +314,8 @@ def parse_predictor_lora_cfg(lora_cfg: dict) -> dict | None:
         "alpha": float(cfg.get("alpha", lora_cfg.get("alpha", 16.0))),
         "dropout": float(cfg.get("dropout", lora_cfg.get("dropout", 0.05))),
         "last_n_blocks": int(cfg.get("last_n_blocks", 0)),
+        "full_ft_last_n_blocks": int(cfg.get("full_ft_last_n_blocks", 0) or 0),
+        "copy_init_from_pretrained": int(cfg.get("copy_init_from_pretrained", 12) or 0),
         "lr_mult": float(cfg.get("lr_mult", 0.5)),
         "weight_decay": float(cfg.get("weight_decay", 0.0001)),
         "activation_checkpointing": bool(cfg.get("activation_checkpointing", False)),
