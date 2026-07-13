@@ -10,10 +10,11 @@ eval_name: app.hdepic_lora_action_anticipation
 
 ---
 
-## Best Val Action Top-5 (as of 2026-07-12 evening)
+## Best Val Action Top-5 (as of 2026-07-13)
 
 Metric: **val action Top-5 accuracy** from `topk_log_r0.csv` (preferred).  
-Backbone: **ViT-L/16 @ 256**, horizon ≈ **1s**, temporal sampling `phd_reference` unless noted.
+Backbone: **ViT-L/16 @ 256**, horizon ≈ **1s**, temporal sampling `phd_reference` unless noted.  
+Cluster runs use **1×H100** unless noted.
 
 ### EGTEA (split1)
 
@@ -31,24 +32,54 @@ Backbone: **ViT-L/16 @ 256**, horizon ≈ **1s**, temporal sampling `phd_referen
 | Video stage-1 (probe + encoder LoRA) | 38.10% | |
 | Video stage-2 (predictor LoRA only) | 37.87% | Short / incomplete log |
 | Video joint v1 (predictor + **full probe** @ 2e-5) | 38.85% csv / 38.62% tracker | Partial; declining; superseded by heads-only joint |
+| Video **joint v2** (predictor + **heads**; pooler frozen) | **40.44%** @ep3 | Incomplete (killed ~2–2.5h); resume in flight |
 | Gaze+pose stage-1 (gaze map + SLAM pose matrix + encoder LoRA) | 39.16% | Pose = SLAM `pose_6d` (IMU-fused trajectory; not raw IMU CSV) |
-| Gaze+pose stage-2 (predictor LoRA only) | **40.59%** | **Best completed P01 Top-5 so far** |
+| Gaze+pose stage-2 (predictor LoRA only) | 40.59% | Previous P01 best (completed) |
+| Gaze+pose **joint v2** (predictor + **heads**; pooler frozen) | **42.74%** @ep2 | **Best P01 Top-5**; early-stopped @ep5 (patience 3) |
 | Gaze+pose joint v1 (predictor + **full probe** @ 2e-5) | 37.42% → 28.02% | **Collapsed**; early-stopped @ep5 (forgetting, not NaN) |
 
-**P01 leader so far:** Gaze+pose predictor-only **40.59%**.
+**P01 leader:** Gaze+pose joint v2 (heads) **42.74%**.
 
-### In flight / resubmitted (2026-07-12)
+#### Best P01 checkpoint (saved on scratch)
 
-| Job family | Change | Status |
-|---|---|---|
-| Video / gaze **joint v2** (`*_joint_heads_*`) | `freeze_pooler=True` (heads only) + predictor LoRA; fresh dirs; real 2-GPU | Resubmitted |
-| Predictor depth sweep (`last_n_blocks` ∈ {1,2,4,6,8,12}, video-only) | Fixed multi-GPU launch | Resubmitted |
-| Tri-modal stage-2 | Fixed multi-GPU launch | Resubmitted |
+```text
+/scratch/ll5914/experiments/p01_gazepose_pred_joint_heads_clip/action_anticipation_frozen/p01-gazepose-pred-joint-heads-vitl16-256-10ep/
+  best.pt                      # probe / classifier @ ep2 (42.74%)
+  predictor_lora_best.pt
+  encoder_lora_best.pt         # frozen warm-start from stage-1
+  binary_input_adapter_best.pt
+  topk_log_r0.csv
+```
 
-### Known issues fixed in this pass
+### Predictor depth sweep (video-only, `last_n_blocks`; incomplete)
+
+Encoder LoRA + probe frozen from video stage-1; only predictor LoRA trains. Killed ~2h; resume in flight.
+
+| `last_n_blocks` | Best Top-5 so far | Vals logged |
+|---:|---:|---|
+| 1 | 39.37% | 6 |
+| 2 | 39.52% | 6 |
+| 4 | **39.83%** | 2 |
+| 6 | 39.68% | 2 |
+| 8 | 39.37% | 2 |
+| 12 | 39.29% | 2 |
+
+Arch depth 12→14 (full-FT last 2 blocks): config path fixed (`pretrain_kwargs.predictor.depth`); resubmitted.
+
+### In flight (2026-07-13)
+
+| Job family | Status |
+|---|---|
+| Video joint v2 resume | Queued / resume from `latest.pt` |
+| Predictor depth sweep resume | Queued / resume |
+| Predictor arch depth14 | Queued (bugfix) |
+| Tri-modal stage-2 (1×H100) | Running |
+
+### Known issues fixed recently
 
 1. **`--debugmode false` bug:** `argparse` `type=bool` makes `bool("false") is True`, forcing single-GPU debug path. Fixed parser in `vjepa2/evals/main.py` and removed the bad flag from submit scripts; parent now `join()`s workers.
-2. **Gaze joint collapse:** full 50M probe + predictor LoRA caused action forgetting (train action↓, verb/noun↑). New joint keeps pooler frozen and trains **heads only**.
+2. **Gaze joint collapse:** full 50M probe + predictor LoRA caused action forgetting (train action↓, verb/noun↑). Joint v2 keeps pooler frozen and trains **heads only**.
+3. **Arch depth14 `KeyError: 'predictor'`:** depth must be set under `model_kwargs.pretrain_kwargs.predictor`, not `model_kwargs.predictor`.
 
 ---
 
