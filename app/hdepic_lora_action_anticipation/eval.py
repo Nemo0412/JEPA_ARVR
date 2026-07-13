@@ -55,11 +55,14 @@ from app.hdepic_lora_action_anticipation.encoder_lora import (
 from app.hdepic_lora_action_anticipation.pose_slam import feature_dim_for_set
 from app.hdepic_lora_action_anticipation.predictor_lora import (
     assert_predictor_lora_device_consistency,
+    copy_init_extra_predictor_blocks,
     inject_predictor_lora,
     load_predictor_lora_checkpoint,
     parse_predictor_lora_cfg,
     save_predictor_lora_checkpoint,
+    set_predictor_full_ft_last_n,
     train_one_epoch_predictor_lora,
+    trainable_predictor_full_ft_params,
     trainable_predictor_lora_params,
 )
 from app.hdepic_lora_action_anticipation.pose_map_builder import GazePoseInputMapBuilder
@@ -2110,6 +2113,9 @@ def _patch_for_predictor_lora(base_eval, pred_cfg: dict, baseline_train_loop: bo
 
     def init_module_with_predictor_lora(*args, **kwargs):
         model = inner_init_module(*args, **kwargs)
+        n_pretrained = int(pred_cfg.get("copy_init_from_pretrained", 0) or 0)
+        if n_pretrained > 0:
+            copy_init_extra_predictor_blocks(model, n_pretrained=n_pretrained)
         inject_predictor_lora(
             model,
             rank=pred_cfg["rank"],
@@ -2118,6 +2124,9 @@ def _patch_for_predictor_lora(base_eval, pred_cfg: dict, baseline_train_loop: bo
             last_n_blocks=pred_cfg["last_n_blocks"],
             target_suffixes=pred_cfg.get("target_suffixes", ("attn.qkv", "attn.proj", "mlp.fc1", "mlp.fc2")),
         )
+        full_ft_last_n = int(pred_cfg.get("full_ft_last_n_blocks", 0) or 0)
+        if full_ft_last_n > 0:
+            set_predictor_full_ft_last_n(model, full_ft_last_n)
         if pred_cfg.get("activation_checkpointing", False):
             mdl = model.module if hasattr(model, "module") and not hasattr(model, "predictor") else model
             pred = getattr(getattr(mdl, "base_model", mdl), "predictor", getattr(mdl, "predictor", None))
@@ -2148,29 +2157,53 @@ def _patch_for_predictor_lora(base_eval, pred_cfg: dict, baseline_train_loop: bo
         if model is None:
             raise RuntimeError("predictor_lora model was not registered before init_opt")
         pred_params = trainable_predictor_lora_params(model)
-        if not pred_params:
-            raise RuntimeError("predictor LoRA is enabled but no trainable predictor-LoRA params were found")
+        full_ft_params = trainable_predictor_full_ft_params(model)
+        if not pred_params and not full_ft_params:
+            raise RuntimeError(
+                "predictor LoRA/full-FT is enabled but no trainable predictor params were found"
+            )
         first_kwargs = opt_kwargs[0]
         lr_mult = pred_cfg["lr_mult"]
         ref_lr = _opt_ref_lr(first_kwargs)
         warmup_steps = int((first_kwargs.get("warmup") or 0.0) * iterations_per_epoch)
-        pred_group = {
-            "diagnostic_name": "predictor_lora",
-            "params": pred_params,
-            "mc_warmup_steps": warmup_steps,
-            "mc_start_lr": (first_kwargs.get("start_lr") or 0.0) * lr_mult,
-            "mc_ref_lr": (ref_lr or 0.0) * lr_mult,
-            "mc_final_lr": (first_kwargs.get("final_lr") or 0.0) * lr_mult,
-            "mc_ref_wd": pred_cfg["weight_decay"],
-            "mc_final_wd": pred_cfg["weight_decay"],
-        }
-        optimizers[0].add_param_group(pred_group)
-        logger.info(
-            "Added predictor-LoRA optimizer group to optimizer[0]: params=%d lr_mult=%.3f wd=%.5f",
-            sum(p.numel() for p in pred_params),
-            lr_mult,
-            pred_cfg["weight_decay"],
-        )
+        if pred_params:
+            pred_group = {
+                "diagnostic_name": "predictor_lora",
+                "params": pred_params,
+                "mc_warmup_steps": warmup_steps,
+                "mc_start_lr": (first_kwargs.get("start_lr") or 0.0) * lr_mult,
+                "mc_ref_lr": (ref_lr or 0.0) * lr_mult,
+                "mc_final_lr": (first_kwargs.get("final_lr") or 0.0) * lr_mult,
+                "mc_ref_wd": pred_cfg["weight_decay"],
+                "mc_final_wd": pred_cfg["weight_decay"],
+            }
+            optimizers[0].add_param_group(pred_group)
+            logger.info(
+                "Added predictor-LoRA optimizer group to optimizer[0]: params=%d lr_mult=%.3f wd=%.5f",
+                sum(p.numel() for p in pred_params),
+                lr_mult,
+                pred_cfg["weight_decay"],
+            )
+        if full_ft_params:
+            # Slightly higher LR for randomly/copy-init extra blocks.
+            ft_mult = float(pred_cfg.get("full_ft_lr_mult", max(lr_mult, 1.0)))
+            ft_group = {
+                "diagnostic_name": "predictor_full_ft",
+                "params": full_ft_params,
+                "mc_warmup_steps": warmup_steps,
+                "mc_start_lr": (first_kwargs.get("start_lr") or 0.0) * ft_mult,
+                "mc_ref_lr": (ref_lr or 0.0) * ft_mult,
+                "mc_final_lr": (first_kwargs.get("final_lr") or 0.0) * ft_mult,
+                "mc_ref_wd": pred_cfg["weight_decay"],
+                "mc_final_wd": pred_cfg["weight_decay"],
+            }
+            optimizers[0].add_param_group(ft_group)
+            logger.info(
+                "Added predictor full-FT optimizer group to optimizer[0]: params=%d lr_mult=%.3f wd=%.5f",
+                sum(p.numel() for p in full_ft_params),
+                ft_mult,
+                pred_cfg["weight_decay"],
+            )
         return optimizers, scalers, schedulers, wd_schedulers
 
     base_eval.init_opt = init_opt_with_predictor_lora

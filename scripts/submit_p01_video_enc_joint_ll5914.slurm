@@ -4,8 +4,8 @@
 #SBATCH --partition=h100_tandon
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:h100:2
-#SBATCH --cpus-per-task=16
+#SBATCH --gres=gpu:h100:1
+#SBATCH --cpus-per-task=24
 #SBATCH --mem=384GB
 #SBATCH --time=03:00:00
 #SBATCH --output=/scratch/ll5914/logs/p01_video_enc_%j.out
@@ -46,7 +46,7 @@ config_path   = Path('${CONFIG_PATH}')
 with template_path.open() as f:
     cfg = yaml.safe_load(f)
 cfg['nodes'] = 1
-cfg['tasks_per_node'] = 2
+cfg['tasks_per_node'] = 1
 cfg['cpus_per_task'] = 16
 cfg['tag']  = '${TAG}'
 cfg['eval_name'] = 'app.hdepic_lora_action_anticipation'
@@ -96,7 +96,7 @@ print(f'Config: {config_path}')
 PY
 
 cd "${VJEPA_ROOT}"
-"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0 cuda:1
+"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0
 RUN_DIR="${OUTPUT_DIR}/action_anticipation_frozen/${TAG}"
 touch "${RUN_DIR}/.stage1_complete"
 echo "P01 video-only joint training complete: $(date)"

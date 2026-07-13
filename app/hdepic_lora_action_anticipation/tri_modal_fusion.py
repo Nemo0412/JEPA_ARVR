@@ -346,6 +346,22 @@ class ImuTrajectoryLoader:
         pose_cfg.setdefault("enabled", True)
         self.pose_loader = SlamPoseLoader({**cfg, "pose": pose_cfg}, gate=gate)
         self.k_max = int(pose_cfg.get("interframe_k_max", 128))
+        # Clip-level cache: IMU features are deterministic given (video, frames).
+        # Avoids re-slicing SLAM zips every epoch (main CPU stall → low GPU util).
+        self._imu_cache: dict[tuple, np.ndarray | None] = {}
+        self._cache_hits = 0
+        self._cache_misses = 0
+
+    @staticmethod
+    def _cache_key(meta) -> tuple:
+        frame_indices = meta.get("frame_indices")
+        if hasattr(frame_indices, "detach"):
+            frame_indices = frame_indices.detach().cpu().numpy()
+        if frame_indices is None:
+            fi = ()
+        else:
+            fi = tuple(np.asarray(frame_indices, dtype=np.int64).tolist())
+        return (str(meta.get("video_id", "")), fi, int(meta.get("start_frame", -1) or -1))
 
     def load_batch(self, metadata, device: torch.device) -> tuple[torch.Tensor, torch.Tensor] | None:
         if metadata is None:
@@ -375,12 +391,18 @@ class ImuTrajectoryLoader:
         return imu_t, len_t
 
     def _query_imu_6d(self, meta) -> np.ndarray | None:
-        mats = self.pose_loader.query_interframe_matrices(meta, self.k_max)
-        if mats is None:
-            return None
+        key = self._cache_key(meta)
+        if key in self._imu_cache:
+            self._cache_hits += 1
+            cached = self._imu_cache[key]
+            return None if cached is None else cached.copy()
+        self._cache_misses += 1
+        # Do NOT call query_interframe_matrices first — it reloads the same clip
+        # record and was only used as a null-check, doubling SLAM zip work.
         record = self.pose_loader._load_clip_record(meta)  # noqa: SLF001
         frame_ts = self.pose_loader.frame_timestamps_us(meta)
         if record is None or frame_ts is None:
+            self._imu_cache[key] = None
             return None
         t_vid = int(frame_ts.shape[0])
         out = np.zeros((t_vid, self.k_max, 6), dtype=np.float32)
@@ -394,7 +416,15 @@ class ImuTrajectoryLoader:
             vel = seg.linear_vel if seg.linear_vel is not None else np.zeros((seg.timestamps_us.size, 3), np.float32)
             feats = np.concatenate([gyro.astype(np.float32), vel.astype(np.float32)], axis=1)
             out[i] = window_smooth_pose_matrix(feats, self.k_max)
-        return out
+        self._imu_cache[key] = out
+        if (self._cache_hits + self._cache_misses) % 500 == 0:
+            logger.info(
+                "ImuTrajectoryLoader cache: hits=%d misses=%d size=%d",
+                self._cache_hits,
+                self._cache_misses,
+                len(self._imu_cache),
+            )
+        return out.copy()
 
 
 class TriModalFusionAdaptedModel(nn.Module):
