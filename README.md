@@ -12,7 +12,7 @@ eval_name: app.hdepic_lora_action_anticipation
 
 ## Best Val Action Top-5 (as of 2026-07-13)
 
-Metric: **val action Top-5 accuracy** from `topk_log_r0.csv` (preferred).  
+Metric: **val action Top-5 accuracy** from `topk_log_r0.csv`.  
 Backbone: **ViT-L/16 @ 256**, horizon ≈ **1s**, temporal sampling `phd_reference` unless noted.  
 Cluster runs use **1×H100** unless noted.
 
