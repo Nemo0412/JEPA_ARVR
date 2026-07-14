@@ -40,8 +40,6 @@ Cluster runs use **1×H100** unless noted.
 
 **P01 leader:** Gaze+pose joint v2 (heads) **42.74%**.
 
-> Note: joint **40.44% / 42.74%** are not a fair depth comparison against arch-depth runs (~39%). Joint also trains classifier heads + predictor LoRA; arch-depth freezes the probe and only trains the predictor (see recipes below).
-
 #### Best P01 checkpoint (saved on scratch)
 
 ```text
@@ -56,97 +54,84 @@ Cluster runs use **1×H100** unless noted.
 ### Known issues fixed recently
 
 1. **`--debugmode false` bug:** `argparse` `type=bool` makes `bool("false") is True`, forcing single-GPU debug path. Fixed parser in `vjepa2/evals/main.py` and removed the bad flag from submit scripts; parent now `join()`s workers.
-2. **Gaze joint collapse:** full 50M probe + predictor LoRA caused action forgetting (train action↓, verb/noun↑). Joint v2 keeps pooler frozen and trains **heads only**.
+2. **Gaze joint collapse:** full probe + predictor LoRA caused action forgetting. Joint keeps pooler frozen and trains **heads only**.
 3. **Arch depth14 `KeyError: 'predictor'`:** depth must be set under `model_kwargs.pretrain_kwargs.predictor`, not `model_kwargs.predictor`.
 
 ---
 
-## Training recipes
+## How we train
 
-Default backbone checkpoint: V-JEPA2 ViT-L predictor has **12** blocks. Entry point:
+Default V-JEPA2 ViT-L predictor depth is **12**. Entry:
 
 ```text
 eval_name: app.hdepic_lora_action_anticipation
 ```
 
-### 1) Stage-1 → predictor / joint (standard)
+### What the reported numbers use
 
-| Stage | Trainable | Frozen | Typical script |
+| Step | Trains | Frozen / loaded | Scripts |
 |---|---|---|---|
-| **Stage-1** | Probe (+ heads) + encoder LoRA | Predictor (pretrained) | `scripts/submit_p01_*` stage-1 / EGTEA video or gaze |
-| **Stage-2 predictor-only** | Predictor LoRA | Encoder LoRA + probe (load stage-1 best) | `submit_p01_*_predictor_*.slurm` / EGTEA `*_predictor_*` |
-| **Joint v2 (preferred)** | Predictor LoRA + **classifier heads** | Encoder LoRA; **pooler** (`freeze_pooler=True`) | `submit_p01_video_pred_joint_ll5914.slurm`, `submit_p01_gazepose_pred_joint_ll5914.slurm` |
-| **Joint v1 (legacy)** | Predictor LoRA + **full probe** @ small LR | Encoder LoRA | Avoid on P01 gaze — collapses |
+| **Stage-1** | Probe (+ heads) + encoder LoRA | Predictor = pretrained | EGTEA / P01 stage-1 |
+| **Stage-2 predictor-only** | Predictor LoRA on **all** blocks (`last_n_blocks: 0`) | Encoder LoRA + probe from stage-1 | `*_predictor_*.slurm` |
+| **Joint** (video **40.44%**, gaze+pose **42.74%**) | Predictor LoRA on **all** blocks + **classifier heads** | Encoder LoRA frozen; **pooler frozen** | `submit_p01_video_pred_joint_ll5914.slurm`, `submit_p01_gazepose_pred_joint_ll5914.slurm` |
 
-**Joint v2 knobs (conceptually):**
+**Video joint (baseline):**
 
 ```yaml
+model_kwargs.pretrain_kwargs.predictor.depth: 12
 experiment.lora:
   train_heads: true
-  freeze_pooler: true          # do NOT train the full ATTPooler
-  load_probe_heads: true
+  freeze_pooler: true
   pretrained_probe: <stage1>/best.pt
-  encoder_lora:
-    freeze: true
-    load_checkpoint_path: <stage1>/encoder_lora_best.pt
-  predictor_lora:
-    enabled: true
-    last_n_blocks: 2           # or more; LoRA on last N of the 12 blocks
+  encoder_lora: { freeze: true, load_checkpoint_path: <stage1>/encoder_lora_best.pt, last_n_blocks: 0 }
+  predictor_lora: { enabled: true, last_n_blocks: 0 }   # 0 = LoRA on every predictor block
 ```
 
-Warm-start from stage-1 `best.pt` + `encoder_lora_best.pt`. Metric / early-stop: **`val-action-top5`**.
+Metric / early-stop: **`val-action-top5`**.
 
-### 2) Changing predictor depth (+2 / −2 / baseline 12)
+### Depth ±n when baseline is video joint
 
-Used to ablate **architecture depth**, not LoRA coverage. Correct recipe: after changing depth, **fully retrain the entire predictor** (not only the last 2 blocks). Encoder LoRA + probe stay frozen from video stage-1.
+Keep the **same joint setup** (heads on, pooler frozen, encoder frozen). Only change predictor depth. After changing depth, **full-FT the entire predictor** (all blocks + embeds), not only the last 2 layers.
 
-| Variant | Depth | Init | Train |
+| | Depth | Init | Train |
 |---|---:|---|---|
-| **−2** | 10 | Build 10 blocks; `strict=False` load keeps pretrained blocks **0..9**, drops **10..11** | Full-FT **all** predictor params |
-| **12 (control)** | 12 | Standard ckpt; all keys match | Full-FT **all** predictor params |
-| **+2** | 14 | Build 14 blocks; load 12 with `strict=False` (new blocks missing); **copy-init** blocks 12–13 from block 11 | Full-FT **all** predictor params |
-
-**Config path for depth (important):**
+| **Baseline (video joint)** | 12 | Standard ckpt | Heads + predictor LoRA (all blocks) |
+| **−n** (e.g. n=2 → 10) | `12-n` | `strict=False`: keep blocks `0..depth-1`, drop trailing | Heads + **full-FT entire** predictor |
+| **+n** (e.g. n=2 → 14) | `12+n` | Load 12-block ckpt (`strict=False`); **copy-init** new blocks from block 11 (`copy_init_from_pretrained: 12`) | Heads + **full-FT entire** predictor |
 
 ```yaml
 model_kwargs:
   pretrain_kwargs:
     predictor:
-      depth: 10   # or 12 or 14  — NOT model_kwargs.predictor
+      depth: 12          # set to 12-n or 12+n
 experiment.lora:
-  train_heads: false
-  encoder_lora: { freeze: true, load_checkpoint_path: <stage1>/encoder_lora_best.pt, ... }
+  train_heads: true
+  freeze_pooler: true
+  pretrained_probe: <stage1>/best.pt
+  encoder_lora: { freeze: true, load_checkpoint_path: <stage1>/encoder_lora_best.pt }
   predictor_lora:
     enabled: true
-    last_n_blocks: -1              # skip LoRA injection
-    full_ft_last_n_blocks: 10      # >= num blocks ⇒ entire predictor
-    copy_init_from_pretrained: 0   # 12 when depth=14; 0 when depth≤12
+    last_n_blocks: -1              # no LoRA
+    full_ft_last_n_blocks: <depth> # >= depth ⇒ entire predictor
+    copy_init_from_pretrained: 12  # only if depth > 12; else 0
 ```
 
-Code: `copy_init_extra_predictor_blocks` + `set_predictor_full_ft_last_n` in  
-`app/hdepic_lora_action_anticipation/predictor_lora.py` (wired from `eval.py`).  
-When `full_ft_last_n_blocks >= depth`, the log should say  
-`Enabled full fine-tune on ENTIRE predictor`.
+Depth field path: `model_kwargs.pretrain_kwargs.predictor.depth` only.  
+Code: `predictor_lora.py` (`copy_init_extra_predictor_blocks`, `set_predictor_full_ft_last_n`).  
+Expect log: `Enabled full fine-tune on ENTIRE predictor`.
 
-**Submit scripts (P01 video-only, current full-pred dirs):**
+Note: `submit_p01_predictor_arch_depth{10,12,14}_*.slurm` (`arch_depth*_fullpred/`) freeze the probe and train predictor only — that is a **different** protocol from video-joint ±n.
 
-- `scripts/submit_p01_predictor_arch_depth10_ll5914.slurm` → `.../arch_depth10_fullpred/`
-- `scripts/submit_p01_predictor_arch_depth12_ll5914.slurm` → `.../arch_depth12_fullpred/`
-- `scripts/submit_p01_predictor_arch_depth14_ll5914.slurm` → `.../arch_depth14_fullpred/`
+### Naming
 
-**Fairness:** compare 10 / 12 / 14 only under this full-pred recipe. Do **not** score them against joint v2 Top-5 without also matching heads+LoRA training.
+| Name | Means |
+|---|---|
+| **Stage-1** | Probe + encoder LoRA |
+| **Stage-2 / predictor-only** | Predictor LoRA; enc/probe frozen |
+| **Joint** | Predictor LoRA (all blocks) + heads; pooler frozen |
+| **Joint ±n** | Same as joint, but depth `12±n` and full-FT entire predictor |
 
-### Setting definitions (short)
-
-| Name | Trainable | Inputs |
-|---|---|---|
-| **Stage-1** | Probe (+ heads) + encoder LoRA | Video, or video+gaze(+pose) |
-| **Stage-2 predictor-only** | Predictor LoRA only; encoder LoRA + probe frozen from stage-1 | Same as stage-1 |
-| **Joint v1 (legacy)** | Predictor LoRA + **full** probe @ small LR | Same as stage-1 |
-| **Joint v2 (current)** | Predictor LoRA + **classifier heads** @ small LR; pooler frozen | Same as stage-1 |
-| **Arch depth full-pred** | Entire predictor (all blocks); encoder/probe frozen | Video-only so far |
-
-Gaze+pose path: `binary_input_adapter_gaze_pose_matrix` (RGB + binary gaze map + inter-frame SLAM pose patch → 5-channel adapter).
+Gaze+pose: `binary_input_adapter_gaze_pose_matrix` (RGB + gaze map + SLAM `pose_6d` patch).
 
 ---
 
