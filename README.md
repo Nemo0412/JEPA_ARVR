@@ -126,6 +126,38 @@ Code: `predictor_lora.py` (`copy_init_extra_predictor_blocks`).
 
 **Not comparable:** `submit_p01_predictor_arch_depth{10,12,14}_*.slurm` (`arch_depth*_fullpred/`) freeze heads and full-FT the predictor.
 
+### Encoder ±n when baseline is video joint (encoder depth 24)
+
+**Must re-finetune the encoder after dropping/adding layers** (do not freeze the old depth-24 Stage-1 LoRA onto a truncated trunk).
+
+| Step | Train | Freeze |
+|---|---|---|
+| **Stage-1 @ new depth** | Probe + **encoder LoRA** | Predictor pretrained |
+| **Joint** | Predictor LoRA (all blocks) + **heads** | **New** encoder LoRA + pooler |
+
+| | Encoder depth | Init | Scripts |
+|---|---:|---|---|
+| **Baseline (video joint)** | 24 | Standard | Stage-1 `p01_video_enc_clip` → joint **40.44%** |
+| **−2** | 22 | `strict=False` / truncate last 2 blocks | `submit_p01_video_enc_depth22_ll5914.slurm` → `submit_p01_video_joint_enc_depth22_ll5914.slurm` |
+| **+2** | 26 | Build depth=26; `copy_init_from_pretrained: 24` | Same recipe with depth 26 (not scripted yet) |
+
+```yaml
+# Stage-1 (−2 example)
+model_kwargs.pretrain_kwargs.encoder.depth: 22
+encoder_lora: { enabled: true, last_n_blocks: 0, arch_depth: 22 }  # train LoRA
+predictor_lora: { enabled: false }
+
+# Joint (−2): identical to video joint except encoder.depth / arch_depth
+encoder.depth: 22
+train_heads: true
+freeze_pooler: true
+pretrained_probe: <enc_depth22_stage1>/best.pt
+encoder_lora: { freeze: true, arch_depth: 22, load_checkpoint_path: <enc_depth22_stage1>/encoder_lora_best.pt }
+predictor_lora: { enabled: true, last_n_blocks: 0 }
+```
+
+Code: `encoder_lora.py` (`apply_encoder_arch_depth`, `copy_init_extra_encoder_blocks`); local V-JEPA `vit_large` / `vit_large_rope` honor `depth=` (also truncate fallback via `arch_depth`).
+
 ### Naming
 
 | Name | Means |
@@ -133,7 +165,8 @@ Code: `predictor_lora.py` (`copy_init_extra_predictor_blocks`).
 | **Stage-1** | Probe + encoder LoRA |
 | **Stage-2 / predictor-only** | Predictor LoRA; enc/probe frozen |
 | **Joint** | Predictor LoRA (all blocks) + heads; pooler frozen |
-| **Joint ±n** | Same as joint (predictor LoRA + heads), depth `12±n` (+ copy-init if deeper) |
+| **Joint ±n** | Same as joint (predictor LoRA + heads), predictor depth `12±n` (+ copy-init if deeper) |
+| **Encoder ±n** | Stage-1 probe+encoder LoRA at encoder depth `24±n`; then joint (freeze that encoder LoRA) |
 
 Gaze+pose: `binary_input_adapter_gaze_pose_matrix` (RGB + gaze map + SLAM `pose_6d` patch).
 

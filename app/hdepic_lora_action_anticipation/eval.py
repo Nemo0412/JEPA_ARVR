@@ -42,7 +42,9 @@ from app.hdepic_lora_action_anticipation.gaze_rnn import (
     gaze_encoder_param_names,
 )
 from app.hdepic_lora_action_anticipation.encoder_lora import (
+    apply_encoder_arch_depth,
     assert_encoder_lora_device_consistency,
+    copy_init_extra_encoder_blocks,
     inject_encoder_lora,
     load_encoder_lora_checkpoint,
     make_grad_scaler,
@@ -1979,6 +1981,12 @@ def _patch_for_encoder_lora(base_eval, enc_cfg: dict, baseline_train_loop: bool)
 
     def init_module_with_encoder_lora(*args, **kwargs):
         model = inner_init_module(*args, **kwargs)
+        arch_depth = int(enc_cfg.get("arch_depth", 0) or 0)
+        if arch_depth > 0:
+            apply_encoder_arch_depth(model, arch_depth)
+        n_pretrained = int(enc_cfg.get("copy_init_from_pretrained", 0) or 0)
+        if n_pretrained > 0:
+            copy_init_extra_encoder_blocks(model, n_pretrained=n_pretrained)
         inject_encoder_lora(
             model,
             rank=enc_cfg["rank"],

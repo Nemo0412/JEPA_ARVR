@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=p01_jnt_d14
+#SBATCH --job-name=p01_enc_d22
 #SBATCH --account=torch_pr_674_tandon_advanced
 #SBATCH --partition=h100_tandon
 #SBATCH --nodes=1
@@ -8,17 +8,15 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=384GB
 #SBATCH --time=03:00:00
-#SBATCH --output=/scratch/ll5914/logs/p01_jnt_d14_%j.out
-#SBATCH --error=/scratch/ll5914/logs/p01_jnt_d14_%j.err
+#SBATCH --output=/scratch/ll5914/logs/p01_enc_d22_%j.out
+#SBATCH --error=/scratch/ll5914/logs/p01_enc_d22_%j.err
 
 set -euo pipefail
 
-# Video joint +2 (depth 14 vs baseline depth 12).
-# Fair vs video joint: heads on, pooler frozen, encoder LoRA frozen,
-# predictor LoRA on ALL blocks. New blocks copy-init from block 11.
-#
-# GPU util fix: stage P01 videos to /dev/shm; disable activation checkpointing.
-# See submit_p01_video_joint_depth10_ll5914.slurm for details.
+# Stage-1 for encoder depth −2 (24 -> 22), fair vs video joint baseline.
+# Drop last 2 encoder blocks (strict=False load of vitl.pt), then train
+# probe + encoder LoRA on the truncated encoder (must finetune encoder).
+# After this finishes, run submit_p01_video_joint_enc_depth22_ll5914.slurm.
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
 PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
@@ -28,20 +26,10 @@ ANN_DIR="/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/clip_split"
 VIDEO_ROOT_REMOTE="/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_videos"
 HDEPIC_ANN_ROOT="/scratch/ll5914/datasets/HD-EPIC/hd-epic-annotations/narrations-and-action-segments"
 CHECKPOINT="/scratch/ll5914/models/vjepa2/vitl.pt"
-STAGE1_DIR="${STAGE1_DIR:-/scratch/ll5914/experiments/p01_video_enc_clip/action_anticipation_frozen/p01-video-enc-clip-vitl16-256-10ep}"
-STAGE1_PROBE="${STAGE1_DIR}/best.pt"
-STAGE1_ENCODER_LORA="${STAGE1_DIR}/encoder_lora_best.pt"
 
-OUTPUT_DIR="/scratch/ll5914/experiments/p01_predictor_depth_sweep/video_joint_depth14"
-CONFIG_PATH="/scratch/ll5914/logs/p01_video_joint_depth14_config.yaml"
-TAG="p01-video-joint-depth14-vitl16-256-10ep"
-
-for f in "${STAGE1_PROBE}" "${STAGE1_ENCODER_LORA}"; do
-    if [[ ! -f "${f}" ]]; then
-        echo "ERROR: stage-1 checkpoint missing: ${f}" >&2
-        exit 1
-    fi
-done
+OUTPUT_DIR="/scratch/ll5914/experiments/p01_encoder_depth_sweep/video_enc_depth22"
+CONFIG_PATH="/scratch/ll5914/logs/p01_video_enc_depth22_config.yaml"
+TAG="p01-video-enc-depth22-vitl16-256-10ep"
 
 export MASTER_PORT=$((20000 + (${SLURM_JOB_ID:-$$} % 20000)))
 export OMP_NUM_THREADS=1
@@ -60,11 +48,9 @@ cleanup_stage() {
 trap cleanup_stage EXIT
 
 echo "========================================================"
-echo "Video joint +2: depth=14, heads + predictor LoRA (all blocks, copy-init)"
+echo "Stage-1 encoder −2: depth=22, probe + encoder LoRA"
 echo "Job=${SLURM_JOB_ID:-manual} MASTER_PORT=${MASTER_PORT}"
-echo "Stage-1: ${STAGE1_DIR}"
 echo "Out: ${OUTPUT_DIR}"
-echo "Remote videos: ${VIDEO_ROOT_REMOTE}"
 echo "Staging to: ${STAGE_ROOT}"
 df -h /dev/shm || true
 echo "Start: $(date)"
@@ -74,7 +60,6 @@ mkdir -p "${STAGE_ROOT}/P01"
 echo "Copying P01 videos into RAM disk (follow symlinks)..."
 rsync -aL --info=stats2 "${VIDEO_ROOT_REMOTE}/P01/" "${STAGE_ROOT}/P01/"
 echo "Stage done: $(du -sh "${STAGE_ROOT}" | awk '{print $1}') @ $(date)"
-ls "${STAGE_ROOT}/P01" | wc -l
 
 export PYTHONPATH="${PROJECT_ROOT}:${VJEPA_ROOT}:${PYTHONPATH:-}"
 
@@ -112,16 +97,13 @@ opt.update({'batch_size': 16, 'num_epochs': 10, 'use_bfloat16': True,
     'use_focal_loss': False, 'val_every_epochs': 1, 'best_metric': 'val-action-top5',
     'early_stopping_patience': 3, 'grad_clip': 1.0,
     'multihead_kwargs': [{'weight_decay': 0.0001, 'final_weight_decay': 0.0001,
-        'lr': 0.00002, 'start_lr': 0.0, 'final_lr': 0.0, 'warmup': 1}]})
+        'lr': 0.0001, 'start_lr': 0.0, 'final_lr': 0.0, 'warmup': 2}]})
 cfg['model_kwargs']['checkpoint'] = '${CHECKPOINT}'
-cfg['model_kwargs']['pretrain_kwargs']['predictor']['depth'] = 14
+# Truncate ViT-L encoder 24 -> 22 (drop trailing blocks; strict=False load).
+cfg['model_kwargs']['pretrain_kwargs']['encoder']['depth'] = 22
 cfg['experiment']['lora'] = {
     'enabled': True, 'rank': 8, 'alpha': 16.0, 'dropout': 0.05,
-    'probe_train_mode': 'full',
-    'train_heads': True,
-    'freeze_pooler': True,
-    'load_probe_heads': True,
-    'pretrained_probe': '${STAGE1_PROBE}',
+    'probe_train_mode': 'full', 'train_heads': True, 'pretrained_probe': '',
     'align_reference_metrics': True, 'val_metric_scope': 'native',
     'val_metric_aggregation': 'metric_wise_max', 'class_space': 'train_only',
     'temporal_sampling': 'phd_reference', 'output_regularization': {'enabled': False},
@@ -133,25 +115,25 @@ cfg['experiment']['lora'] = {
     'encoder_lora': {
         'enabled': True, 'rank': 8, 'alpha': 16.0, 'dropout': 0.05,
         'last_n_blocks': 0, 'lr_mult': 0.5, 'weight_decay': 0.0001,
-        'activation_checkpointing': False, 'target_suffixes': ['attn.qkv', 'attn.proj'],
-        'load_checkpoint_path': '${STAGE1_ENCODER_LORA}',
-        'warm_start_at_init': True, 'freeze': True,
+        'activation_checkpointing': False,
+        'target_suffixes': ['attn.qkv', 'attn.proj'],
+        'arch_depth': 22,
+        'copy_init_from_pretrained': 0,
     },
-    'predictor_lora': {
-        'enabled': True, 'rank': 8, 'alpha': 16.0, 'dropout': 0.05,
-        'last_n_blocks': 0, 'lr_mult': 0.5, 'weight_decay': 0.0001,
-        'copy_init_from_pretrained': 12,
-        'activation_checkpointing': False, 'target_suffixes': ['attn.qkv', 'attn.proj'],
-    },
+    'predictor_lora': {'enabled': False},
     'gaze': {'mode': 'none'},
 }
 config_path.parent.mkdir(parents=True, exist_ok=True)
 Path('${OUTPUT_DIR}').mkdir(parents=True, exist_ok=True)
 with config_path.open('w') as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
-print(f'Config: {config_path} joint depth=14 heads+predictor LoRA (shm-staged)')
+print(f'Config: {config_path} encoder.depth=22 stage-1')
 PY
 
 cd "${VJEPA_ROOT}"
 "${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0
-echo "P01 video joint depth14 (LoRA) complete: $(date)"
+
+RUN_DIR="${OUTPUT_DIR}/action_anticipation_frozen/${TAG}"
+touch "${RUN_DIR}/.stage1_complete"
+echo "Stage-1 encoder depth22 complete: $(date)"
+echo "Checkpoints: ${RUN_DIR}/{best.pt,encoder_lora_best.pt}"
