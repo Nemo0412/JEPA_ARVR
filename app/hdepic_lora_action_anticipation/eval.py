@@ -61,6 +61,7 @@ from app.hdepic_lora_action_anticipation.predictor_lora import (
     parse_predictor_lora_cfg,
     save_predictor_lora_checkpoint,
     set_predictor_full_ft_last_n,
+    set_predictor_lora_trainable,
     train_one_epoch_predictor_lora,
     trainable_predictor_full_ft_params,
     trainable_predictor_lora_params,
@@ -658,7 +659,8 @@ def _patch_post_train_test_eval(base_eval, args_eval, dumper=None):
             rank=rank_local,
             num_workers=data_cfg.get("val_num_workers", data_cfg.get("num_workers", 12)),
             pin_mem=data_cfg.get("pin_memory", True),
-            persistent_workers=False,
+            persistent_workers=bool(data_cfg.get("persistent_workers", True)),
+            prefetch_factor=int(data_cfg.get("prefetch_factor", 4) or 4),
         )
         kwargs.update(
             data_loader=test_loader,
@@ -2133,6 +2135,20 @@ def _patch_for_predictor_lora(base_eval, pred_cfg: dict, baseline_train_loop: bo
             if pred is not None and hasattr(pred, "use_activation_checkpointing"):
                 pred.use_activation_checkpointing = True
                 logger.info("Enabled predictor activation checkpointing for predictor LoRA")
+        warm_path = pred_cfg.get("load_checkpoint_path")
+        if pred_cfg.get("warm_start_at_init") and warm_path and Path(warm_path).exists():
+            missing, unexpected = load_predictor_lora_checkpoint(model, str(warm_path), strict=False)
+            logger.info(
+                "Warm-started predictor LoRA from %s; missing=%d unexpected=%d",
+                warm_path,
+                len(missing),
+                len(unexpected),
+            )
+        elif pred_cfg.get("warm_start_at_init") and warm_path:
+            logger.warning("Predictor LoRA warm-start checkpoint not found: %s", warm_path)
+        if pred_cfg.get("freeze"):
+            frozen = set_predictor_lora_trainable(model, trainable=False)
+            logger.info("Froze predictor LoRA params after init: %d", frozen)
         assert_predictor_lora_device_consistency(model)
         base_eval._predictor_lora_model = model
         return model
@@ -2149,6 +2165,8 @@ def _patch_for_predictor_lora(base_eval, pred_cfg: dict, baseline_train_loop: bo
         )
         model = getattr(base_eval, "_binary_input_adapter_model", None)
         if model is None:
+            model = getattr(base_eval, "_tri_modal_fusion_model", None)
+        if model is None:
             model = getattr(base_eval, "_encoder_output_gaze_model", None)
         if model is None:
             model = getattr(base_eval, "_encoder_lora_model", None)
@@ -2159,6 +2177,11 @@ def _patch_for_predictor_lora(base_eval, pred_cfg: dict, baseline_train_loop: bo
         pred_params = trainable_predictor_lora_params(model)
         full_ft_params = trainable_predictor_full_ft_params(model)
         if not pred_params and not full_ft_params:
+            if pred_cfg.get("freeze"):
+                logger.info(
+                    "Predictor LoRA is frozen (warm-start only); skipping predictor-LoRA optimizer group"
+                )
+                return optimizers, scalers, schedulers, wd_schedulers
             raise RuntimeError(
                 "predictor LoRA/full-FT is enabled but no trainable predictor params were found"
             )

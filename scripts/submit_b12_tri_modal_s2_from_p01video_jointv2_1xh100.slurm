@@ -13,12 +13,14 @@
 
 set -euo pipefail
 
-# Stage-2 tri-modal resume chunks (cluster util-kill ~2h @ <60%).
+# Tri-modal Stage-2 warm-started from Video joint v2 (heads) best Top-5=40.44% @ep3.
 #
-# 13489272 still util-killed: previous "prefetch" only async'd gaze/IMU AFTER a
-# synchronous next(dataloader) on the main thread — video-decode spikes
-# (10–40s) still idled the GPU. Fix: background producer queue for
-# next(loader)+aux (TRI_MODAL_PREFETCH_DEPTH). Also bs=16, more workers.
+# Warm-start:
+#   - probe heads from joint-v2 best.pt  (pooler stays frozen)
+#   - encoder LoRA from joint-v2 encoder_lora_best.pt  (continue train)
+#   - predictor LoRA from joint-v2 predictor_lora_best.pt  (FROZEN)
+# New train: GazeSpatialEncoder + ImuTemporalEncoder + ProjectedTriModalCrossAttention
+# Soft FT: classifier heads @ 2e-5; fusion lr_mult=0.25 → ~5e-6
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
 PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
@@ -29,13 +31,14 @@ VIDEO_ROOT="/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_videos"
 HDEPIC_ANN_ROOT="/scratch/ll5914/datasets/HD-EPIC/hd-epic-annotations/narrations-and-action-segments"
 CHECKPOINT="/scratch/ll5914/models/vjepa2/vitl.pt"
 
-STAGE1_RUN="/scratch/ll5914/experiments/p01_video_enc_clip/action_anticipation_frozen/p01-video-enc-clip-vitl16-256-10ep"
-PROBE_CKPT="${STAGE1_RUN}/best.pt"
-ENCODER_LORA_CKPT="${STAGE1_RUN}/encoder_lora_best.pt"
+JOINT_V2_RUN="/scratch/ll5914/experiments/p01_video_pred_joint_heads_clip/action_anticipation_frozen/p01-video-pred-joint-heads-vitl16-256-10ep"
+PROBE_CKPT="${JOINT_V2_RUN}/best.pt"
+ENCODER_LORA_CKPT="${JOINT_V2_RUN}/encoder_lora_best.pt"
+PREDICTOR_LORA_CKPT="${JOINT_V2_RUN}/predictor_lora_best.pt"
 
-OUTPUT_DIR="/scratch/ll5914/experiments/tri_modal_fusion_s2_from_p01video"
-CONFIG_PATH="/scratch/ll5914/logs/tri_modal_fusion_s2_from_p01video_1xh100_config.yaml"
-TAG="tri-modal-s2-from-p01video-ep6best-vitl16-256-10ep-1xh100"
+OUTPUT_DIR="/scratch/ll5914/experiments/tri_modal_fusion_s2_from_p01video_jointv2"
+CONFIG_PATH="/scratch/ll5914/logs/tri_modal_fusion_s2_from_p01video_jointv2_1xh100_config.yaml"
+TAG="tri-modal-s2-from-p01video-jointv2-ep3best-vitl16-256-10ep-1xh100"
 RUN_DIR="${OUTPUT_DIR}/action_anticipation_frozen/${TAG}"
 
 GAZE_EXTRACT_ROOT="/scratch/ll5914/datasets/HD-EPIC/_gaze_extract"
@@ -53,18 +56,22 @@ if [[ -f "${RUN_DIR}/latest.pt" && -f "${RUN_DIR}/tri_modal_fusion_latest.pt" ]]
   if [[ -f "${RUN_DIR}/encoder_lora_latest.pt" ]]; then
     ENCODER_LORA_CKPT="${RUN_DIR}/encoder_lora_latest.pt"
   fi
+  if [[ -f "${RUN_DIR}/predictor_lora_latest.pt" ]]; then
+    PREDICTOR_LORA_CKPT="${RUN_DIR}/predictor_lora_latest.pt"
+  fi
 fi
 
 echo "========================================================"
-echo "Tri-modal Stage-2 — 1xH100 async-prefetch + bs16"
+echo "Tri-modal Stage-2 from Video joint v2 (40.44% @ep3) — 1xH100"
 echo "Job  : ${SLURM_JOB_ID:-manual}  Node: $(hostname)"
 echo "Start: $(date)"
 echo "Resume: ${RESUME}"
 echo "Probe : ${PROBE_CKPT}"
 echo "EncLoRA: ${ENCODER_LORA_CKPT}"
+echo "PredLoRA: ${PREDICTOR_LORA_CKPT} (frozen)"
 echo "========================================================"
 
-for f in "${PROBE_CKPT}" "${ENCODER_LORA_CKPT}" "${POSE_MAPPING_JSON}" "${CHECKPOINT}"; do
+for f in "${PROBE_CKPT}" "${ENCODER_LORA_CKPT}" "${PREDICTOR_LORA_CKPT}" "${POSE_MAPPING_JSON}" "${CHECKPOINT}"; do
   if [[ ! -f "${f}" ]]; then
     echo "ERROR: missing required file: ${f}" >&2
     exit 1
@@ -109,13 +116,13 @@ data.update({
 })
 opt = cfg['experiment']['optimization']
 opt.update({
-    # bs16 + actckpt: fewer iters (~369), heavier GPU step, ~55GB@bs12 had headroom.
     'batch_size': 16, 'num_epochs': 10, 'use_bfloat16': True,
     'use_focal_loss': False, 'val_every_epochs': 3, 'best_metric': 'val-action-top5',
     'early_stopping_patience': 3, 'grad_clip': 1.0,
+    # Match joint-v2 head LR so we don't wash out the 40.44% heads.
     'multihead_kwargs': [{
         'weight_decay': 0.0001, 'final_weight_decay': 0.0001,
-        'lr': 0.0001, 'start_lr': 0.0, 'final_lr': 0.0, 'warmup': 2,
+        'lr': 0.00002, 'start_lr': 0.0, 'final_lr': 0.0, 'warmup': 1,
     }],
 })
 cfg['model_kwargs']['checkpoint'] = '${CHECKPOINT}'
@@ -123,7 +130,7 @@ cfg['model_kwargs']['module_name'] = 'evals.action_anticipation_frozen.modelcust
 cfg['experiment']['classifier'] = {'num_probe_blocks': 4, 'num_heads': 16}
 cfg['experiment']['lora'] = {
     'enabled': True, 'rank': 8, 'alpha': 16.0, 'dropout': 0.05,
-    'probe_train_mode': 'full', 'train_heads': True,
+    'probe_train_mode': 'full', 'train_heads': True, 'freeze_pooler': True,
     'pretrained_probe': '${PROBE_CKPT}',
     'load_probe_heads': True,
     'align_reference_metrics': True, 'val_metric_scope': 'native',
@@ -143,7 +150,17 @@ cfg['experiment']['lora'] = {
         'load_checkpoint_path': '${ENCODER_LORA_CKPT}',
         'checkpoint_path': '${RUN_DIR}/encoder_lora_latest.pt',
     },
-    'predictor_lora': {'enabled': False},
+    # Keep joint-v2 predictor adapters in the forward pass, but do not train them.
+    'predictor_lora': {
+        'enabled': True, 'rank': 8, 'alpha': 16.0, 'dropout': 0.05,
+        'last_n_blocks': 0, 'lr_mult': 0.5, 'weight_decay': 0.0001,
+        'activation_checkpointing': True,
+        'target_suffixes': ['attn.qkv', 'attn.proj'],
+        'warm_start_at_init': True,
+        'freeze': True,
+        'load_checkpoint_path': '${PREDICTOR_LORA_CKPT}',
+        'checkpoint_path': '${RUN_DIR}/predictor_lora_latest.pt',
+    },
     'gaze': {
         'mode': 'projected_tri_modal_cross_attention',
         'gaze_root': '${GAZE_ROOT}',
@@ -164,7 +181,8 @@ cfg['experiment']['lora'] = {
             'fusion_num_layers': 1,
             'use_gated_residual': True,
             'imu_hidden_dim': 128,
-            'lr_mult': 0.05,
+            # 0.25 * 2e-5 ≈ 5e-6 (same absolute fusion LR as earlier 0.05 * 1e-4).
+            'lr_mult': 0.25,
             'weight_decay': 0.0001,
             'dropout': 0.0,
             **({'load_checkpoint_path': '${RUN_DIR}/tri_modal_fusion_latest.pt'} if resume else {}),
@@ -188,7 +206,7 @@ print(f'Config written: {config_path} (resume={resume})')
 PY
 
 cd "${VJEPA_ROOT}"
-"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0 --debugmode false
+"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0
 
-echo "Tri-modal Stage-2 complete: $(date)"
-echo "Checkpoints: ${RUN_DIR}/{best.pt,encoder_lora_best.pt,tri_modal_fusion_best.pt}"
+echo "Tri-modal Stage-2 (from joint v2) complete: $(date)"
+echo "Checkpoints: ${RUN_DIR}/{best.pt,encoder_lora_best.pt,tri_modal_fusion_best.pt,predictor_lora_best.pt}"

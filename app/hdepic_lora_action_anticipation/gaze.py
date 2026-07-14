@@ -610,6 +610,7 @@ def make_clip_balanced_webvid(
     cache_reader=None,
     decoder_num_threads=None,
     debug_subset_path=None,
+    prefetch_factor=4,
     **kwargs,
 ):
     del base_path, kwargs
@@ -688,8 +689,7 @@ def make_clip_balanced_webvid(
         wds.batched(batch_size, partial=True, collation_fn=collate),
     ]
     dataset = wds.DataPipeline(*pipeline)
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
+    loader_kwargs = dict(
         batch_size=None,
         shuffle=False,
         num_workers=num_workers,
@@ -697,13 +697,20 @@ def make_clip_balanced_webvid(
         worker_init_fn=pl_worker_init_function,
         pin_memory=pin_memory,
     )
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = max(2, int(prefetch_factor))
+    dataloader = torch.utils.data.DataLoader(dataset, **loader_kwargs)
     dataloader.num_batches = len(samples) // (world_size * batch_size)
     dataloader.num_samples = len(samples)
     logger.info(
-        "Using clip-balanced HD-EPIC dataloader: samples=%d batch_size=%d workers=%d emit_metadata=%s emit_binary_map=%s cache_reader=%s decoder_num_threads=%d",
+        "Using clip-balanced HD-EPIC dataloader: samples=%d batch_size=%d workers=%d "
+        "prefetch_factor=%s persistent_workers=%s emit_metadata=%s emit_binary_map=%s "
+        "cache_reader=%s decoder_num_threads=%d",
         len(samples),
         batch_size,
         num_workers,
+        loader_kwargs.get("prefetch_factor"),
+        loader_kwargs["persistent_workers"],
         emit_metadata,
         emit_binary_map,
         cache_reader,

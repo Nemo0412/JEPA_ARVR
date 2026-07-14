@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -351,6 +353,7 @@ class ImuTrajectoryLoader:
         self._imu_cache: dict[tuple, np.ndarray | None] = {}
         self._cache_hits = 0
         self._cache_misses = 0
+        self._lock = threading.Lock()
 
     @staticmethod
     def _cache_key(meta) -> tuple:
@@ -392,17 +395,19 @@ class ImuTrajectoryLoader:
 
     def _query_imu_6d(self, meta) -> np.ndarray | None:
         key = self._cache_key(meta)
-        if key in self._imu_cache:
-            self._cache_hits += 1
-            cached = self._imu_cache[key]
-            return None if cached is None else cached.copy()
-        self._cache_misses += 1
+        with self._lock:
+            if key in self._imu_cache:
+                self._cache_hits += 1
+                cached = self._imu_cache[key]
+                return None if cached is None else cached.copy()
+            self._cache_misses += 1
         # Do NOT call query_interframe_matrices first — it reloads the same clip
         # record and was only used as a null-check, doubling SLAM zip work.
         record = self.pose_loader._load_clip_record(meta)  # noqa: SLF001
         frame_ts = self.pose_loader.frame_timestamps_us(meta)
         if record is None or frame_ts is None:
-            self._imu_cache[key] = None
+            with self._lock:
+                self._imu_cache[key] = None
             return None
         t_vid = int(frame_ts.shape[0])
         out = np.zeros((t_vid, self.k_max, 6), dtype=np.float32)
@@ -416,14 +421,15 @@ class ImuTrajectoryLoader:
             vel = seg.linear_vel if seg.linear_vel is not None else np.zeros((seg.timestamps_us.size, 3), np.float32)
             feats = np.concatenate([gyro.astype(np.float32), vel.astype(np.float32)], axis=1)
             out[i] = window_smooth_pose_matrix(feats, self.k_max)
-        self._imu_cache[key] = out
-        if (self._cache_hits + self._cache_misses) % 500 == 0:
-            logger.info(
-                "ImuTrajectoryLoader cache: hits=%d misses=%d size=%d",
-                self._cache_hits,
-                self._cache_misses,
-                len(self._imu_cache),
-            )
+        with self._lock:
+            self._imu_cache[key] = out
+            if (self._cache_hits + self._cache_misses) % 500 == 0:
+                logger.info(
+                    "ImuTrajectoryLoader cache: hits=%d misses=%d size=%d",
+                    self._cache_hits,
+                    self._cache_misses,
+                    len(self._imu_cache),
+                )
         return out.copy()
 
 
@@ -699,6 +705,91 @@ def load_tri_modal_fusion_checkpoint(model: nn.Module, path: str) -> None:
         model.imu_encoder.load_state_dict(payload["imu_encoder"], strict=False)
 
 
+def _metadata_from_udata(udata):
+    metadata = udata[3] if len(udata) > 4 else None
+    if metadata is None:
+        raise ValueError("projected_tri_modal_cross_attention requires metadata-aware dataloader")
+    return metadata
+
+
+def _prepare_aux_cpu(
+    gaze_map_builder: BinaryGazeMapBuilder,
+    imu_loader: ImuTrajectoryLoader,
+    udata,
+):
+    """CPU-side gaze rasterize + IMU load (overlapped with GPU via prefetch)."""
+    clips = udata[0]
+    metadata = _metadata_from_udata(udata)
+    _, _, frames, height, width = clips.shape
+    gaze_cpu = gaze_map_builder.build_cpu(metadata, int(frames), int(height), int(width))
+    imu_cpu = imu_loader.load_batch(metadata, torch.device("cpu"))
+    return gaze_cpu, imu_cpu
+
+
+class _TriModalBatchPrefetcher:
+    """Background producer: ``next(dataloader)`` + gaze/IMU CPU overlap GPU.
+
+    Previous code only async'd gaze/IMU *after* a synchronous ``next(loader)`` on
+    the main thread — video-decode stalls (10–40s) still idled the H100 and
+    triggered cluster util-kill. This class moves the full fetch into a worker.
+    """
+
+    def __init__(
+        self,
+        data_loader,
+        gaze_map_builder: BinaryGazeMapBuilder,
+        imu_loader: ImuTrajectoryLoader,
+        *,
+        depth: int = 3,
+    ):
+        self.data_loader = data_loader
+        self.gaze_map_builder = gaze_map_builder
+        self.imu_loader = imu_loader
+        self.depth = max(1, int(depth))
+        self._q: queue.Queue = queue.Queue(maxsize=self.depth)
+        self._stop = threading.Event()
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(target=self._run, name="tri-modal-prefetch", daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        _data_loader = iter(self.data_loader)
+        while not self._stop.is_set():
+            t0 = time.time()
+            try:
+                try:
+                    udata = next(_data_loader)
+                except Exception:
+                    _data_loader = iter(self.data_loader)
+                    udata = next(_data_loader)
+                gaze_cpu, imu_cpu = _prepare_aux_cpu(self.gaze_map_builder, self.imu_loader, udata)
+                fetch_ms = (time.time() - t0) * 1000.0
+                # Block here when GPU is behind — that is fine; producer stays warm.
+                self._q.put((udata, gaze_cpu, imu_cpu, fetch_ms))
+            except BaseException as exc:  # noqa: BLE001 — surface to consumer
+                self._error = exc
+                self._q.put(None)
+                return
+
+    def get(self):
+        item = self._q.get()
+        if item is None:
+            if self._error is not None:
+                raise RuntimeError("tri-modal batch prefetcher failed") from self._error
+            raise RuntimeError("tri-modal batch prefetcher stopped unexpectedly")
+        return item
+
+    def close(self):
+        self._stop.set()
+        # Drain so producer is not stuck on full queue.
+        try:
+            while True:
+                self._q.get_nowait()
+        except queue.Empty:
+            pass
+        self._thread.join(timeout=5.0)
+
+
 def train_one_epoch_with_tri_modal_fusion(
     base_eval,
     gaze_map_builder: BinaryGazeMapBuilder,
@@ -719,7 +810,6 @@ def train_one_epoch_with_tri_modal_fusion(
     action_classes,
     criterion,
 ):
-    _data_loader = iter(data_loader)
     model_inner = unwrap_ddp(model)
     model_inner.base_model.eval()
     model_inner.fusion.train(mode=True)
@@ -742,7 +832,8 @@ def train_one_epoch_with_tri_modal_fusion(
         base_eval.ClassMeanRecall(num_classes=len(action_classes), device=device, k=5)
         for _ in classifiers
     ]
-    data_elapsed_time_meter = AverageMeter()
+    batch_wait_meter = AverageMeter()
+    fetch_meter = AverageMeter()
     try:
         max_train_iters = int(
             os.environ.get("EVAL_MAX_TRAIN_ITERS", os.environ.get("MAX_TRAIN_ITERS", "0")) or "0"
@@ -757,115 +848,134 @@ def train_one_epoch_with_tri_modal_fusion(
         )
         ipe = max_train_iters
 
-    for itr in range(ipe):
-        itr_start_time = time.time()
-        try:
-            udata = next(_data_loader)
-        except Exception:
-            _data_loader = iter(data_loader)
-            udata = next(_data_loader)
-        [s.step() for s in scheduler]
-        [wds_.step() for wds_ in wd_scheduler]
+    # Depth>=2 so next(dataloader)+gaze/IMU stay off the main thread while GPU runs.
+    prefetch_depth = max(2, int(os.environ.get("TRI_MODAL_PREFETCH_DEPTH", "3")))
+    logger.info(
+        "tri_modal train async prefetch: depth=%d (dataloader+gaze/IMU off main thread)",
+        prefetch_depth,
+    )
+    prefetcher = _TriModalBatchPrefetcher(
+        data_loader, gaze_map_builder, imu_loader, depth=prefetch_depth
+    )
+    try:
+        for itr in range(ipe):
+            itr_start_time = time.time()
+            [s.step() for s in scheduler]
+            [wds_.step() for wds_ in wd_scheduler]
 
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
-            clips = udata[0].to(device, non_blocking=True)
-            metadata = udata[3] if len(udata) > 4 else None
-            if metadata is None:
-                raise ValueError("projected_tri_modal_cross_attention requires metadata-aware dataloader")
-            anticipation_times = udata[4].to(device, non_blocking=True)
-            labels = labels_from_udata(
-                udata, device, action_is_verb_noun, verb_classes, noun_classes, action_classes
-            )
-            gaze_map = gaze_map_builder.build(clips, metadata)
-            imu_batch = imu_loader.load_batch(metadata, device)
-            tokens = model(clips, anticipation_times, gaze_map=gaze_map, imu_batch=imu_batch)
-            if tokens is None:
-                logger.warning(
-                    "Skipping tri_modal_fusion optimizer step because tokens are non-finite at itr=%d",
-                    itr,
+            wait_t0 = time.time()
+            udata, gaze_cpu, imu_cpu, fetch_ms = prefetcher.get()
+            batch_wait_meter.update((time.time() - wait_t0) * 1000.0)
+            fetch_meter.update(float(fetch_ms))
+
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
+                clips = udata[0].to(device, non_blocking=True)
+                anticipation_times = udata[4].to(device, non_blocking=True)
+                labels = labels_from_udata(
+                    udata, device, action_is_verb_noun, verb_classes, noun_classes, action_classes
                 )
+                gaze_map = gaze_cpu.to(device, non_blocking=True)
+                if imu_cpu is None:
+                    imu_batch = None
+                else:
+                    imu_batch = (
+                        imu_cpu[0].to(device, non_blocking=True),
+                        imu_cpu[1].to(device, non_blocking=True),
+                    )
+                tokens = model(clips, anticipation_times, gaze_map=gaze_map, imu_batch=imu_batch)
+                if tokens is None:
+                    logger.warning(
+                        "Skipping tri_modal_fusion optimizer step because tokens are non-finite at itr=%d",
+                        itr,
+                    )
+                    optimizer[0].zero_grad()
+                    continue
+                tokens_proxy = tokens.detach().requires_grad_(True)
+                outputs = [c(tokens_proxy) for c in classifiers]
+
+            if action_is_verb_noun:
+                loss = [
+                    criterion(o["verb"], labels["verb"])
+                    + criterion(o["noun"], labels["noun"])
+                    + criterion(o["action"], labels["action"])
+                    for o in outputs
+                ]
+            else:
+                loss = [criterion(o["action"], labels["action"]) for o in outputs]
+
+            tokens_grad_accum = torch.zeros_like(tokens_proxy)
+            healthy_heads = 0
+            for head_idx, (l, c) in enumerate(zip(loss, classifiers)):
+                if not torch.isfinite(l.detach()):
+                    _zero_classifier_grads(c)
+                    continue
+                if tokens_proxy.grad is not None:
+                    tokens_proxy.grad.zero_()
+                scaled = scaler[0].scale(l) if use_bfloat16 else l
+                scaled.backward(retain_graph=(head_idx < len(loss) - 1))
+                head_token_grad = tokens_proxy.grad
+                if head_token_grad is None or not torch.isfinite(head_token_grad).all():
+                    _zero_classifier_grads(c)
+                    continue
+                if not _classifier_grads_finite(c):
+                    _zero_classifier_grads(c)
+                    continue
+                tokens_grad_accum.add_(head_token_grad)
+                healthy_heads += 1
+
+            if healthy_heads == 0:
                 optimizer[0].zero_grad()
+                if use_bfloat16:
+                    scaler[0].update()
                 continue
-            tokens_proxy = tokens.detach().requires_grad_(True)
-            outputs = [c(tokens_proxy) for c in classifiers]
 
-        if action_is_verb_noun:
-            loss = [
-                criterion(o["verb"], labels["verb"])
-                + criterion(o["noun"], labels["noun"])
-                + criterion(o["action"], labels["action"])
-                for o in outputs
-            ]
-        else:
-            loss = [criterion(o["action"], labels["action"]) for o in outputs]
-
-        tokens_grad_accum = torch.zeros_like(tokens_proxy)
-        healthy_heads = 0
-        for head_idx, (l, c) in enumerate(zip(loss, classifiers)):
-            if not torch.isfinite(l.detach()):
-                _zero_classifier_grads(c)
-                continue
-            if tokens_proxy.grad is not None:
-                tokens_proxy.grad.zero_()
-            scaled = scaler[0].scale(l) if use_bfloat16 else l
-            scaled.backward(retain_graph=(head_idx < len(loss) - 1))
-            head_token_grad = tokens_proxy.grad
-            if head_token_grad is None or not torch.isfinite(head_token_grad).all():
-                _zero_classifier_grads(c)
-                continue
-            if not _classifier_grads_finite(c):
-                _zero_classifier_grads(c)
-                continue
-            tokens_grad_accum.add_(head_token_grad)
-            healthy_heads += 1
-
-        if healthy_heads == 0:
-            optimizer[0].zero_grad()
+            tokens_grad_accum.mul_(1.0 / float(healthy_heads))
+            tokens.backward(gradient=tokens_grad_accum)
+            fusion_ok = _fusion_grads_finite(model)
+            if not fusion_ok:
+                _zero_fusion_grads(model)
             if use_bfloat16:
+                scaler[0].step(optimizer[0])
                 scaler[0].update()
-            continue
+            else:
+                optimizer[0].step()
+            optimizer[0].zero_grad()
 
-        tokens_grad_accum.mul_(1.0 / float(healthy_heads))
-        tokens.backward(gradient=tokens_grad_accum)
-        fusion_ok = _fusion_grads_finite(model)
-        if not fusion_ok:
-            _zero_fusion_grads(model)
-        if use_bfloat16:
-            scaler[0].step(optimizer[0])
-            scaler[0].update()
-        else:
-            optimizer[0].step()
-        optimizer[0].zero_grad()
-
-        with torch.no_grad():
-            action_metrics = [
-                m(o["action"], labels["action"]) for o, m in zip(outputs, action_metric_loggers)
-            ]
-            if action_is_verb_noun:
-                verb_metrics = [
-                    m(o["verb"], labels["verb"]) for o, m in zip(outputs, verb_metric_loggers)
+            with torch.no_grad():
+                action_metrics = [
+                    m(o["action"], labels["action"]) for o, m in zip(outputs, action_metric_loggers)
                 ]
-                noun_metrics = [
-                    m(o["noun"], labels["noun"]) for o, m in zip(outputs, noun_metric_loggers)
-                ]
-        if itr % 10 == 0 or itr == ipe - 1:
-            if action_is_verb_noun:
-                logger.info(
-                    "[%5d] acc (v/n): %.1f%% (%.1f%% %.1f%%) recall (v/n): %.1f%% (%.1f%% %.1f%%) "
-                    "healthy_heads=%d/%d fusion_ok=%s [mem: %.2e] [data: %.1f ms]",
-                    itr,
-                    max(a["accuracy"] for a in action_metrics),
-                    max(v["accuracy"] for v in verb_metrics),
-                    max(n["accuracy"] for n in noun_metrics),
-                    max(a["recall"] for a in action_metrics),
-                    max(v["recall"] for v in verb_metrics),
-                    max(n["recall"] for n in noun_metrics),
-                    healthy_heads,
-                    len(loss),
-                    fusion_ok,
-                    torch.cuda.max_memory_allocated() / 1024.0**2,
-                    data_elapsed_time_meter.avg,
-                )
+                if action_is_verb_noun:
+                    verb_metrics = [
+                        m(o["verb"], labels["verb"]) for o, m in zip(outputs, verb_metric_loggers)
+                    ]
+                    noun_metrics = [
+                        m(o["noun"], labels["noun"]) for o, m in zip(outputs, noun_metric_loggers)
+                    ]
+            if itr % 10 == 0 or itr == ipe - 1:
+                step_ms = (time.time() - itr_start_time) * 1000.0
+                if action_is_verb_noun:
+                    logger.info(
+                        "[%5d] acc (v/n): %.1f%% (%.1f%% %.1f%%) recall (v/n): %.1f%% (%.1f%% %.1f%%) "
+                        "healthy_heads=%d/%d fusion_ok=%s [mem: %.2e] "
+                        "[batch_wait: %.1f ms] [fetch: %.0f ms] [step: %.0f ms]",
+                        itr,
+                        max(a["accuracy"] for a in action_metrics),
+                        max(v["accuracy"] for v in verb_metrics),
+                        max(n["accuracy"] for n in noun_metrics),
+                        max(a["recall"] for a in action_metrics),
+                        max(v["recall"] for v in verb_metrics),
+                        max(n["recall"] for n in noun_metrics),
+                        healthy_heads,
+                        len(loss),
+                        fusion_ok,
+                        torch.cuda.max_memory_allocated() / 1024.0**2,
+                        batch_wait_meter.avg,
+                        fetch_meter.avg,
+                        step_ms,
+                    )
+    finally:
+        prefetcher.close()
 
     ret = {
         "action": {
@@ -922,7 +1032,6 @@ def validate_with_tri_modal_fusion(
         metric_scope,
         val_metric_aggregation,
     )
-    _data_loader = iter(data_loader)
     model_inner = unwrap_ddp(model)
     model_inner.base_model.eval()
     model_inner.fusion.eval()
@@ -946,75 +1055,89 @@ def validate_with_tri_modal_fusion(
         for _ in classifiers
     ]
 
-    for itr in range(ipe):
-        try:
-            udata = next(_data_loader)
-        except Exception:
-            _data_loader = iter(data_loader)
-            udata = next(_data_loader)
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
-            clips = udata[0].to(device, non_blocking=True)
-            metadata = udata[3] if len(udata) > 4 else None
-            if metadata is None:
-                raise ValueError("projected_tri_modal_cross_attention requires metadata-aware dataloader")
-            anticipation_times = udata[4].to(device, non_blocking=True)
-            labels = labels_from_udata(
-                udata, device, action_is_verb_noun, verb_classes, noun_classes, action_classes
-            )
-            gaze_map = gaze_map_builder.build(clips, metadata)
-            imu_batch = imu_loader.load_batch(metadata, device)
-            tokens = model(clips, anticipation_times, gaze_map=gaze_map, imu_batch=imu_batch)
-            if tokens is None:
-                continue
-            outputs = [c(tokens) for c in classifiers]
-            valid_actions_arg = valid_actions if use_valid_filter else None
-            valid_verbs_arg = valid_verbs if use_valid_filter else None
-            valid_nouns_arg = valid_nouns if use_valid_filter else None
-            action_metrics = [
-                m(o["action"], labels["action"], valid_actions_arg)
-                for o, m in zip(outputs, action_metric_loggers)
-            ]
-            if action_is_verb_noun:
-                verb_metrics = [
-                    m(o["verb"], labels["verb"], valid_verbs_arg)
-                    for o, m in zip(outputs, verb_metric_loggers)
-                ]
-                noun_metrics = [
-                    m(o["noun"], labels["noun"], valid_nouns_arg)
-                    for o, m in zip(outputs, noun_metric_loggers)
-                ]
-                verb_loss = sum(criterion(o["verb"], labels["verb"]) for o in outputs)
-                noun_loss = sum(criterion(o["noun"], labels["noun"]) for o in outputs)
-                action_loss = sum(criterion(o["action"], labels["action"]) for o in outputs)
-                loss = verb_loss + noun_loss + action_loss
-            else:
-                loss = sum(criterion(o["action"], labels["action"]) for o in outputs)
-        best_head_idx = max(range(len(action_metrics)), key=lambda i: action_metrics[i]["accuracy"])
-        dumper.add_batch(udata, [outputs[best_head_idx]], labels, {"verb": verb_classes, "noun": noun_classes, "action": action_classes})
-        if itr % 10 == 0 or itr == ipe - 1:
-            if action_is_verb_noun:
-                logger.info(
-                    "[%5d] acc (v/n): %.1f%% (%.1f%% %.1f%%) recall (v/n): %.1f%% (%.1f%% %.1f%%) "
-                    "loss (v/n): %.3f (%.3f %.3f) [mem: %.2e]",
-                    itr,
-                    max(a["accuracy"] for a in action_metrics),
-                    max(v["accuracy"] for v in verb_metrics),
-                    max(n["accuracy"] for n in noun_metrics),
-                    max(a["recall"] for a in action_metrics),
-                    max(v["recall"] for v in verb_metrics),
-                    max(n["recall"] for n in noun_metrics),
-                    loss,
-                    verb_loss,
-                    noun_loss,
-                    torch.cuda.max_memory_allocated() / 1024.0**2,
+    prefetch_depth = max(2, int(os.environ.get("TRI_MODAL_PREFETCH_DEPTH", "3")))
+    prefetcher = _TriModalBatchPrefetcher(
+        data_loader, gaze_map_builder, imu_loader, depth=prefetch_depth
+    )
+    try:
+        for itr in range(ipe):
+            udata, gaze_cpu, imu_cpu, _fetch_ms = prefetcher.get()
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
+                clips = udata[0].to(device, non_blocking=True)
+                labels = labels_from_udata(
+                    udata, device, action_is_verb_noun, verb_classes, noun_classes, action_classes
                 )
+                anticipation_times = udata[4].to(device, non_blocking=True)
+                gaze_map = gaze_cpu.to(device, non_blocking=True)
+                if imu_cpu is None:
+                    imu_batch = None
+                else:
+                    imu_batch = (
+                        imu_cpu[0].to(device, non_blocking=True),
+                        imu_cpu[1].to(device, non_blocking=True),
+                    )
+                tokens = model(clips, anticipation_times, gaze_map=gaze_map, imu_batch=imu_batch)
+                if tokens is None:
+                    continue
+                outputs = [c(tokens) for c in classifiers]
+                valid_actions_arg = valid_actions if use_valid_filter else None
+                valid_verbs_arg = valid_verbs if use_valid_filter else None
+                valid_nouns_arg = valid_nouns if use_valid_filter else None
+                action_metrics = [
+                    m(o["action"], labels["action"], valid_actions_arg)
+                    for o, m in zip(outputs, action_metric_loggers)
+                ]
+                if action_is_verb_noun:
+                    verb_metrics = [
+                        m(o["verb"], labels["verb"], valid_verbs_arg)
+                        for o, m in zip(outputs, verb_metric_loggers)
+                    ]
+                    noun_metrics = [
+                        m(o["noun"], labels["noun"], valid_nouns_arg)
+                        for o, m in zip(outputs, noun_metric_loggers)
+                    ]
+                else:
+                    verb_metrics = noun_metrics = None
+                if action_is_verb_noun:
+                    verb_loss = sum(criterion(o["verb"], labels["verb"]) for o in outputs)
+                    noun_loss = sum(criterion(o["noun"], labels["noun"]) for o in outputs)
+                    action_loss = sum(criterion(o["action"], labels["action"]) for o in outputs)
+                    loss = verb_loss + noun_loss + action_loss
+                else:
+                    verb_loss = noun_loss = None
+                    loss = sum(criterion(o["action"], labels["action"]) for o in outputs)
+            best_head_idx = max(range(len(action_metrics)), key=lambda i: action_metrics[i]["accuracy"])
+            dumper.add_batch(
+                udata,
+                [outputs[best_head_idx]],
+                labels,
+                {"verb": verb_classes, "noun": noun_classes, "action": action_classes},
+            )
+            if itr % 10 == 0 or itr == ipe - 1:
+                if action_is_verb_noun:
+                    logger.info(
+                        "[%5d] acc (v/n): %.1f%% (%.1f%% %.1f%%) recall (v/n): %.1f%% (%.1f%% %.1f%%) "
+                        "loss (v/n): %.3f (%.3f %.3f) [mem: %.2e]",
+                        itr,
+                        max(a["accuracy"] for a in action_metrics),
+                        max(v["accuracy"] for v in verb_metrics),
+                        max(n["accuracy"] for n in noun_metrics),
+                        max(a["recall"] for a in action_metrics),
+                        max(v["recall"] for v in verb_metrics),
+                        max(n["recall"] for n in noun_metrics),
+                        float(loss.detach()),
+                        float(verb_loss.detach()),
+                        float(noun_loss.detach()),
+                        torch.cuda.max_memory_allocated() / 1024.0**2,
+                    )
+    finally:
+        prefetcher.close()
+
     dumper.write()
-    verb_arg = verb_metrics if action_is_verb_noun else None
-    noun_arg = noun_metrics if action_is_verb_noun else None
     return summarize_val_metrics(
         action_metrics,
-        verb_arg,
-        noun_arg,
+        verb_metrics if action_is_verb_noun else None,
+        noun_metrics if action_is_verb_noun else None,
         metric_scope,
         metric_aggregation=val_metric_aggregation,
         val_fixed_head_index=val_fixed_head_index,

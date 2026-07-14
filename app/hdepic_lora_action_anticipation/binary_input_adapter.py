@@ -8,6 +8,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+import threading
+
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -132,6 +135,9 @@ class BinaryGazeMapBuilder:
         self.rank = int(cfg.get("rank", 0))
         self.gate = gate or GazeTokenGate({**cfg, "mode": "token_gate"})
         self._grid_cache: dict[tuple[str, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        # Clip-level XY cache (deterministic given video_id + frame indices).
+        self._xy_cache: dict[tuple, np.ndarray | None] = {}
+        self._xy_lock = threading.Lock()
 
     def build(self, clips: torch.Tensor, metadata) -> torch.Tensor:
         bsz, _, frames, height, width = clips.shape
@@ -139,9 +145,32 @@ class BinaryGazeMapBuilder:
             return clips.new_zeros((bsz, 1, frames, height, width))
         if height != self.crop_size or width != self.crop_size:
             logger.debug("Binary map crop size differs from clips: cfg=%d clip=%sx%s", self.crop_size, height, width)
-        maps = clips.new_zeros((bsz, 1, frames, height, width))
-        yy, xx = self._grid(clips.device, height, width)
-        radius2 = float(self.radius_px) ** 2
+        return self._rasterize(metadata, bsz, frames, height, width, device=clips.device, dtype=clips.dtype)
+
+    def build_cpu(self, metadata, frames: int, height: int, width: int) -> torch.Tensor:
+        """CPU gaze maps for async prefetch (overlap with GPU train step)."""
+        if not isinstance(metadata, list):
+            metadata = [metadata]
+        bsz = len(metadata)
+        if self.force_zero_map:
+            return torch.zeros((bsz, 1, frames, height, width), dtype=torch.float32)
+        return self._rasterize(
+            metadata, bsz, frames, height, width, device=torch.device("cpu"), dtype=torch.float32
+        )
+
+    def _rasterize(
+        self,
+        metadata,
+        bsz: int,
+        frames: int,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        maps = torch.zeros((bsz, 1, frames, height, width), device=device, dtype=dtype)
+        yy, xx = self._grid(device, height, width)
+        radius = float(self.radius_px)
 
         for idx in range(bsz):
             meta = metadata[idx] if isinstance(metadata, list) else metadata
@@ -151,7 +180,7 @@ class BinaryGazeMapBuilder:
                     maps[idx] = 1.0
                 continue
             nframes = min(frames, xy.shape[0])
-            xy_t = torch.as_tensor(xy[:nframes], device=clips.device, dtype=torch.float32)
+            xy_t = torch.as_tensor(xy[:nframes], device=device, dtype=torch.float32)
             x = xy_t[:, 0].view(nframes, 1, 1) * (width - 1) / max(1, self.crop_size - 1)
             y = xy_t[:, 1].view(nframes, 1, 1) * (height - 1) / max(1, self.crop_size - 1)
             maps[idx, 0, :nframes] = rasterize_gaze_disk(
@@ -159,9 +188,9 @@ class BinaryGazeMapBuilder:
                 yy,
                 x,
                 y,
-                radius2**0.5,
+                radius,
                 map_type=self.map_type,
-                dtype=maps.dtype,
+                dtype=dtype,
             )
         return maps
 
@@ -179,18 +208,33 @@ class BinaryGazeMapBuilder:
         if meta is None:
             return None
         video_id = str(meta.get("video_id"))
-        record = self.gate._load_record(video_id)  # noqa: SLF001 - reuse the existing gaze loader/sync logic
-        if record is None:
-            return None
         frame_indices = meta.get("frame_indices")
         if torch.is_tensor(frame_indices):
             frame_indices = frame_indices.detach().cpu().numpy()
+        if frame_indices is None:
+            fi = ()
+        else:
+            fi = tuple(np.asarray(frame_indices, dtype=np.int64).tolist())
         vfps = meta.get("vfps", 30.0)
         if torch.is_tensor(vfps):
             vfps = float(vfps.detach().cpu())
         h0 = int(meta.get("height", self.crop_size))
         w0 = int(meta.get("width", self.crop_size))
-        return self.gate._query_crop_xy(record, frame_indices, vfps, h0, w0)  # noqa: SLF001
+        cache_key = (video_id, fi, float(vfps), h0, w0)
+        with self._xy_lock:
+            if cache_key in self._xy_cache:
+                cached = self._xy_cache[cache_key]
+                return None if cached is None else cached.copy()
+        record = self.gate._load_record(video_id)  # noqa: SLF001 - reuse the existing gaze loader/sync logic
+        if record is None:
+            with self._xy_lock:
+                self._xy_cache[cache_key] = None
+            return None
+        xy = self.gate._query_crop_xy(record, frame_indices, vfps, h0, w0)  # noqa: SLF001
+        with self._xy_lock:
+            self._xy_cache[cache_key] = None if xy is None else np.asarray(xy)
+            cached = self._xy_cache[cache_key]
+        return None if cached is None else cached.copy()
 
 
 def binary_input_adapter_param_names(model: nn.Module) -> set[str]:

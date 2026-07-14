@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=p01_pred_d14
+#SBATCH --job-name=p01_pred_d10
 #SBATCH --account=torch_pr_674_tandon_advanced
 #SBATCH --partition=h100_tandon
 #SBATCH --nodes=1
@@ -8,15 +8,16 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400GB
 #SBATCH --time=03:00:00
-#SBATCH --output=/scratch/ll5914/logs/p01_pred_d14_%j.out
-#SBATCH --error=/scratch/ll5914/logs/p01_pred_d14_%j.err
+#SBATCH --output=/scratch/ll5914/logs/p01_pred_d10_%j.out
+#SBATCH --error=/scratch/ll5914/logs/p01_pred_d10_%j.err
 
 set -euo pipefail
 
-# P01 video-only: architecturally deepen predictor 12 -> 14 (+2 blocks).
-# - Load pretrained 12 blocks (strict=False)
-# - Copy-init the 2 new blocks from block 11
-# - Full fine-tune only the last 2 blocks; freeze pretrained 0..11
+# P01 video-only: architecturally shrink predictor 12 -> 10 (-2 blocks).
+# Compare against baseline depth=12 and arch depth14 (+2).
+# - Build predictor with depth=10; load pretrained 12-block ckpt (strict=False)
+#   so blocks 0..9 match and blocks 10..11 are dropped
+# - No LoRA; FULL fine-tune entire predictor (drop last 2 pretrained blocks (strict=False load))
 # - Encoder LoRA + probe frozen from stage-1 video best
 # Metric: val-action-top5
 
@@ -33,9 +34,9 @@ STAGE1_PROBE="${STAGE1_DIR}/best.pt"
 STAGE1_ENCODER_LORA="${STAGE1_DIR}/encoder_lora_best.pt"
 
 OUTPUT_ROOT="/scratch/ll5914/experiments/p01_predictor_depth_sweep"
-OUTPUT_DIR="${OUTPUT_ROOT}/arch_depth14_fullpred"
-CONFIG_PATH="/scratch/ll5914/logs/p01_predictor_arch_depth14_fullpred_config.yaml"
-TAG="p01-pred-arch-depth14-fullpred-vitl16-256-8ep"
+OUTPUT_DIR="${OUTPUT_ROOT}/arch_depth10_fullpred"
+CONFIG_PATH="/scratch/ll5914/logs/p01_predictor_arch_depth10_fullpred_config.yaml"
+TAG="p01-pred-arch-depth10-fullpred-vitl16-256-8ep"
 
 for f in "${STAGE1_PROBE}" "${STAGE1_ENCODER_LORA}"; do
     if [[ ! -f "${f}" ]]; then
@@ -46,7 +47,7 @@ done
 
 export MASTER_PORT=$((20000 + (${SLURM_JOB_ID:-$$} % 20000)))
 echo "========================================================"
-echo "P01 predictor ARCH depth+2 (12->14): FULL-FT entire predictor (14 blocks)"
+echo "P01 predictor ARCH depth-2 (12->10): FULL-FT entire predictor (10 blocks)"
 echo "Job=${SLURM_JOB_ID:-manual} MASTER_PORT=${MASTER_PORT}"
 echo "Stage-1: ${STAGE1_DIR}"
 echo "Out: ${OUTPUT_DIR}"
@@ -91,8 +92,8 @@ opt.update({'batch_size': 48, 'num_epochs': 8, 'use_bfloat16': True,
     'multihead_kwargs': [{'weight_decay': 0.0001, 'final_weight_decay': 0.0001,
         'lr': 0.0001, 'start_lr': 0.0, 'final_lr': 0.0, 'warmup': 1}]})
 cfg['model_kwargs']['checkpoint'] = '${CHECKPOINT}'
-# Architecturally deepen predictor: 12 -> 14 (path is pretrain_kwargs.predictor).
-cfg['model_kwargs']['pretrain_kwargs']['predictor']['depth'] = 14
+# Architecturally shrink predictor: 12 -> 10.
+cfg['model_kwargs']['pretrain_kwargs']['predictor']['depth'] = 10
 cfg['experiment']['lora'] = {
     'enabled': True, 'rank': 8, 'alpha': 16.0, 'dropout': 0.05,
     'probe_train_mode': 'full',
@@ -116,10 +117,10 @@ cfg['experiment']['lora'] = {
     },
     'predictor_lora': {
         'enabled': True,
-        # No LoRA on the 12 pretrained blocks; fully train the 2 new ones.
+        # No LoRA; fully train the truncated top (last 2 of 10).
         'last_n_blocks': -1,
-        'full_ft_last_n_blocks': 14,
-        'copy_init_from_pretrained': 12,
+        'full_ft_last_n_blocks': 10,
+        'copy_init_from_pretrained': 0,
         'full_ft_lr_mult': 1.0,
         'lr_mult': 0.5, 'weight_decay': 0.0001,
         'activation_checkpointing': True,
@@ -131,7 +132,7 @@ config_path.parent.mkdir(parents=True, exist_ok=True)
 Path('${OUTPUT_DIR}').mkdir(parents=True, exist_ok=True)
 with config_path.open('w') as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
-print(f'Config: {config_path} predictor.depth=14 full_ft_all=14')
+print(f'Config: {config_path} predictor.depth=10 full_ft_all=10')
 PY
 
 cd "${VJEPA_ROOT}"
@@ -163,8 +164,8 @@ if csv_path.exists():
         last = vals[-1][0]
 summary = Path('${SUMMARY}')
 with summary.open('a') as f:
-    f.write(f"arch14,${SLURM_JOB_ID:-},-,{best:.5f},{last:.5f},{best_ep},{run}\n")
-print(f'arch_depth14 best_top5={best} last_top5={last} best_ep={best_ep}')
+    f.write(f"arch10,${SLURM_JOB_ID:-},-,{best:.5f},{last:.5f},{best_ep},{run}\n")
+print(f'arch_depth10 best_top5={best} last_top5={last} best_ep={best_ep}')
 PY
 
-echo "P01 predictor arch depth+2 complete: $(date)"
+echo "P01 predictor arch depth-2 complete: $(date)"
