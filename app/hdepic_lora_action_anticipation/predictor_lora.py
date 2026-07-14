@@ -154,13 +154,31 @@ def copy_init_extra_predictor_blocks(model: nn.Module, n_pretrained: int = 12) -
 
 
 def set_predictor_full_ft_last_n(model: nn.Module, last_n: int) -> int:
-    """Fully unfreeze the last ``last_n`` predictor blocks."""
+    """Fully unfreeze predictor weights for fine-tuning.
+
+    - ``last_n >= num_blocks`` (or a very large value): train the **entire**
+      predictor (all blocks + embeds / heads).
+    - ``0 < last_n < num_blocks``: freeze everything, then unfreeze only the
+      last ``last_n`` blocks (legacy partial-FT path).
+    """
     if last_n <= 0:
         return 0
     predictor = _find_predictor(model)
     blocks = _iter_blocks(predictor)
     n_total = len(blocks)
-    last_n = min(int(last_n), n_total)
+    last_n = int(last_n)
+    if last_n >= n_total:
+        n_params = 0
+        for p in predictor.parameters():
+            p.requires_grad = True
+            n_params += p.numel()
+        set_predictor_lora_trainable(model, trainable=True)
+        logger.info(
+            "Enabled full fine-tune on ENTIRE predictor (%d blocks, %d params)",
+            n_total,
+            n_params,
+        )
+        return n_params
     for p in predictor.parameters():
         p.requires_grad = False
     n_params = 0
@@ -319,6 +337,8 @@ def parse_predictor_lora_cfg(lora_cfg: dict) -> dict | None:
         "lr_mult": float(cfg.get("lr_mult", 0.5)),
         "weight_decay": float(cfg.get("weight_decay", 0.0001)),
         "activation_checkpointing": bool(cfg.get("activation_checkpointing", False)),
+        "freeze": bool(cfg.get("freeze", False)),
+        "warm_start_at_init": bool(cfg.get("warm_start_at_init", False)),
     }
     target_suffixes = cfg.get("target_suffixes")
     if isinstance(target_suffixes, str):
