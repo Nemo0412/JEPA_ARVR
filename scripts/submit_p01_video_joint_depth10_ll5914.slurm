@@ -13,10 +13,9 @@
 
 set -euo pipefail
 
-# Video joint ±n (depth 10 = −2 vs joint baseline depth 12).
-# Same as video joint: heads on, pooler frozen, encoder LoRA frozen.
-# Predictor: depth=10, full-FT entire predictor (no LoRA).
-# Compare to video joint 40.44% (depth 12, predictor LoRA + heads).
+# Video joint −2 (depth 10 vs baseline depth 12).
+# Fair vs video joint: heads on, pooler frozen, encoder LoRA frozen,
+# predictor LoRA on ALL blocks (same as joint; only depth changes).
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
 PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
@@ -43,7 +42,7 @@ done
 
 export MASTER_PORT=$((20000 + (${SLURM_JOB_ID:-$$} % 20000)))
 echo "========================================================"
-echo "Video joint −2: depth=10, heads + full-FT entire predictor"
+echo "Video joint −2: depth=10, heads + predictor LoRA (all blocks)"
 echo "Job=${SLURM_JOB_ID:-manual} MASTER_PORT=${MASTER_PORT}"
 echo "Stage-1: ${STAGE1_DIR}"
 echo "Out: ${OUTPUT_DIR}"
@@ -82,7 +81,6 @@ data.update({
     'train_anticipation_time_sec': [0.25, 1.75],
 })
 opt = cfg['experiment']['optimization']
-# Match video joint heads LR; full-FT predictor at same base LR (full_ft_lr_mult=1.0).
 opt.update({'batch_size': 16, 'num_epochs': 10, 'use_bfloat16': True,
     'use_focal_loss': False, 'val_every_epochs': 1, 'best_metric': 'val-action-top5',
     'early_stopping_patience': 3, 'grad_clip': 1.0,
@@ -113,14 +111,9 @@ cfg['experiment']['lora'] = {
         'warm_start_at_init': True, 'freeze': True,
     },
     'predictor_lora': {
-        'enabled': True,
-        'last_n_blocks': -1,
-        'full_ft_last_n_blocks': 10,
-        'copy_init_from_pretrained': 0,
-        'full_ft_lr_mult': 1.0,
-        'lr_mult': 0.5, 'weight_decay': 0.0001,
-        'activation_checkpointing': True,
-        'target_suffixes': ['attn.qkv', 'attn.proj'],
+        'enabled': True, 'rank': 8, 'alpha': 16.0, 'dropout': 0.05,
+        'last_n_blocks': 0, 'lr_mult': 0.5, 'weight_decay': 0.0001,
+        'activation_checkpointing': True, 'target_suffixes': ['attn.qkv', 'attn.proj'],
     },
     'gaze': {'mode': 'none'},
 }
@@ -128,9 +121,9 @@ config_path.parent.mkdir(parents=True, exist_ok=True)
 Path('${OUTPUT_DIR}').mkdir(parents=True, exist_ok=True)
 with config_path.open('w') as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
-print(f'Config: {config_path} joint depth=10 heads+fullpred')
+print(f'Config: {config_path} joint depth=10 heads+predictor LoRA')
 PY
 
 cd "${VJEPA_ROOT}"
 "${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0
-echo "P01 video joint depth10 complete: $(date)"
+echo "P01 video joint depth10 (LoRA) complete: $(date)"

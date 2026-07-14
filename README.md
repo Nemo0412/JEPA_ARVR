@@ -100,32 +100,31 @@ predictor_lora: { enabled: true, last_n_blocks: 0 }  # all blocks
 
 ### Depth ±n when baseline is video joint
 
-Keep the **same joint setup** (heads on, pooler frozen, encoder frozen). Only change predictor depth. After changing depth, **full-FT the entire predictor** (all blocks + embeds), not only the last 2 layers.
+Same joint recipe as video joint (**heads + predictor LoRA on all blocks**, pooler/encoder frozen). Only `predictor.depth` changes.
 
 | | Depth | Init | Train | Script / out |
 |---|---:|---|---|---|
 | **Baseline (video joint)** | 12 | Standard ckpt | Heads + predictor **LoRA** (all blocks) | `submit_p01_video_pred_joint_ll5914.slurm` → **40.44%** |
-| **−2** | 10 | `strict=False`: keep blocks `0..9`, drop 10–11 | Heads + **full-FT entire** predictor | `submit_p01_video_joint_depth10_ll5914.slurm` → `video_joint_depth10/` |
-| **+2** | 14 | Load 12-block ckpt; **copy-init** new blocks from block 11 | Heads + **full-FT entire** predictor | `submit_p01_video_joint_depth14_ll5914.slurm` → `video_joint_depth14/` |
+| **−2** | 10 | `strict=False`: keep blocks `0..9`, drop 10–11 | Heads + predictor **LoRA** (all 10) | `submit_p01_video_joint_depth10_ll5914.slurm` → `video_joint_depth10/` |
+| **+2** | 14 | Load 12-block ckpt; **copy-init** new blocks from block 11 | Heads + predictor **LoRA** (all 14) | `submit_p01_video_joint_depth14_ll5914.slurm` → `video_joint_depth14/` |
 
 ```yaml
-# Joint ±n (same as video joint + depth change)
+# Joint ±n (identical to video joint except depth / copy-init)
 model_kwargs.pretrain_kwargs.predictor.depth: 10  # or 14
 train_heads: true
 freeze_pooler: true
 pretrained_probe: <stage1>/best.pt
 encoder_lora: { freeze: true, load_checkpoint_path: <stage1>/encoder_lora_best.pt }
 predictor_lora:
-  last_n_blocks: -1              # no LoRA
-  full_ft_last_n_blocks: <depth> # >= depth ⇒ entire predictor
-  copy_init_from_pretrained: 12  # only if depth > 12; else 0
+  enabled: true
+  last_n_blocks: 0                 # LoRA on every predictor block
+  copy_init_from_pretrained: 12    # only if depth > 12; else omit / 0
 ```
 
 Depth field path: `model_kwargs.pretrain_kwargs.predictor.depth` only.  
-Code: `predictor_lora.py` (`copy_init_extra_predictor_blocks`, `set_predictor_full_ft_last_n`).  
-Expect log: `Enabled full fine-tune on ENTIRE predictor`.
+Code: `predictor_lora.py` (`copy_init_extra_predictor_blocks`).
 
-**Not comparable:** `submit_p01_predictor_arch_depth{10,12,14}_*.slurm` (`arch_depth*_fullpred/`) freeze heads/probe and only FT the predictor.
+**Not comparable:** `submit_p01_predictor_arch_depth{10,12,14}_*.slurm` (`arch_depth*_fullpred/`) freeze heads and full-FT the predictor.
 
 ### Naming
 
@@ -134,7 +133,7 @@ Expect log: `Enabled full fine-tune on ENTIRE predictor`.
 | **Stage-1** | Probe + encoder LoRA |
 | **Stage-2 / predictor-only** | Predictor LoRA; enc/probe frozen |
 | **Joint** | Predictor LoRA (all blocks) + heads; pooler frozen |
-| **Joint ±n** | Same as joint, but depth `12±n` and full-FT entire predictor |
+| **Joint ±n** | Same as joint (predictor LoRA + heads), depth `12±n` (+ copy-init if deeper) |
 
 Gaze+pose: `binary_input_adapter_gaze_pose_matrix` (RGB + gaze map + SLAM `pose_6d` patch).
 

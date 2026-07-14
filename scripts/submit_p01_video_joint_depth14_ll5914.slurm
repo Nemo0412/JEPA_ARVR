@@ -13,10 +13,9 @@
 
 set -euo pipefail
 
-# Video joint ±n (depth 14 = +2 vs joint baseline depth 12).
-# Same as video joint: heads on, pooler frozen, encoder LoRA frozen.
-# Predictor: depth=14, copy-init new blocks from block 11, full-FT entire predictor.
-# Compare to video joint 40.44% (depth 12, predictor LoRA + heads).
+# Video joint +2 (depth 14 vs baseline depth 12).
+# Fair vs video joint: heads on, pooler frozen, encoder LoRA frozen,
+# predictor LoRA on ALL blocks. New blocks copy-init from block 11.
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
 PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
@@ -43,7 +42,7 @@ done
 
 export MASTER_PORT=$((20000 + (${SLURM_JOB_ID:-$$} % 20000)))
 echo "========================================================"
-echo "Video joint +2: depth=14, heads + full-FT entire predictor (copy-init)"
+echo "Video joint +2: depth=14, heads + predictor LoRA (all blocks, copy-init)"
 echo "Job=${SLURM_JOB_ID:-manual} MASTER_PORT=${MASTER_PORT}"
 echo "Stage-1: ${STAGE1_DIR}"
 echo "Out: ${OUTPUT_DIR}"
@@ -112,14 +111,11 @@ cfg['experiment']['lora'] = {
         'warm_start_at_init': True, 'freeze': True,
     },
     'predictor_lora': {
-        'enabled': True,
-        'last_n_blocks': -1,
-        'full_ft_last_n_blocks': 14,
+        'enabled': True, 'rank': 8, 'alpha': 16.0, 'dropout': 0.05,
+        # Copy-init blocks 12..13 from block 11, then LoRA on all 14 (same as joint).
+        'last_n_blocks': 0, 'lr_mult': 0.5, 'weight_decay': 0.0001,
         'copy_init_from_pretrained': 12,
-        'full_ft_lr_mult': 1.0,
-        'lr_mult': 0.5, 'weight_decay': 0.0001,
-        'activation_checkpointing': True,
-        'target_suffixes': ['attn.qkv', 'attn.proj'],
+        'activation_checkpointing': True, 'target_suffixes': ['attn.qkv', 'attn.proj'],
     },
     'gaze': {'mode': 'none'},
 }
@@ -127,9 +123,9 @@ config_path.parent.mkdir(parents=True, exist_ok=True)
 Path('${OUTPUT_DIR}').mkdir(parents=True, exist_ok=True)
 with config_path.open('w') as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
-print(f'Config: {config_path} joint depth=14 heads+fullpred copy-init')
+print(f'Config: {config_path} joint depth=14 heads+predictor LoRA copy-init')
 PY
 
 cd "${VJEPA_ROOT}"
 "${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0
-echo "P01 video joint depth14 complete: $(date)"
+echo "P01 video joint depth14 (LoRA) complete: $(date)"
