@@ -99,8 +99,10 @@ opt.update({'batch_size': 16, 'num_epochs': 10, 'use_bfloat16': True,
     'multihead_kwargs': [{'weight_decay': 0.0001, 'final_weight_decay': 0.0001,
         'lr': 0.0001, 'start_lr': 0.0, 'final_lr': 0.0, 'warmup': 2}]})
 cfg['model_kwargs']['checkpoint'] = '${CHECKPOINT}'
-# Truncate ViT-L encoder 24 -> 22 (drop trailing blocks; strict=False load).
-cfg['model_kwargs']['pretrain_kwargs']['encoder']['depth'] = 22
+# The pinned upstream vit_large factory hard-codes depth=24 and rejects a
+# second depth kwarg. Build/load all 24 pretrained blocks first; arch_depth
+# below then drops the trailing two blocks before encoder LoRA is injected.
+cfg['model_kwargs']['pretrain_kwargs']['encoder'].pop('depth', None)
 cfg['experiment']['lora'] = {
     'enabled': True, 'rank': 8, 'alpha': 16.0, 'dropout': 0.05,
     'probe_train_mode': 'full', 'train_heads': True, 'pretrained_probe': '',
@@ -127,7 +129,7 @@ config_path.parent.mkdir(parents=True, exist_ok=True)
 Path('${OUTPUT_DIR}').mkdir(parents=True, exist_ok=True)
 with config_path.open('w') as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
-print(f'Config: {config_path} encoder.depth=22 stage-1')
+print(f'Config: {config_path} encoder arch_depth=22 stage-1')
 PY
 
 cd "${VJEPA_ROOT}"
