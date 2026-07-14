@@ -71,23 +71,32 @@ eval_name: app.hdepic_lora_action_anticipation
 
 | Step | Trains | Frozen / loaded | Scripts |
 |---|---|---|---|
-| **Stage-1** | Probe (+ heads) + encoder LoRA | Predictor = pretrained | EGTEA / P01 stage-1 |
-| **Stage-2 predictor-only** | Predictor LoRA on **all** blocks (`last_n_blocks: 0`) | Encoder LoRA + probe from stage-1 | `*_predictor_*.slurm` |
-| **Joint** (video **40.44%**, gaze+pose **42.74%**) | Predictor LoRA on **all** blocks + **classifier heads** | Encoder LoRA frozen; **pooler frozen** | `submit_p01_video_pred_joint_ll5914.slurm`, `submit_p01_gazepose_pred_joint_ll5914.slurm` |
+| **Stage-1** | Probe + encoder LoRA | Predictor = pretrained | EGTEA / P01 stage-1 |
+| **Stage-2 predictor-only** | Predictor LoRA (all blocks) | Encoder LoRA + probe from stage-1 | `*_predictor_*.slurm` |
+| **Joint** | Predictor LoRA (all blocks) + **heads** | Encoder LoRA frozen; **pooler frozen** | see below |
 
-**Video joint (baseline):**
+Metric / early-stop: **`val-action-top5`**. Heads LR `2e-5`; predictor LoRA `lr_mult=0.5`. Full-probe joint collapsed → heads-only.
+
+### Joint video (40.44% @ep3) / Joint gaze+pose (42.74% @ep2)
+
+Same recipe, two inputs:
+
+1. **Stage-1** — train probe + encoder LoRA (gaze+pose also trains 5ch input adapter). Predictor frozen.
+2. **Joint** — load stage-1; **freeze** encoder LoRA (+ adapter if gaze); **freeze pooler**; train **predictor LoRA (all blocks)** + **heads**.
+
+| | Stage-1 → Joint | Batch | Extra |
+|---|---|---:|---|
+| **Video** | `p01_video_enc_clip` → `submit_p01_video_pred_joint_ll5914.slurm` | 16 | `gaze.mode: none` |
+| **Gaze+pose** | `p01_gazepose_clip` → `submit_p01_gazepose_pred_joint_ll5914.slurm` | 6 | load+freeze `binary_input_adapter_best.pt` |
 
 ```yaml
-model_kwargs.pretrain_kwargs.predictor.depth: 12
-experiment.lora:
-  train_heads: true
-  freeze_pooler: true
-  pretrained_probe: <stage1>/best.pt
-  encoder_lora: { freeze: true, load_checkpoint_path: <stage1>/encoder_lora_best.pt, last_n_blocks: 0 }
-  predictor_lora: { enabled: true, last_n_blocks: 0 }   # 0 = LoRA on every predictor block
+# Joint (both)
+train_heads: true
+freeze_pooler: true
+pretrained_probe: <stage1>/best.pt
+encoder_lora: { freeze: true, load_checkpoint_path: <stage1>/encoder_lora_best.pt }
+predictor_lora: { enabled: true, last_n_blocks: 0 }  # all blocks
 ```
-
-Metric / early-stop: **`val-action-top5`**.
 
 ### Depth ±n when baseline is video joint
 
