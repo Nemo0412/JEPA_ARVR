@@ -104,11 +104,11 @@ predictor_lora: { enabled: true, last_n_blocks: 0 }  # all blocks
 
 Same joint recipe as video joint (**heads + predictor LoRA on all blocks**, pooler/encoder frozen). Only `predictor.depth` changes.
 
-| | Depth | Init | Train | Script / out |
-|---|---:|---|---|---|
-| **Baseline (video joint)** | 12 | Standard ckpt | Heads + predictor **LoRA** (all blocks) | `submit_p01_video_pred_joint_ll5914.slurm` → **40.44%** |
-| **−2** | 10 | `strict=False`: keep blocks `0..9`, drop 10–11 | Heads + predictor **LoRA** (all 10) | `submit_p01_video_joint_depth10_ll5914.slurm` → `video_joint_depth10/` |
-| **+2** | 14 | Load 12-block ckpt; **copy-init** new blocks from block 11 | Heads + predictor **LoRA** (all 14) | `submit_p01_video_joint_depth14_ll5914.slurm` → `video_joint_depth14/` |
+| | Depth | Init | Train | Script / out | Best Top-5 |
+|---|---:|---|---|---|---:|
+| **Baseline (video joint)** | 12 | Standard ckpt | Heads + predictor **LoRA** (all blocks) | `submit_p01_video_pred_joint_ll5914.slurm` | **40.44%** @ep3 |
+| **−2** | 10 | `strict=False`: keep blocks `0..9`, drop 10–11 | Heads + predictor **LoRA** (all 10) | `submit_p01_video_joint_depth10_ll5914.slurm` → `video_joint_depth10/` | **40.36%** @ep2 (completed) |
+| **+2** | 14 | Load 12-block ckpt; **copy-init** new blocks from block 11 | Heads + predictor **LoRA** (all 14) | `submit_p01_video_joint_depth14_ll5914.slurm` → `video_joint_depth14/` | **40.74%** (partial; util-killed) |
 
 ```yaml
 # Joint ±n (identical to video joint except depth / copy-init)
