@@ -32,7 +32,9 @@ Cluster runs use **1×H100** unless noted.
 | Video stage-1 (probe + encoder LoRA) | 38.10% | |
 | Video stage-2 (predictor LoRA only) | 37.87% | Short / incomplete log |
 | Video joint v1 (predictor + **full probe** @ 2e-5) | 38.85% csv / 38.62% tracker | Partial; declining; superseded by heads-only joint |
-| Video **joint v2** (predictor + **heads**; pooler frozen) | **40.44%** @ep3 | Completed (early-stop) |
+| Video **joint v2** (predictor + **heads**; pooler frozen) | **40.44%** @ep3 | Completed (early-stop); depth=12 baseline |
+| Video joint **predictor depth −2** (depth=10, LoRA+heads) | **40.36%** @ep2 | Completed (early-stop @ep5); job `13593917` |
+| Video joint **predictor depth +2** (depth=14, LoRA+heads, copy-init) | **40.74%** | Incomplete: killed ~2h low-GPU-util (`SIGNAL Terminated`, job `13593918`); best so far @ resumed ep1 / logged as epoch 3 |
 | Gaze+pose stage-1 (gaze map + SLAM pose matrix + encoder LoRA) | 39.16% | Pose = SLAM `pose_6d` (IMU-fused trajectory; not raw IMU CSV) |
 | Gaze+pose stage-2 (predictor LoRA only) | 40.59% | Previous P01 best (completed) |
 | Gaze+pose **joint v2** (predictor + **heads**; pooler frozen) | **42.74%** @ep2 | **Best P01 Top-5**; early-stopped @ep5 (patience 3) |
