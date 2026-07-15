@@ -32,7 +32,9 @@ Cluster runs use **1×H100** unless noted.
 | Video stage-1 (probe + encoder LoRA) | 38.10% | |
 | Video stage-2 (predictor LoRA only) | 37.87% | Short / incomplete log |
 | Video joint v1 (predictor + **full probe** @ 2e-5) | 38.85% csv / 38.62% tracker | Partial; declining; superseded by heads-only joint |
-| Video **joint v2** (predictor + **heads**; pooler frozen) | **40.44%** @ep3 | Completed (early-stop) |
+| Video **joint v2** (predictor + **heads**; pooler frozen) | **40.44%** @ep3 | Completed (early-stop); depth=12 baseline |
+| Video joint **predictor depth −2** (depth=10, LoRA+heads) | **40.36%** @ep2 | Completed (early-stop @ep5); job `13593917` |
+| Video joint **predictor depth +2** (depth=14, LoRA+heads, copy-init) | **40.74%** | Incomplete: killed ~2h low-GPU-util (`SIGNAL Terminated`, job `13593918`); best so far @ resumed ep1 / logged as epoch 3 |
 | Gaze+pose stage-1 (gaze map + SLAM pose matrix + encoder LoRA) | 39.16% | Pose = SLAM `pose_6d` (IMU-fused trajectory; not raw IMU CSV) |
 | Gaze+pose stage-2 (predictor LoRA only) | 40.59% | Previous P01 best (completed) |
 | Gaze+pose **joint v2** (predictor + **heads**; pooler frozen) | **42.74%** @ep2 | **Best P01 Top-5**; early-stopped @ep5 (patience 3) |
@@ -139,16 +141,14 @@ Code: `predictor_lora.py` (`copy_init_extra_predictor_blocks`).
 |---|---:|---|---|
 | **Baseline (video joint)** | 24 | Standard | Stage-1 `p01_video_enc_clip` → joint **40.44%** |
 | **−2** | 22 | `strict=False` / truncate last 2 blocks | `submit_p01_video_enc_depth22_ll5914.slurm` → `submit_p01_video_joint_enc_depth22_ll5914.slurm` |
-| **+2** | 26 | Build depth=26; `copy_init_from_pretrained: 24` | Same recipe with depth 26 (not scripted yet) |
+| **+2** | 26 | Requires factory depth override, then `copy_init_from_pretrained: 24` | Not scripted yet |
 
 ```yaml
 # Stage-1 (−2 example)
-model_kwargs.pretrain_kwargs.encoder.depth: 22
 encoder_lora: { enabled: true, last_n_blocks: 0, arch_depth: 22 }  # train LoRA
 predictor_lora: { enabled: false }
 
-# Joint (−2): identical to video joint except encoder.depth / arch_depth
-encoder.depth: 22
+# Joint (−2): identical to video joint except encoder arch_depth
 train_heads: true
 freeze_pooler: true
 pretrained_probe: <enc_depth22_stage1>/best.pt
@@ -156,7 +156,14 @@ encoder_lora: { freeze: true, arch_depth: 22, load_checkpoint_path: <enc_depth22
 predictor_lora: { enabled: true, last_n_blocks: 0 }
 ```
 
-Code: `encoder_lora.py` (`apply_encoder_arch_depth`, `copy_init_extra_encoder_blocks`); local V-JEPA `vit_large` / `vit_large_rope` honor `depth=` (also truncate fallback via `arch_depth`).
+Code: `encoder_lora.py` (`apply_encoder_arch_depth`,
+`copy_init_extra_encoder_blocks`). For encoder **−n**, keep the pinned upstream
+factory at its native depth, load the full checkpoint, and use `arch_depth` to
+drop suffix blocks before LoRA injection. Do not set
+`model_kwargs.pretrain_kwargs.encoder.depth`: the pinned upstream `vit_large` /
+`vit_large_rope` factories hard-code their native depth and reject a duplicate
+`depth` keyword. Encoder **+n** will require an explicit upstream/factory change
+before `copy_init_from_pretrained` can be used.
 
 ### Naming
 

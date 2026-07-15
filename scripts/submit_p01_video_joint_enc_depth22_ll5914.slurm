@@ -16,7 +16,7 @@ set -euo pipefail
 # Joint for encoder depth −2 (24 -> 22), fair vs video joint @ encoder depth 24.
 # Loads Stage-1 from video_enc_depth22 (probe + encoder LoRA trained at depth 22).
 # Freeze that encoder LoRA + pooler; train predictor LoRA (all blocks) + heads.
-# Same recipe as submit_p01_video_pred_joint_ll5914.slurm; only encoder.depth differs.
+# Same recipe as submit_p01_video_pred_joint_ll5914.slurm; only encoder arch_depth differs.
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
 PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
@@ -111,7 +111,10 @@ opt.update({'batch_size': 16, 'num_epochs': 10, 'use_bfloat16': True,
     'multihead_kwargs': [{'weight_decay': 0.0001, 'final_weight_decay': 0.0001,
         'lr': 0.00002, 'start_lr': 0.0, 'final_lr': 0.0, 'warmup': 1}]})
 cfg['model_kwargs']['checkpoint'] = '${CHECKPOINT}'
-cfg['model_kwargs']['pretrain_kwargs']['encoder']['depth'] = 22
+# Keep the pinned upstream factory at its native depth=24. arch_depth below
+# truncates after the full pretrained checkpoint is loaded and before the
+# depth-22 encoder-LoRA sidecar is restored.
+cfg['model_kwargs']['pretrain_kwargs']['encoder'].pop('depth', None)
 cfg['experiment']['lora'] = {
     'enabled': True, 'rank': 8, 'alpha': 16.0, 'dropout': 0.05,
     'probe_train_mode': 'full',
@@ -147,7 +150,7 @@ config_path.parent.mkdir(parents=True, exist_ok=True)
 Path('${OUTPUT_DIR}').mkdir(parents=True, exist_ok=True)
 with config_path.open('w') as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
-print(f'Config: {config_path} joint encoder.depth=22')
+print(f'Config: {config_path} joint encoder arch_depth=22')
 PY
 
 cd "${VJEPA_ROOT}"

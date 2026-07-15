@@ -71,11 +71,11 @@ def _get_submodule(block: nn.Module, dotted: str):
 def apply_encoder_arch_depth(model: nn.Module, depth: int) -> int:
     """Force encoder ``blocks`` length to ``depth`` (keep first ``depth`` blocks).
 
-    Used for −n layer drop. Prefer also setting
-    ``model_kwargs.pretrain_kwargs.encoder.depth`` so the module is built at the
-    target size when the local V-JEPA ``vit_large`` honors ``depth=``. This helper
-    is the fallback truncate if the encoder was still constructed at 24.
-    Deepening (+n) requires building with ``encoder.depth`` + ``copy_init``.
+    Used for −n layer drop after the native-depth encoder and its full pretrained
+    checkpoint have been loaded. The pinned upstream ``vit_large`` factories
+    hard-code their native depth, so shortening configs must not also pass a
+    ``depth`` keyword to the factory. Deepening (+n) requires a factory that can
+    build the requested depth, followed by ``copy_init``.
     """
     depth = int(depth)
     if depth <= 0:
@@ -89,7 +89,8 @@ def apply_encoder_arch_depth(model: nn.Module, depth: int) -> int:
     if depth > n_before:
         raise ValueError(
             f"Cannot deepen encoder from {n_before} to {depth} via truncate; "
-            "set model_kwargs.pretrain_kwargs.encoder.depth and copy_init_from_pretrained"
+            "first add/use a factory that supports the requested depth, then "
+            "set copy_init_from_pretrained"
         )
     encoder.blocks = nn.ModuleList(blocks[:depth])
     logger.info("Truncated encoder blocks %d -> %d (dropped last %d)", n_before, depth, n_before - depth)
