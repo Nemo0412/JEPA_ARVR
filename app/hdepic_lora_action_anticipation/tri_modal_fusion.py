@@ -188,6 +188,12 @@ class ModalityProjections(nn.Module):
             nn.GELU(),
             nn.Linear(embed_dim, embed_dim),
         )
+        # Start nearly closed: sigmoid(-4)≈0.018 so early updates stay near identity
+        # until aux encoders become useful (avoids injecting random gaze/IMU noise).
+        nn.init.zeros_(self.gate[0].weight)
+        nn.init.zeros_(self.gate[0].bias)
+        nn.init.zeros_(self.gate[2].weight)
+        nn.init.constant_(self.gate[2].bias, -4.0)
 
     def project_qkv(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.w_q(z), self.w_k(z), self.w_v(z)
@@ -759,7 +765,8 @@ class _TriModalBatchPrefetcher:
             try:
                 try:
                     udata = next(_data_loader)
-                except Exception:
+                except StopIteration:
+                    # End of epoch: re-create iterator for next epoch / val reuse.
                     _data_loader = iter(self.data_loader)
                     udata = next(_data_loader)
                 gaze_cpu, imu_cpu = _prepare_aux_cpu(self.gaze_map_builder, self.imu_loader, udata)
@@ -767,6 +774,8 @@ class _TriModalBatchPrefetcher:
                 # Block here when GPU is behind — that is fine; producer stays warm.
                 self._q.put((udata, gaze_cpu, imu_cpu, fetch_ms))
             except BaseException as exc:  # noqa: BLE001 — surface to consumer
+                # Do not swallow AttributeError / decode errors as a silent re-iter;
+                # that previously masked root causes (e.g. mtp_horizons_sec).
                 self._error = exc
                 self._q.put(None)
                 return

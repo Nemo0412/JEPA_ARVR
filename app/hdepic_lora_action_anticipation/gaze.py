@@ -73,6 +73,8 @@ class ClipBalancedDecodeVideosToClips(wds.PipelineStage):
         label_horizon_schedule=None,
         cache_reader=True,
         decoder_num_threads=-1,
+        mtp_horizons_sec=None,
+        mtp_intervals=None,
     ):
         self.frames_per_clip = frames_per_clip
         self.fps = fps
@@ -89,6 +91,9 @@ class ClipBalancedDecodeVideosToClips(wds.PipelineStage):
         self.label_horizon_schedule = list(label_horizon_schedule or [])
         self.cache_reader = bool(cache_reader)
         self.decoder_num_threads = int(decoder_num_threads)
+        # Optional MTP multi-horizon labels (1s/5s/10s). Off by default.
+        self.mtp_horizons_sec = [float(h) for h in (mtp_horizons_sec or [])]
+        self.mtp_intervals = dict(mtp_intervals or {})
         self._reader_path: str | None = None
         self._reader_state: tuple[VideoReader, float, int] | None = None
         self._binary_gate = None
@@ -374,6 +379,30 @@ class ClipBalancedDecodeVideosToClips(wds.PipelineStage):
                     "noun": labels_noun,
                     "anticipation_time": model_at,
                 }
+                # MTP is optional / separate from 1s tri-modal fusion. Defensive
+                # getattr: persistent workers may hold pre-MTP decoder instances.
+                mtp_horizons = getattr(self, "mtp_horizons_sec", None) or []
+                mtp_intervals = getattr(self, "mtp_intervals", None) or {}
+                if mtp_horizons:
+                    from app.hdepic_lora_action_anticipation.mtp import lookup_action_at_frame
+
+                    intervals = mtp_intervals.get(str(video_id), [])
+                    mtp_verbs, mtp_nouns, mtp_mask = [], [], []
+                    for hi, h in enumerate(mtp_horizons):
+                        if hi == 0:
+                            # Primary horizon: keep this sample's annotated action.
+                            mtp_verbs.append(labels_verb)
+                            mtp_nouns.append(labels_noun)
+                            mtp_mask.append(1.0)
+                            continue
+                        t_frame = int(af + float(h) * vfps)
+                        v_h, n_h, ok = lookup_action_at_frame(intervals, t_frame)
+                        mtp_verbs.append(int(v_h) if ok else -1)
+                        mtp_nouns.append(int(n_h) if ok else -1)
+                        mtp_mask.append(1.0 if ok else 0.0)
+                    out["mtp_verbs"] = mtp_verbs
+                    out["mtp_nouns"] = mtp_nouns
+                    out["mtp_mask"] = mtp_mask
                 if self.emit_metadata:
                     out["metadata"] = {
                         "video_id": video_id,
@@ -429,6 +458,17 @@ class ClipBalancedDecodeVideosToClips(wds.PipelineStage):
         finally:
             self._trace_sample("stage_exit", {"reader_path": self._reader_path})
             self._release_reader()
+
+
+def _mtp_collate(batch):
+    videos = torch.stack([item[0] for item in batch])
+    verbs = torch.tensor([item[1] for item in batch], dtype=torch.long)
+    nouns = torch.tensor([item[2] for item in batch], dtype=torch.long)
+    anticipation = torch.tensor([item[3] for item in batch], dtype=torch.float32)
+    mtp_verbs = torch.tensor([item[4] for item in batch], dtype=torch.long)
+    mtp_nouns = torch.tensor([item[5] for item in batch], dtype=torch.long)
+    mtp_mask = torch.tensor([item[6] for item in batch], dtype=torch.float32)
+    return videos, verbs, nouns, anticipation, mtp_verbs, mtp_nouns, mtp_mask
 
 
 def _metadata_collate(batch):
@@ -611,9 +651,12 @@ def make_clip_balanced_webvid(
     decoder_num_threads=None,
     debug_subset_path=None,
     prefetch_factor=4,
+    mtp_horizons_sec=None,
+    mtp_intervals=None,
     **kwargs,
 ):
     del base_path, kwargs
+    mtp_horizons_sec = [float(h) for h in (mtp_horizons_sec or [])]
     if emit_binary_map and binary_map_cfg is not None and bool(binary_map_cfg.get("aug_aware", False)):
         binary_map_cfg = dict(binary_map_cfg)
         binary_map_cfg["aug_aware_training"] = bool(training)
@@ -670,13 +713,22 @@ def make_clip_balanced_webvid(
         label_horizon_schedule=label_horizon_schedule,
         cache_reader=cache_reader,
         decoder_num_threads=decoder_num_threads,
+        mtp_horizons_sec=mtp_horizons_sec or None,
+        mtp_intervals=mtp_intervals,
     )
     if emit_binary_map:
         tuple_keys = ("video", "verb", "noun", "metadata", "anticipation_time", "binary_map")
         collate = _metadata_binary_collate
+        if mtp_horizons_sec:
+            raise ValueError("MTP labels are not supported together with emit_binary_map yet")
     elif emit_metadata:
         tuple_keys = ("video", "verb", "noun", "metadata", "anticipation_time")
         collate = _metadata_collate
+        if mtp_horizons_sec:
+            raise ValueError("MTP labels are not supported together with emit_metadata yet")
+    elif mtp_horizons_sec:
+        tuple_keys = ("video", "verb", "noun", "anticipation_time", "mtp_verbs", "mtp_nouns", "mtp_mask")
+        collate = _mtp_collate
     else:
         tuple_keys = ("video", "verb", "noun", "anticipation_time")
         collate = torch.utils.data.default_collate

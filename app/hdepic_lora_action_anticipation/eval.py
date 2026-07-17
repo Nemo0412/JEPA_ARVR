@@ -89,6 +89,7 @@ from app.hdepic_lora_action_anticipation.tri_modal_fusion import (
     trainable_tri_modal_fusion_params,
     validate_with_tri_modal_fusion,
 )
+from app.hdepic_lora_action_anticipation.mtp import enable_mtp, parse_mtp_cfg
 
 logger = logging.getLogger(__name__)
 logging.raiseExceptions = False
@@ -1806,6 +1807,17 @@ def main(args_eval, resume_preempt=False):
             _patch_load_checkpoint_for_predictor_lora(base_eval, predictor_lora_cfg)
         baseline_train_loop = base_eval.train_one_epoch is _UPSTREAM_TRAIN_ONE_EPOCH
         _patch_for_predictor_lora(base_eval, predictor_lora_cfg, baseline_train_loop=baseline_train_loop)
+
+    # Multi-Time Prediction (1s/5s/10s cascading). Opt-in only; leaves single-horizon
+    # path untouched when experiment.lora.mtp.enabled is false/absent.
+    mtp_cfg = parse_mtp_cfg(lora_cfg)
+    if mtp_cfg is not None:
+        if gaze_mode not in {"none", ""}:
+            raise ValueError(
+                f"MTP currently supports video-only (gaze.mode=none); got gaze.mode={gaze_mode!r}"
+            )
+        enable_mtp(base_eval, args_eval, mtp_cfg, lora_cfg)
+
     if base_eval.train_one_epoch is _UPSTREAM_TRAIN_ONE_EPOCH:
         from app.hdepic_lora_action_anticipation.val_metrics import train_one_epoch_with_standard_model
 
@@ -2519,12 +2531,19 @@ def _patch_opt_for_tri_modal_fusion(base_eval, gaze_cfg: dict):
         if model is None:
             raise RuntimeError("tri_modal_fusion model was not registered before init_opt")
         fusion_params = trainable_tri_modal_fusion_params(model)
+        if not fusion_params:
+            raise RuntimeError("tri_modal_fusion is enabled but no trainable fusion params were found")
         param_groups = []
         classifier_param_count = 0
+        classifier_heads_used = 0
         first_kwargs = opt_kwargs[0]
         for classifier, kwargs in zip(classifiers, opt_kwargs):
-            head_idx = len(param_groups)
             base_params = [p for p in classifier.parameters() if p.requires_grad]
+            if not base_params:
+                # Fusion-only recipes freeze heads/pooler; skip empty AdamW groups.
+                continue
+            head_idx = classifier_heads_used
+            classifier_heads_used += 1
             classifier_param_count += sum(p.numel() for p in base_params)
             warmup_steps = int((kwargs.get("warmup") or 0.0) * iterations_per_epoch)
             param_groups.append(
@@ -2556,7 +2575,7 @@ def _patch_opt_for_tri_modal_fusion(base_eval, gaze_cfg: dict):
         logger.info(
             "Optimizer split: classifiers=%d params across %d heads, tri_modal_fusion=%d params, lr_mult=%.3f",
             classifier_param_count,
-            len(classifiers),
+            classifier_heads_used,
             sum(p.numel() for p in fusion_params),
             lr_mult,
         )
