@@ -45,3 +45,9 @@ before submitting jobs.
 
 Generated configs are retained because many launchers consume them directly;
 internal run logs, dashboards, and historical result documents are not copied.
+
+## Experiment-specific interfaces
+
+- [B14 early-exit reproduction interface](B14_EARLY_EXIT_REPRODUCTION.md):
+  checkpoint-bound split validation, predictor/encoder prefix diagnostics,
+  output schema, and the encoder-prefix projector smoke.

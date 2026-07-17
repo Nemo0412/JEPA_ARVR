@@ -578,3 +578,23 @@ bash scripts/submit_b11_singleprobe_ar10s_direct_rope_vitl_fp32_bs8_noac_fulltra
 | `refer_repo/JEPA_ARVR` | ✅ | ❌ | — | 参考 encoder-LoRA，无 predictor-LoRA/无 VLM |
 
 完整 run 注册表（含 checkpoint 路径、sidecar、raw log 链接）去 VJEPA2-EXP `logs/RUNNING.md`。
+
+---
+
+## B14 early-exit diagnostics (synchronized 2026-07-18)
+
+Public reproduction contract:
+[B14_EARLY_EXIT_REPRODUCTION.md](B14_EARLY_EXIT_REPRODUCTION.md). The shared
+launchers require explicit checkpoint config, checkpoint directory, and frozen
+split directory; no personal scratch path or Slurm account is embedded.
+
+The source full-validation predictor diagnostic used a checkpoint-bound split
+with 1336 effective validation items. Predictor d3/d6/d9/d12 action Top-5 was
+`42.515/42.216/42.590/42.440%`, and Top-1 agreement with d12 was
+`95.135/95.584/96.257/100%`. This supports a true prefix-latency benchmark for
+static truncation, but not an entropy-only dynamic exit policy.
+
+The eight-sample encoder compatibility gate found zero Top-1 agreement between
+d6/d12/d18 and d24. Direct coarse encoder truncation was rejected. A d18
+`LayerNorm + Linear` output-space projector smoke was registered in the source
+repository, but the synchronized log contained no completed projector result.

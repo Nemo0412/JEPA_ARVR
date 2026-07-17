@@ -1,0 +1,34 @@
+run_tag: b14-encoder-d18-lnlinear-projector-smoke
+nickname: b14-d18-lnlinear-projector-smoke
+source_config: /path/to/parent_checkpoint_training_config.yaml
+checkpoint_dir: /path/to/parent_checkpoint_directory
+expected_split_dir: /path/to/checkpoint_bound_split
+split_label: checkpoint_bound_split
+output_dir: /path/to/JEPA_ARVR/outputs/encoder_early_exit_projector/b14_d18_lnlinear_smoke
+resume_checkpoint: ''
+projector:
+  encoder_depth: 18
+  architecture: layernorm_linear
+  embed_dim: 1024
+  linear_init: identity
+optimization:
+  epochs: 1
+  max_train_steps: 384
+  max_val_samples: 128
+  batch_size: 8
+  num_workers: 8
+  val_num_workers: 6
+  lr: 0.0001
+  weight_decay: 0.0001
+  lambda_repr: 1.0
+  lambda_task: 1.0
+  grad_clip: 1.0
+  use_bfloat16: true
+  predictor_activation_checkpointing: true
+  checkpoint_every_steps: 50
+  log_every_steps: 10
+resource_gate:
+  purpose: monitored learning and GPU-utilization smoke
+  monitor_interval_seconds: 30
+  expected_effective_train_minutes: 20
+  advance_only_with_policy_safe_utilization: true
