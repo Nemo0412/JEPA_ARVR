@@ -750,17 +750,30 @@ def _patch_best_checkpointing_and_early_stop(base_eval, args_eval):
         "best_epoch": None,
         "bad_validations": 0,
     }
-    if args_eval.get("resume_checkpoint"):
-        disk_state = _load_best_tracking_state(_run_dir(args_eval), metric_name=metric_name)
-        if disk_state is not None:
-            state.update(disk_state)
-            logger.info(
-                "Restored best-tracker state from checkpoint: best_metric=%.5f best_epoch=%s bad_validations=%d metric=%s",
-                state["best_metric"],
-                state["best_epoch"],
-                state["bad_validations"],
-                metric_name,
-            )
+    # Always restore best floor from disk (even when resume_checkpoint=False / fresh
+    # optimizer). Otherwise a weaker first val after util-kill resume overwrites a
+    # stronger historical best.pt (seen: 39.80 → 39.49).
+    disk_state = _load_best_tracking_state(_run_dir(args_eval), metric_name=metric_name)
+    if disk_state is not None:
+        state.update(disk_state)
+        logger.info(
+            "Restored best-tracker state from checkpoint: best_metric=%.5f best_epoch=%s bad_validations=%d metric=%s",
+            state["best_metric"],
+            state["best_epoch"],
+            state["bad_validations"],
+            metric_name,
+        )
+    floor = opt_cfg.get("best_metric_floor", None)
+    if floor is None:
+        env_floor = os.environ.get("BEST_METRIC_FLOOR", "").strip()
+        floor = env_floor if env_floor else None
+    if floor is not None:
+        floor_v = float(floor)
+        if state["best_metric"] is None or floor_v > float(state["best_metric"]):
+            state["best_metric"] = floor_v
+            if state["best_epoch"] is None:
+                state["best_epoch"] = -1
+            logger.info("Applied best_metric_floor=%.5f (refuses weaker best overwrites)", floor_v)
 
     def validate_with_best_tracking(*args, **kwargs):
         val_metrics = original_validate(*args, **kwargs)

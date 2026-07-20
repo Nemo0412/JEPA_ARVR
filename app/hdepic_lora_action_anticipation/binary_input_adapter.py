@@ -138,6 +138,10 @@ class BinaryGazeMapBuilder:
         # Clip-level XY cache (deterministic given video_id + frame indices).
         self._xy_cache: dict[tuple, np.ndarray | None] = {}
         self._xy_lock = threading.Lock()
+        # Full rasterized map cache — avoids re-filling HxW disks every epoch.
+        self._map_cache: dict[tuple, torch.Tensor] = {}
+        self._map_lock = threading.Lock()
+        self._map_cache_max = int(os.environ.get("TRI_MODAL_GAZE_MAP_CACHE", "4096") or "4096")
 
     def build(self, clips: torch.Tensor, metadata) -> torch.Tensor:
         bsz, _, frames, height, width = clips.shape
@@ -171,9 +175,31 @@ class BinaryGazeMapBuilder:
         maps = torch.zeros((bsz, 1, frames, height, width), device=device, dtype=dtype)
         yy, xx = self._grid(device, height, width)
         radius = float(self.radius_px)
+        use_map_cache = device.type == "cpu" and self._map_cache_max > 0
 
         for idx in range(bsz):
             meta = metadata[idx] if isinstance(metadata, list) else metadata
+            cache_key = None
+            if use_map_cache and meta is not None:
+                frame_indices = meta.get("frame_indices")
+                if torch.is_tensor(frame_indices):
+                    frame_indices = frame_indices.detach().cpu().numpy()
+                fi = () if frame_indices is None else tuple(np.asarray(frame_indices, dtype=np.int64).tolist())
+                cache_key = (
+                    str(meta.get("video_id")),
+                    fi,
+                    int(frames),
+                    int(height),
+                    int(width),
+                    float(self.radius_px),
+                    str(self.map_type),
+                )
+                with self._map_lock:
+                    cached_map = self._map_cache.get(cache_key)
+                if cached_map is not None:
+                    maps[idx].copy_(cached_map.to(dtype=dtype))
+                    continue
+
             xy = self._query_xy(meta)
             if xy is None:
                 if self.fallback_full_frame:
@@ -192,6 +218,15 @@ class BinaryGazeMapBuilder:
                 map_type=self.map_type,
                 dtype=dtype,
             )
+            if use_map_cache and cache_key is not None:
+                with self._map_lock:
+                    if len(self._map_cache) >= self._map_cache_max:
+                        # Drop an arbitrary old entry (FIFO-ish via iter order).
+                        try:
+                            self._map_cache.pop(next(iter(self._map_cache)))
+                        except StopIteration:
+                            pass
+                    self._map_cache[cache_key] = maps[idx].detach().clone()
         return maps
 
     def _grid(self, device: torch.device, height: int, width: int):

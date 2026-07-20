@@ -7,23 +7,33 @@
 #SBATCH --gres=gpu:h100:1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=384GB
-#SBATCH --time=02:50:00
+# Keep wall-clock under the 2h util-kill window. Chain via auto-resubmit.
+#SBATCH --time=01:50:00
+# Signal 90s before walltime so we can requeue before hard kill.
+#SBATCH --signal=B:USR1@90
 #SBATCH --output=/scratch/ll5914/logs/tri_modal_s2_%j.out
 #SBATCH --error=/scratch/ll5914/logs/tri_modal_s2_%j.err
 
 set -euo pipefail
 
-# Tri-modal Stage-2b resume: freeze backbone, train fusion only (1s predict).
+# Tri-modal Stage-2b: freeze backbone, train fusion only (1s predict).
 #
-# Why val dropped (39.28→38.74, below video 40.44):
-#   Fusion LR 1e-4 was too high. Random gaze/IMU encoders + opening W_o/gate
-#   inject noise into a strong frozen video path before aux features help.
-# This resume: lower fusion LR (1e-5), larger batch (32) for util≥60%,
-# warm from *best* (not declining latest), fresh optimizer.
+# Util-kill root cause (AveUtil≈19%):
+#   decode≈20s/batch vs step≈4s → theoretical util ≈20% when DataLoader
+#   workers cannot stay ahead. Prior prefetch_factor=6 × depth=16 held
+#   ~60GB of 0.8GB float32 batches → workers stalled → every next()≈20s.
+#
+# Fixes this job:
+#   1) Small in-flight tensor budget (pf=2, depth=4) so 16 workers actually
+#      parallelize → decode inter-arrival ≈20/16s → GPU stays busy (≥60%).
+#   2) pin_memory=False to avoid a second host copy of huge batches.
+#   3) time=01:50 + auto-resubmit if epochs remain (dodge 2h kill).
+#   4) Warm from historical 39.82% fusion (ep3best); best-tracker floor.
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
 PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
+SCRIPT_PATH="${PROJECT_ROOT}/scripts/submit_b12_tri_modal_s2_from_p01video_jointv2_1xh100.slurm"
 
 ANN_DIR="/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/clip_split"
 VIDEO_ROOT_REMOTE="/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_videos"
@@ -31,11 +41,13 @@ HDEPIC_ANN_ROOT="/scratch/ll5914/datasets/HD-EPIC/hd-epic-annotations/narrations
 CHECKPOINT="/scratch/ll5914/models/vjepa2/vitl.pt"
 
 JOINT_V2_RUN="/scratch/ll5914/experiments/p01_video_pred_joint_heads_clip/action_anticipation_frozen/p01-video-pred-joint-heads-vitl16-256-10ep"
+EP3BEST_RUN="/scratch/ll5914/experiments/tri_modal_fusion_s2_from_p01video_jointv2/action_anticipation_frozen/tri-modal-s2-from-p01video-jointv2-ep3best-vitl16-256-10ep-1xh100"
 
 OUTPUT_DIR="/scratch/ll5914/experiments/tri_modal_fusion_s2_from_p01video_jointv2"
 CONFIG_PATH="/scratch/ll5914/logs/tri_modal_fusion_s2_from_p01video_jointv2_fusiononly_1xh100_config.yaml"
 TAG="tri-modal-s2-jointv2-fusiononly-cold-vitl16-256-10ep-1xh100"
 RUN_DIR="${OUTPUT_DIR}/action_anticipation_frozen/${TAG}"
+DONE_FLAG="${RUN_DIR}/TRAINING_DONE"
 
 GAZE_EXTRACT_ROOT="/scratch/ll5914/datasets/HD-EPIC/_gaze_extract"
 GAZE_ROOT="/scratch/ll5914/datasets/HD-EPIC/SLAM-and-Gaze"
@@ -43,45 +55,77 @@ GAZE_SYNC_ROOT="/scratch/ll5914/datasets/HD-EPIC/HD-EPIC/Videos"
 POSE_SLAM_ROOT="/scratch/ll5914/datasets/HD-EPIC/SLAM-and-Gaze/P01/SLAM/multi"
 POSE_MAPPING_JSON="${POSE_SLAM_ROOT}/vrs_to_multi_slam.json"
 
-mkdir -p /scratch/ll5914/logs "${OUTPUT_DIR}"
+NUM_EPOCHS=10
+mkdir -p /scratch/ll5914/logs "${OUTPUT_DIR}" "${RUN_DIR}"
+
+if [[ -f "${DONE_FLAG}" ]]; then
+  echo "Already done (${DONE_FLAG}); exiting."
+  exit 0
+fi
 
 STAGE_ROOT="${STAGE_ROOT:-/dev/shm/${USER}/hdepic_p01_${SLURM_JOB_ID:-manual}}"
 VIDEO_ROOT="${STAGE_ROOT}"
+_RESUBMITTED=0
+request_resubmit() {
+  if [[ -f "${DONE_FLAG}" ]]; then
+    return 0
+  fi
+  if [[ "${_RESUBMITTED}" == "1" ]]; then
+    return 0
+  fi
+  _RESUBMITTED=1
+  echo "Auto-resubmitting next chunk (util-kill / walltime / continue)..."
+  sbatch "${SCRIPT_PATH}" || echo "WARN: sbatch resubmit failed" >&2
+}
 cleanup_stage() {
   if [[ -n "${STAGE_ROOT:-}" && -d "${STAGE_ROOT}" ]]; then
     echo "Cleaning staged videos: ${STAGE_ROOT}"
     rm -rf "${STAGE_ROOT}" || true
   fi
 }
+on_signal() {
+  echo "Caught signal — requesting resubmit before exit @ $(date)"
+  request_resubmit
+  # Stop training process if still running.
+  if [[ -n "${TRAIN_PID:-}" ]] && kill -0 "${TRAIN_PID}" 2>/dev/null; then
+    kill -TERM "${TRAIN_PID}" 2>/dev/null || true
+  fi
+}
 trap cleanup_stage EXIT
+trap on_signal USR1 TERM
 
-# Prefer declining-run *best* (39.28%@ep1). Fresh opt (resume_checkpoint=False)
-# because LR/batch recipe changed — do not restore the old 1e-4 optimizer.
+# Prefer this run's best; else historical ep3best fusion (39.82%); else joint-v2 cold.
 WARM_SRC="joint_v2"
 PROBE_CKPT="${JOINT_V2_RUN}/best.pt"
 ENCODER_LORA_CKPT="${JOINT_V2_RUN}/encoder_lora_best.pt"
 PREDICTOR_LORA_CKPT="${JOINT_V2_RUN}/predictor_lora_best.pt"
 FUSION_CKPT=""
 RESUME=0
+BEST_FLOOR="39.8155"
 
-if [[ -f "${RUN_DIR}/best.pt" && -f "${RUN_DIR}/tri_modal_fusion_best.pt" ]]; then
-  WARM_SRC="run_best_lowlr"
+if [[ -f "${RUN_DIR}/latest.pt" && -f "${RUN_DIR}/tri_modal_fusion_latest.pt" ]]; then
+  # Continue mid-run with optimizer/schedulers (chunked 1:50 jobs).
+  WARM_SRC="run_latest_resume"
+  PROBE_CKPT="${RUN_DIR}/latest.pt"
+  ENCODER_LORA_CKPT="${RUN_DIR}/encoder_lora_latest.pt"
+  PREDICTOR_LORA_CKPT="${RUN_DIR}/predictor_lora_latest.pt"
+  FUSION_CKPT="${RUN_DIR}/tri_modal_fusion_latest.pt"
+  RESUME=1
+elif [[ -f "${RUN_DIR}/best.pt" && -f "${RUN_DIR}/tri_modal_fusion_best.pt" ]]; then
+  WARM_SRC="run_best_fresh_opt"
   PROBE_CKPT="${RUN_DIR}/best.pt"
   ENCODER_LORA_CKPT="${RUN_DIR}/encoder_lora_best.pt"
   PREDICTOR_LORA_CKPT="${RUN_DIR}/predictor_lora_best.pt"
   FUSION_CKPT="${RUN_DIR}/tri_modal_fusion_best.pt"
   RESUME=0
-elif [[ -f "${RUN_DIR}/latest.pt" && -f "${RUN_DIR}/tri_modal_fusion_latest.pt" ]]; then
-  WARM_SRC="run_latest_lowlr"
-  PROBE_CKPT="${RUN_DIR}/latest.pt"
-  ENCODER_LORA_CKPT="${RUN_DIR}/encoder_lora_latest.pt"
-  PREDICTOR_LORA_CKPT="${RUN_DIR}/predictor_lora_latest.pt"
-  FUSION_CKPT="${RUN_DIR}/tri_modal_fusion_latest.pt"
+elif [[ -f "${EP3BEST_RUN}/tri_modal_fusion_best.pt" ]]; then
+  WARM_SRC="ep3best_fusion_39p82"
+  FUSION_CKPT="${EP3BEST_RUN}/tri_modal_fusion_best.pt"
   RESUME=0
 fi
 
 echo "========================================================"
-echo "Tri-modal fusion-only resume (low LR + batch32 util)"
+echo "Tri-modal fusion-only (util-safe prefetch + 1:50 chunks)"
 echo "Job  : ${SLURM_JOB_ID:-manual}  Node: $(hostname)"
 echo "Start: $(date)"
 echo "WarmSrc: ${WARM_SRC}  resume_checkpoint=${RESUME}"
@@ -89,7 +133,7 @@ echo "Probe : ${PROBE_CKPT}"
 echo "EncLoRA: ${ENCODER_LORA_CKPT} (FROZEN)"
 echo "PredLoRA: ${PREDICTOR_LORA_CKPT} (FROZEN)"
 echo "Fusion: ${FUSION_CKPT:-<cold init>}"
-echo "Fusion LR: 1e-5 (was 1e-4); batch=32; target util>60%"
+echo "Util: workers=16 pf=2 depth=4 pin_memory=0; floor=${BEST_FLOOR}"
 echo "Target: beat joint-v2 video Top-5 40.44%"
 echo "Staging videos: ${VIDEO_ROOT_REMOTE}/P01 -> ${STAGE_ROOT}"
 df -h /dev/shm || true
@@ -114,11 +158,14 @@ fi
 export PYTHONPATH="${PROJECT_ROOT}:${VJEPA_ROOT}:${PYTHONPATH:-}"
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
-# Deeper prefetch: overlap more decode/gaze/IMU with GPU (util-kill mitigation).
-export TRI_MODAL_PREFETCH_DEPTH=8
-export DATALOADER_PREFETCH_DEPTH=8
+# Slim queues so DataLoader workers can actually stay ahead of the GPU.
+export TRI_MODAL_PREFETCH_DEPTH=4
+export TRI_MODAL_AUX_WORKERS=4
+export DATALOADER_PREFETCH_DEPTH=2
+export TRI_MODAL_GAZE_MAP_CACHE=256
 export GAZE_DECODER_CACHE_READER=1
-export GAZE_DECODER_NUM_THREADS="${GAZE_DECODER_NUM_THREADS:-4}"
+export GAZE_DECODER_NUM_THREADS="${GAZE_DECODER_NUM_THREADS:-1}"
+export BEST_METRIC_FLOOR="${BEST_FLOOR}"
 
 "${PYTHON}" - <<PY
 import sys, yaml
@@ -137,7 +184,6 @@ cfg['cpus_per_task'] = 32
 cfg['tag']  = '${TAG}'
 cfg['eval_name'] = 'app.hdepic_lora_action_anticipation'
 cfg['folder'] = '${OUTPUT_DIR}'
-# Fresh opt/schedulers (LR recipe changed); weights loaded from best sidecars.
 cfg['resume_checkpoint'] = resume
 cfg['val_only'] = False
 data = cfg['experiment']['data']
@@ -146,19 +192,21 @@ data.update({
     'base_path': '${VIDEO_ROOT}',
     'dataset_train': '${ANN_DIR}/HD_EPIC_train_vjepa.csv',
     'dataset_val': '${ANN_DIR}/HD_EPIC_val_vjepa.csv',
+    # 16 workers × pf=2: ~26GB in-flight (was ~65GB) so next() can stay << step.
     'num_workers': 16, 'val_num_workers': 4, 'clip_balanced': True,
-    'prefetch_factor': 8,
+    'prefetch_factor': 2,
+    'pin_memory': False,
     'resolution': 256, 'frames_per_clip': 32, 'frames_per_second': 8,
     'anticipation_time_sec': [1.0, 1.0],
     'train_anticipation_time_sec': [0.25, 1.75],
 })
 opt = cfg['experiment']['optimization']
 opt.update({
-    # ~20GB used at bs=16 on 80GB H100 → bs=32 roughly doubles GPU work / step.
-    'batch_size': 32, 'num_epochs': 10, 'use_bfloat16': True,
-    'use_focal_loss': False, 'val_every_epochs': 3, 'best_metric': 'val-action-top5',
+    'batch_size': 32, 'num_epochs': ${NUM_EPOCHS}, 'use_bfloat16': True,
+    'use_focal_loss': False, 'val_every_epochs': 1, 'best_metric': 'val-action-top5',
+    'best_metric_floor': float('${BEST_FLOOR}'),
     'early_stopping_patience': 4, 'grad_clip': 1.0,
-    # Fusion absolute LR = lr_mult * lr = 0.5 * 2e-5 = 1e-5 (was 1e-4).
+    # Fusion absolute LR = lr_mult * lr = 0.5 * 2e-5 = 1e-5.
     'multihead_kwargs': [{
         'weight_decay': 0.0001, 'final_weight_decay': 0.0001,
         'lr': 0.00002, 'start_lr': 0.0, 'final_lr': 0.0, 'warmup': 1,
@@ -174,7 +222,6 @@ fusion_block = {
     'token_budget_ratio': [1.0, 0.5, 0.1],
     'gaze_token_ratio': 0.5,
     'imu_token_ratio': 0.1,
-    # Keep 10 to match existing fusion_best.pt shapes (n_gaze=100).
     'gaze_grid_size': 10,
     'imu_encoder_type': 'gru',
     'fusion_num_heads': 4,
@@ -247,7 +294,48 @@ print(f'Config written: {config_path} (resume_ckpt={resume}, fusion={fusion_ckpt
 PY
 
 cd "${VJEPA_ROOT}"
-"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0
+set +e
+"${PYTHON}" -m evals.main --fname "${CONFIG_PATH}" --devices cuda:0 &
+TRAIN_PID=$!
+wait "${TRAIN_PID}"
+train_rc=$?
+TRAIN_PID=""
+set -e
 
-echo "Tri-modal fusion-only resume complete: $(date)"
+echo "Training process exit_code=${train_rc} at $(date)"
+
+# Mark done / decide whether to chain another 1:50 chunk.
+"${PYTHON}" - <<PY
+from pathlib import Path
+run = Path("${RUN_DIR}")
+done = run / "TRAINING_DONE"
+latest = run / "latest.pt"
+num_epochs = int("${NUM_EPOCHS}")
+if latest.is_file():
+    import torch
+    ck = torch.load(latest, map_location="cpu", weights_only=False)
+    epoch = int(ck.get("epoch", -1) or -1)
+    bad = int(ck.get("bad_validations", 0) or 0)
+    patience = 4
+    print(f"latest epoch={epoch} bad_validations={bad}")
+    if epoch >= num_epochs - 1:
+        done.write_text(f"finished epoch={epoch}\n")
+        print("TRAINING_DONE: reached final epoch")
+    elif bad >= patience:
+        done.write_text(f"early_stop epoch={epoch} bad={bad}\n")
+        print("TRAINING_DONE: early stop")
+print(f"NEED_RESUBMIT={0 if done.is_file() else 1}")
+PY
+
+if [[ ! -f "${DONE_FLAG}" ]]; then
+  request_resubmit
+else
+  echo "Tri-modal fusion-only complete: $(date)"
+fi
+
 echo "Checkpoints: ${RUN_DIR}/{best.pt,tri_modal_fusion_best.pt}"
+# Always exit 0 after a successful requeue so dependency chains keep moving.
+if [[ "${_RESUBMITTED}" == "1" || -f "${DONE_FLAG}" ]]; then
+  exit 0
+fi
+exit ${train_rc}
