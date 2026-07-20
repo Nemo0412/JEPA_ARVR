@@ -24,16 +24,21 @@ set -euo pipefail
 #   ~60GB of 0.8GB float32 batches → workers stalled → every next()≈20s.
 #
 # Fixes this job:
-#   1) Small in-flight tensor budget (pf=2, depth=4) so 16 workers actually
-#      parallelize → decode inter-arrival ≈20/16s → GPU stays busy (≥60%).
-#   2) pin_memory=False to avoid a second host copy of huge batches.
-#   3) time=01:50 + auto-resubmit if epochs remain (dodge 2h kill).
-#   4) Warm from historical 39.82% fusion (ep3best); best-tracker floor.
+#   1) Persistent decoded-clip cache on scratch (TRI_MODAL_FRAME_CACHE) so
+#      get_batch is replaced by np.load after prefill/warmup → AveUtil≥60%.
+#   2) Fixed train anticipation=1.0s (matches val + cache keys); mild vs [0.25,1.75].
+#   3) Small in-flight tensor budget (pf=2, depth=4) + 16 workers + pin_memory=0.
+#   4) time=01:50 + auto-resubmit (dodge 2h util-kill even during cache warmup).
+#   5) best-metric floor so weaker vals cannot overwrite a stronger best.pt.
+#
+# Prefill (CPU, optional but recommended before/while GPU runs):
+#   sbatch scripts/submit_prefill_p01_clip_frame_cache.slurm
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
 PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
 SCRIPT_PATH="${PROJECT_ROOT}/scripts/submit_b12_tri_modal_s2_from_p01video_jointv2_1xh100.slurm"
+FRAME_CACHE_ROOT="${TRI_MODAL_FRAME_CACHE:-/scratch/ll5914/datasets/HD-EPIC/_clip_frame_cache/p01_f32_at1}"
 
 ANN_DIR="/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/clip_split"
 VIDEO_ROOT_REMOTE="/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_videos"
@@ -133,13 +138,13 @@ echo "Probe : ${PROBE_CKPT}"
 echo "EncLoRA: ${ENCODER_LORA_CKPT} (FROZEN)"
 echo "PredLoRA: ${PREDICTOR_LORA_CKPT} (FROZEN)"
 echo "Fusion: ${FUSION_CKPT:-<cold init>}"
-echo "Util: workers=16 pf=2 depth=4 pin_memory=0; floor=${BEST_FLOOR}"
+echo "Util: frame_cache=${FRAME_CACHE_ROOT}; workers=16 pf=2 depth=4 pin_memory=0; floor=${BEST_FLOOR}"
 echo "Target: beat joint-v2 video Top-5 40.44%"
 echo "Staging videos: ${VIDEO_ROOT_REMOTE}/P01 -> ${STAGE_ROOT}"
 df -h /dev/shm || true
 echo "========================================================"
 
-mkdir -p "${STAGE_ROOT}/P01"
+mkdir -p "${FRAME_CACHE_ROOT}" "${STAGE_ROOT}/P01"
 echo "Copying P01 videos into RAM disk (follow symlinks)..."
 rsync -aL --info=stats2 "${VIDEO_ROOT_REMOTE}/P01/" "${STAGE_ROOT}/P01/"
 echo "Stage done: $(du -sh "${STAGE_ROOT}" | awk '{print $1}') @ $(date)"
@@ -166,6 +171,8 @@ export TRI_MODAL_GAZE_MAP_CACHE=256
 export GAZE_DECODER_CACHE_READER=1
 export GAZE_DECODER_NUM_THREADS="${GAZE_DECODER_NUM_THREADS:-1}"
 export BEST_METRIC_FLOOR="${BEST_FLOOR}"
+# Persistent decoded-clip cache (survives util-kill; next resume hits disk).
+export TRI_MODAL_FRAME_CACHE="${FRAME_CACHE_ROOT}"
 
 "${PYTHON}" - <<PY
 import sys, yaml
@@ -198,7 +205,8 @@ data.update({
     'pin_memory': False,
     'resolution': 256, 'frames_per_clip': 32, 'frames_per_second': 8,
     'anticipation_time_sec': [1.0, 1.0],
-    'train_anticipation_time_sec': [0.25, 1.75],
+    # Fixed 1.0s → deterministic frame indices → frame-cache keys match prefill/val.
+    'train_anticipation_time_sec': [1.0, 1.0],
 })
 opt = cfg['experiment']['optimization']
 opt.update({
@@ -291,6 +299,7 @@ config_path.parent.mkdir(parents=True, exist_ok=True)
 with config_path.open('w') as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
 print(f'Config written: {config_path} (resume_ckpt={resume}, fusion={fusion_ckpt or "cold"})')
+print(f'Frame cache: ${FRAME_CACHE_ROOT}')
 PY
 
 cd "${VJEPA_ROOT}"

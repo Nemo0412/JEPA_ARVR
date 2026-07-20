@@ -292,7 +292,13 @@ class ClipBalancedDecodeVideosToClips(wds.PipelineStage):
                             "decoder_num_threads": self.decoder_num_threads,
                         },
                     )
-                    buffer = vr.get_batch(indices).asnumpy().copy()
+                    from app.hdepic_lora_action_anticipation.clip_frame_cache import load_or_decode_clip
+
+                    buffer = load_or_decode_clip(
+                        video_id=video_id,
+                        indices=indices,
+                        decode_fn=lambda: vr.get_batch(indices).asnumpy().copy(),
+                    )
                     self._trace_sample(
                         "after_decode",
                         {
