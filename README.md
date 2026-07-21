@@ -55,20 +55,22 @@ IMU = SLAM 6D proxy (gyro+vel), not raw accelerometer CSV. **MTP multi-horizon i
 |---|---|---:|---|
 | Soft-FT from video joint | Fusion + enc LoRA + heads | 39.82% | Video path drifted; worse than 40.44% |
 | Fusion-only cold (LR 1e-4, bs16) | Fusion only | 39.28% | Still below video; val dropped ep1→3; util-kill AveUtil≈36% |
-| Fusion-only resume (LR **1e-5**, bs**32**) | Fusion only from best | **39.80%** peak | Below video 40.44%; util-kill AveUtil≈19% (`14193917`); continuing with frame-cache recipe |
+| Fusion-only resume (LR **1e-5**, bs**32**) | Fusion only from best | **39.80%** peak | Early-stopped @ep5 below video 40.44%; floor held at 39.82% |
+| **Joint** from video 40.44% (running) | Fusion + **pred LoRA** + **heads** | — | New run; encoder LoRA frozen (RGB-aligned); gate closed-init |
 
-Drop cause (fusion-only): fusion LR too high opened residual onto **random** gaze/IMU encoders before aux helped; first val already after ep1 of aggressive updates (never measured true identity ≈40.44%).
+Drop cause (fusion-only): frozen heads only accept pure-video features; random aux + residual shift drops accuracy. **Cannot warm from gaze+pose 42.74%** — that encoder sees 5ch adapter-fused RGB, not pure RGB.
 
 ```text
-# Submit / resume (auto-chains 1:50 chunks; enables scratch clip cache)
+# NEW: joint tri-modal (pred LoRA + heads + fusion) from video joint 40.44%
+scripts/submit_b12_tri_modal_joint_from_p01video_jointv2_1xh100.slurm
+# Run dir:
+/scratch/ll5914/experiments/tri_modal_joint_from_p01video_jointv2/action_anticipation_frozen/tri-modal-joint-from-videov2-vitl16-256-10ep-1xh100/
+
+# Legacy fusion-only (failed to beat 40.44%)
 scripts/submit_b12_tri_modal_s2_from_p01video_jointv2_1xh100.slurm
 
 # Optional CPU prefill (no GPU → no util-kill) before/while GPU runs
 scripts/submit_prefill_p01_clip_frame_cache.slurm
-
-# Run dir (fusion-only cold)
-/scratch/ll5914/experiments/tri_modal_fusion_s2_from_p01video_jointv2/action_anticipation_frozen/tri-modal-s2-jointv2-fusiononly-cold-vitl16-256-10ep-1xh100/
-  best.pt  tri_modal_fusion_best.pt  topk_log_r0.csv
 ```
 
 #### How we raise GPU utilization (tri-modal / decode-bound jobs)
