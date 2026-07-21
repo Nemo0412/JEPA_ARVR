@@ -10,7 +10,7 @@ eval_name: app.hdepic_lora_action_anticipation
 
 ---
 
-## Best Val Action Top-5 (as of 2026-07-13)
+## Best Val Action Top-5 (as of 2026-07-17)
 
 Metric: **val action Top-5 accuracy** from `topk_log_r0.csv`.  
 Backbone: **ViT-L/16 @ 256**, horizon ≈ **1s**, temporal sampling `phd_reference` unless noted.  
@@ -39,9 +39,54 @@ Cluster runs use **1×H100** unless noted.
 | Gaze+pose stage-2 (predictor LoRA only) | 40.59% | Previous P01 best (completed) |
 | Gaze+pose **joint v2** (predictor + **heads**; pooler frozen) | **42.74%** @ep2 | **Best P01 Top-5**; early-stopped @ep5 (patience 3) |
 | Gaze+pose joint v1 (predictor + **full probe** @ 2e-5) | 37.42% → 28.02% | **Collapsed**; early-stopped @ep5 (forgetting, not NaN) |
+| Tri-modal soft-FT (enc LoRA+heads+fusion from video joint) | **39.82%** → 39.58% | Declining; util-killed @ep3 (`13594209`) |
+| Tri-modal **fusion-only** (freeze backbone; cold from video joint) | **39.28%** → 38.74% | Below video joint; util-killed (`14092744`); resume low-LR `14113917` |
 
-**P01 leader:** Gaze+pose joint v2 (heads) **42.74%**.
+**P01 leader:** Gaze+pose joint v2 (heads) **42.74%**.  
+**Video baseline to beat for tri-modal:** joint v2 **40.44%**.
 
+#### Tri-modal (video + gaze map + SLAM-IMU proxy) — status 2026-07-17
+
+Architecture: `ProjectedTriModalCrossAttention` between frozen V-JEPA encoder output and predictor  
+(`gaze.mode=projected_tri_modal_cross_attention`). Tokens ≈ video:gaze:IMU = **256:100:26**.  
+IMU = SLAM 6D proxy (gyro+vel), not raw accelerometer CSV. **MTP multi-horizon is off** (1s only).
+
+| Recipe | Trainable | Best Top-5 | Outcome |
+|---|---|---:|---|
+| Soft-FT from video joint | Fusion + enc LoRA + heads | 39.82% | Video path drifted; worse than 40.44% |
+| Fusion-only cold (LR 1e-4, bs16) | Fusion only | 39.28% | Still below video; val dropped ep1→3; util-kill AveUtil≈36% |
+| Fusion-only resume (LR **1e-5**, bs**32**) | Fusion only from best | **39.80%** peak | Early-stopped @ep5 below video 40.44%; floor held at 39.82% |
+| **Joint** from video 40.44% (running) | Fusion + **pred LoRA** + **heads** | — | New run; encoder LoRA frozen (RGB-aligned); gate closed-init |
+
+Drop cause (fusion-only): frozen heads only accept pure-video features; random aux + residual shift drops accuracy. **Cannot warm from gaze+pose 42.74%** — that encoder sees 5ch adapter-fused RGB, not pure RGB.
+
+```text
+# NEW: joint tri-modal (pred LoRA + heads + fusion) from video joint 40.44%
+scripts/submit_b12_tri_modal_joint_from_p01video_jointv2_1xh100.slurm
+# Run dir:
+/scratch/ll5914/experiments/tri_modal_joint_from_p01video_jointv2/action_anticipation_frozen/tri-modal-joint-from-videov2-vitl16-256-10ep-1xh100/
+
+# Legacy fusion-only (failed to beat 40.44%)
+scripts/submit_b12_tri_modal_s2_from_p01video_jointv2_1xh100.slurm
+
+# Optional CPU prefill (no GPU → no util-kill) before/while GPU runs
+scripts/submit_prefill_p01_clip_frame_cache.slurm
+```
+
+#### How we raise GPU utilization (tri-modal / decode-bound jobs)
+
+Cluster cancels jobs with **AveUtil &lt; 60% for &gt;2h**. Tri-modal fusion-only is decode-bound: `decord.get_batch` ≈10–20s/batch vs GPU step ≈4s → theoretical util ≈20–30% even with async prefetch.
+
+| Layer | What we do | Effect |
+|---|---|---|
+| **Decoded-clip cache** | `TRI_MODAL_FRAME_CACHE` on scratch; uint8 `(T,H,W,C)` keyed by `video_id`+frame indices (`clip_frame_cache.py`) | After prefill/warmup, decode → `np.load` (tens of ms) → GPU can stay busy (**target AveUtil ≥60%**) |
+| **Cache-aligned train horizon** | `train_anticipation_time_sec=[1.0,1.0]` (same as val / `phd_reference` point) | Deterministic indices → cache keys match prefill; mild vs old `[0.25,1.75]` |
+| **CPU prefill** | `submit_prefill_p01_clip_frame_cache.slurm` | Warms cache without holding a GPU |
+| **Prefetch RAM budget** | `num_workers=16`, `prefetch_factor=2`, `TRI_MODAL_PREFETCH_DEPTH=4`, `pin_memory=False` | Avoid ~60GB in-flight float batches that stalled workers (prior util≈19%) |
+| **Wall-clock dodge** | `#SBATCH --time=01:50:00` + `USR1/TERM` auto-`sbatch` resume | Survives util-kill / timeout; next chunk inherits warm cache + `latest.pt` |
+| **Best-metric floor** | Always restore best tracker + `best_metric_floor` | Weaker vals cannot overwrite a stronger `best.pt` after resume |
+
+Logs to watch: `decode:` / `batch_wait:` should fall well below `step:` once `TRI_MODAL_FRAME_CACHE stats: hit_rate` is high.
 #### Best P01 checkpoint (saved on scratch)
 
 ```text
@@ -58,6 +103,8 @@ Cluster runs use **1×H100** unless noted.
 1. **`--debugmode false` bug:** `argparse` `type=bool` makes `bool("false") is True`, forcing single-GPU debug path. Fixed parser in `vjepa2/evals/main.py` and removed the bad flag from submit scripts; parent now `join()`s workers.
 2. **Gaze joint collapse:** full probe + predictor LoRA caused action forgetting. Joint keeps pooler frozen and trains **heads only**.
 3. **Arch depth14 `KeyError: 'predictor'`:** depth must be set under `model_kwargs.pretrain_kwargs.predictor`, not `model_kwargs.predictor`.
+4. **Tri-modal val crash:** `ClipBalancedDecodeVideosToClips.mtp_horizons_sec` AttributeError in workers — defensive `getattr` (MTP unused for 1s tri-modal).
+5. **Tri-modal util-kill:** video decode ≫ GPU step. Mitigations: scratch **decoded-clip cache** (`TRI_MODAL_FRAME_CACHE`), slim DataLoader prefetch, `/dev/shm` staging, **1:50** auto-resubmit chunks (see “How we raise GPU utilization” above).
 
 ---
 

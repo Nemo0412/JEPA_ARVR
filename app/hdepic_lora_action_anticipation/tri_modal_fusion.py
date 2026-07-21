@@ -188,6 +188,12 @@ class ModalityProjections(nn.Module):
             nn.GELU(),
             nn.Linear(embed_dim, embed_dim),
         )
+        # Start nearly closed: sigmoid(-4)≈0.018 so early updates stay near identity
+        # until aux encoders become useful (avoids injecting random gaze/IMU noise).
+        nn.init.zeros_(self.gate[0].weight)
+        nn.init.zeros_(self.gate[0].bias)
+        nn.init.zeros_(self.gate[2].weight)
+        nn.init.constant_(self.gate[2].bias, -4.0)
 
     def project_qkv(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.w_q(z), self.w_k(z), self.w_v(z)
@@ -564,6 +570,11 @@ class TriModalFusionAdaptedModel(nn.Module):
         x_full = base.encoder(clips)
         if torch.is_tensor(x_full) and not torch.isfinite(x_full).all():
             return None
+        # Fusion-only recipes freeze the video encoder: drop its activations from the
+        # autograd graph so backward only touches gaze/IMU/fusion (saves H100 memory
+        # → larger batches → more GPU work per decode).
+        if not any(p.requires_grad for p in base.encoder.parameters()):
+            x_full = x_full.detach()
         if base.no_predictor:
             return x_full
 
@@ -727,11 +738,12 @@ def _prepare_aux_cpu(
 
 
 class _TriModalBatchPrefetcher:
-    """Background producer: ``next(dataloader)`` + gaze/IMU CPU overlap GPU.
+    """Two-stage producer: decode ‖ gaze/IMU, then feed GPU.
 
-    Previous code only async'd gaze/IMU *after* a synchronous ``next(loader)`` on
-    the main thread — video-decode stalls (10–40s) still idled the H100 and
-    triggered cluster util-kill. This class moves the full fetch into a worker.
+    Stage A: ``next(dataloader)`` only (video decode / collate).
+    Stage B: gaze rasterize + IMU load on a thread pool.
+    Overlapping A and B cuts wall-clock fetch when aux is a large fraction of
+    the old sequential ``next+aux`` path (needed for >60% GPU util).
     """
 
     def __init__(
@@ -741,34 +753,102 @@ class _TriModalBatchPrefetcher:
         imu_loader: ImuTrajectoryLoader,
         *,
         depth: int = 3,
+        aux_workers: int | None = None,
     ):
         self.data_loader = data_loader
         self.gaze_map_builder = gaze_map_builder
         self.imu_loader = imu_loader
-        self.depth = max(1, int(depth))
+        self.depth = max(2, int(depth))
+        if aux_workers is None:
+            aux_workers = int(os.environ.get("TRI_MODAL_AUX_WORKERS", "2") or "2")
+        self.aux_workers = max(1, int(aux_workers))
+        # Raw video batches waiting for aux; keep at least 1 in flight.
+        self._raw_q: queue.Queue = queue.Queue(maxsize=max(2, self.depth))
         self._q: queue.Queue = queue.Queue(maxsize=self.depth)
         self._stop = threading.Event()
         self._error: BaseException | None = None
-        self._thread = threading.Thread(target=self._run, name="tri-modal-prefetch", daemon=True)
-        self._thread.start()
+        self._aux_pool = __import__("concurrent.futures", fromlist=["ThreadPoolExecutor"]).ThreadPoolExecutor(
+            max_workers=self.aux_workers, thread_name_prefix="tri-aux"
+        )
+        self._decode_thread = threading.Thread(target=self._run_decode, name="tri-modal-decode", daemon=True)
+        self._aux_thread = threading.Thread(target=self._run_aux, name="tri-modal-aux", daemon=True)
+        self._decode_thread.start()
+        self._aux_thread.start()
+        logger.info(
+            "TriModalBatchPrefetcher pipeline: ready_depth=%d raw_depth=%d aux_workers=%d",
+            self.depth,
+            self._raw_q.maxsize,
+            self.aux_workers,
+        )
 
-    def _run(self):
+    def _fail(self, exc: BaseException) -> None:
+        self._error = exc
+        self._stop.set()
+        for q in (self._raw_q, self._q):
+            try:
+                q.put_nowait(None)
+            except queue.Full:
+                pass
+
+    def _run_decode(self) -> None:
         _data_loader = iter(self.data_loader)
         while not self._stop.is_set():
             t0 = time.time()
             try:
                 try:
                     udata = next(_data_loader)
-                except Exception:
+                except StopIteration:
                     _data_loader = iter(self.data_loader)
                     udata = next(_data_loader)
-                gaze_cpu, imu_cpu = _prepare_aux_cpu(self.gaze_map_builder, self.imu_loader, udata)
-                fetch_ms = (time.time() - t0) * 1000.0
-                # Block here when GPU is behind — that is fine; producer stays warm.
-                self._q.put((udata, gaze_cpu, imu_cpu, fetch_ms))
-            except BaseException as exc:  # noqa: BLE001 — surface to consumer
-                self._error = exc
-                self._q.put(None)
+                decode_ms = (time.time() - t0) * 1000.0
+                self._raw_q.put((udata, decode_ms))
+            except BaseException as exc:  # noqa: BLE001
+                self._fail(exc)
+                return
+
+    def _run_aux(self) -> None:
+        pending: list = []
+        while not self._stop.is_set():
+            try:
+                # Reap completed aux jobs first so ready_q stays full.
+                still = []
+                for fut in pending:
+                    if not fut.done():
+                        still.append(fut)
+                        continue
+                    try:
+                        item = fut.result()
+                    except BaseException as exc:  # noqa: BLE001
+                        self._fail(exc)
+                        return
+                    self._q.put(item)
+                pending = still
+
+                if len(pending) >= self.aux_workers:
+                    time.sleep(0.001)
+                    continue
+
+                try:
+                    raw = self._raw_q.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                if raw is None:
+                    self._q.put(None)
+                    return
+                udata, decode_ms = raw
+
+                def _job(u=udata, d_ms=decode_ms):
+                    t1 = time.time()
+                    gaze_cpu, imu_cpu = _prepare_aux_cpu(self.gaze_map_builder, self.imu_loader, u)
+                    aux_ms = (time.time() - t1) * 1000.0
+                    # fetch_ms ≈ decode + aux wall if sequential; report sum for logs
+                    # but pipeline hides aux behind next decode.
+                    fetch_ms = float(d_ms) + float(aux_ms)
+                    return (u, gaze_cpu, imu_cpu, fetch_ms, float(d_ms), float(aux_ms))
+
+                pending.append(self._aux_pool.submit(_job))
+            except BaseException as exc:  # noqa: BLE001
+                self._fail(exc)
                 return
 
     def get(self):
@@ -777,17 +857,38 @@ class _TriModalBatchPrefetcher:
             if self._error is not None:
                 raise RuntimeError("tri-modal batch prefetcher failed") from self._error
             raise RuntimeError("tri-modal batch prefetcher stopped unexpectedly")
+        # Back-compat: allow 4-tuple or 6-tuple
+        if len(item) == 4:
+            return item
+        udata, gaze_cpu, imu_cpu, fetch_ms, _decode_ms, _aux_ms = item
+        return udata, gaze_cpu, imu_cpu, fetch_ms
+
+    def get_detailed(self):
+        item = self._q.get()
+        if item is None:
+            if self._error is not None:
+                raise RuntimeError("tri-modal batch prefetcher failed") from self._error
+            raise RuntimeError("tri-modal batch prefetcher stopped unexpectedly")
+        if len(item) == 4:
+            udata, gaze_cpu, imu_cpu, fetch_ms = item
+            return udata, gaze_cpu, imu_cpu, fetch_ms, fetch_ms, 0.0
         return item
 
     def close(self):
         self._stop.set()
-        # Drain so producer is not stuck on full queue.
-        try:
-            while True:
-                self._q.get_nowait()
-        except queue.Empty:
-            pass
-        self._thread.join(timeout=5.0)
+        for q in (self._raw_q, self._q):
+            try:
+                while True:
+                    q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait(None)
+            except queue.Full:
+                pass
+        self._decode_thread.join(timeout=5.0)
+        self._aux_thread.join(timeout=5.0)
+        self._aux_pool.shutdown(wait=False)
 
 
 def train_one_epoch_with_tri_modal_fusion(
@@ -851,12 +952,14 @@ def train_one_epoch_with_tri_modal_fusion(
     # Depth>=2 so next(dataloader)+gaze/IMU stay off the main thread while GPU runs.
     prefetch_depth = max(2, int(os.environ.get("TRI_MODAL_PREFETCH_DEPTH", "3")))
     logger.info(
-        "tri_modal train async prefetch: depth=%d (dataloader+gaze/IMU off main thread)",
+        "tri_modal train async prefetch: depth=%d (decode‖aux pipeline)",
         prefetch_depth,
     )
     prefetcher = _TriModalBatchPrefetcher(
         data_loader, gaze_map_builder, imu_loader, depth=prefetch_depth
     )
+    decode_meter = AverageMeter()
+    aux_meter = AverageMeter()
     try:
         for itr in range(ipe):
             itr_start_time = time.time()
@@ -864,9 +967,11 @@ def train_one_epoch_with_tri_modal_fusion(
             [wds_.step() for wds_ in wd_scheduler]
 
             wait_t0 = time.time()
-            udata, gaze_cpu, imu_cpu, fetch_ms = prefetcher.get()
+            udata, gaze_cpu, imu_cpu, fetch_ms, decode_ms, aux_ms = prefetcher.get_detailed()
             batch_wait_meter.update((time.time() - wait_t0) * 1000.0)
             fetch_meter.update(float(fetch_ms))
+            decode_meter.update(float(decode_ms))
+            aux_meter.update(float(aux_ms))
 
             with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
                 clips = udata[0].to(device, non_blocking=True)
@@ -958,7 +1063,7 @@ def train_one_epoch_with_tri_modal_fusion(
                     logger.info(
                         "[%5d] acc (v/n): %.1f%% (%.1f%% %.1f%%) recall (v/n): %.1f%% (%.1f%% %.1f%%) "
                         "healthy_heads=%d/%d fusion_ok=%s [mem: %.2e] "
-                        "[batch_wait: %.1f ms] [fetch: %.0f ms] [step: %.0f ms]",
+                        "[batch_wait: %.1f ms] [fetch: %.0f ms] [decode: %.0f ms] [aux: %.0f ms] [step: %.0f ms]",
                         itr,
                         max(a["accuracy"] for a in action_metrics),
                         max(v["accuracy"] for v in verb_metrics),
@@ -972,6 +1077,8 @@ def train_one_epoch_with_tri_modal_fusion(
                         torch.cuda.max_memory_allocated() / 1024.0**2,
                         batch_wait_meter.avg,
                         fetch_meter.avg,
+                        decode_meter.avg,
+                        aux_meter.avg,
                         step_ms,
                     )
     finally:
