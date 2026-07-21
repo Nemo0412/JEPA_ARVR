@@ -2475,6 +2475,7 @@ def _patch_init_module_for_tri_modal_fusion(base_eval, gaze_cfg: dict):
             use_gated_residual=bool(fusion_cfg.get("use_gated_residual", True)),
             use_gaze_branch=use_gaze,
             use_imu_branch=use_imu,
+            gate_bias_init=float(fusion_cfg.get("gate_bias_init", -4.0)),
         ).to(device)
         gaze_encoder = (
             GazeSpatialEncoder(embed_dim=embed_dim, grid_size=gaze_grid_size).to(device)

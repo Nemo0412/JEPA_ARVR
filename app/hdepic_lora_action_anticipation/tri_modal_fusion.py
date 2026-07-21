@@ -177,7 +177,7 @@ class ImuTemporalEncoder(nn.Module):
 class ModalityProjections(nn.Module):
     """Learned Q/K/V/O projections for one modality."""
 
-    def __init__(self, embed_dim: int, attn_dim: int):
+    def __init__(self, embed_dim: int, attn_dim: int, gate_bias_init: float = -4.0):
         super().__init__()
         self.w_q = nn.Linear(embed_dim, attn_dim, bias=False)
         self.w_k = nn.Linear(embed_dim, attn_dim, bias=False)
@@ -188,12 +188,13 @@ class ModalityProjections(nn.Module):
             nn.GELU(),
             nn.Linear(embed_dim, embed_dim),
         )
-        # Start nearly closed: sigmoid(-4)≈0.018 so early updates stay near identity
-        # until aux encoders become useful (avoids injecting random gaze/IMU noise).
+        # gate_bias_init=-4 → sigmoid≈0.018 (nearly closed identity start).
+        # With zero-init w_o the double brake stalls fusion learning; recipes
+        # that train heads+predictor jointly should use a softer start (e.g. -1).
         nn.init.zeros_(self.gate[0].weight)
         nn.init.zeros_(self.gate[0].bias)
         nn.init.zeros_(self.gate[2].weight)
-        nn.init.constant_(self.gate[2].bias, -4.0)
+        nn.init.constant_(self.gate[2].bias, float(gate_bias_init))
 
     def project_qkv(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.w_q(z), self.w_k(z), self.w_v(z)
@@ -246,15 +247,20 @@ class ProjectedTriModalCrossAttention(nn.Module):
         use_gated_residual: bool = True,
         use_gaze_branch: bool = True,
         use_imu_branch: bool = True,
+        gate_bias_init: float = -4.0,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.use_gaze_branch = bool(use_gaze_branch)
         self.use_imu_branch = bool(use_imu_branch)
         self.use_gated_residual = bool(use_gated_residual)
-        self.video_proj = ModalityProjections(embed_dim, attn_dim)
-        self.gaze_proj = ModalityProjections(embed_dim, attn_dim) if self.use_gaze_branch else None
-        self.imu_proj = ModalityProjections(embed_dim, attn_dim) if self.use_imu_branch else None
+        self.video_proj = ModalityProjections(embed_dim, attn_dim, gate_bias_init=gate_bias_init)
+        self.gaze_proj = (
+            ModalityProjections(embed_dim, attn_dim, gate_bias_init=gate_bias_init) if self.use_gaze_branch else None
+        )
+        self.imu_proj = (
+            ModalityProjections(embed_dim, attn_dim, gate_bias_init=gate_bias_init) if self.use_imu_branch else None
+        )
         self.layers = nn.ModuleList(
             [
                 ProjectedCrossAttentionUpdate(embed_dim, attn_dim, num_heads, dropout=dropout)
