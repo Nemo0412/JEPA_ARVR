@@ -40,12 +40,13 @@ Cluster runs use **1×H100** unless noted.
 | Gaze+pose **joint v2** (predictor + **heads**; pooler frozen) | **42.74%** @ep2 | **Best P01 Top-5**; early-stopped @ep5 (patience 3) |
 | Gaze+pose joint v1 (predictor + **full probe** @ 2e-5) | 37.42% → 28.02% | **Collapsed**; early-stopped @ep5 (forgetting, not NaN) |
 | Tri-modal soft-FT (enc LoRA+heads+fusion from video joint) | **39.82%** → 39.58% | Declining; util-killed @ep3 (`13594209`) |
-| Tri-modal **fusion-only** (freeze backbone; cold from video joint) | **39.28%** → 38.74% | Below video joint; util-killed (`14092744`); resume low-LR `14113917` |
+| Tri-modal **fusion-only** (freeze backbone; cold from video joint) | **39.80%** peak | Below video joint; early-stopped @ep5 after frame-cache resume chain |
+| Tri-modal **joint** (fusion + pred LoRA + heads from video joint) | **40.85%** @ep1 | **First tri-modal above video 40.44%**; early-stopped @ep5 |
 
 **P01 leader:** Gaze+pose joint v2 (heads) **42.74%**.  
-**Video baseline to beat for tri-modal:** joint v2 **40.44%**.
+**Video baseline to beat for tri-modal:** joint v2 **40.44%** — beaten by tri-modal joint (**40.85%**).
 
-#### Tri-modal (video + gaze map + SLAM-IMU proxy) — status 2026-07-17
+#### Tri-modal (video + gaze map + SLAM-IMU proxy) — status 2026-07-21
 
 Architecture: `ProjectedTriModalCrossAttention` between frozen V-JEPA encoder output and predictor  
 (`gaze.mode=projected_tri_modal_cross_attention`). Tokens ≈ video:gaze:IMU = **256:100:26**.  
@@ -56,15 +57,28 @@ IMU = SLAM 6D proxy (gyro+vel), not raw accelerometer CSV. **MTP multi-horizon i
 | Soft-FT from video joint | Fusion + enc LoRA + heads | 39.82% | Video path drifted; worse than 40.44% |
 | Fusion-only cold (LR 1e-4, bs16) | Fusion only | 39.28% | Still below video; val dropped ep1→3; util-kill AveUtil≈36% |
 | Fusion-only resume (LR **1e-5**, bs**32**) | Fusion only from best | **39.80%** peak | Early-stopped @ep5 below video 40.44%; floor held at 39.82% |
-| **Joint** from video 40.44% (running) | Fusion + **pred LoRA** + **heads** | — | New run; encoder LoRA frozen (RGB-aligned); gate closed-init |
+| **Joint** from video 40.44% | Fusion + **pred LoRA** + **heads** | **40.85%** @ep1 | **First tri-modal > video baseline**; early-stopped @ep5, flat after ep1 |
+| **Joint A "unbrake"** (running) | Same + fusion LR **2e-4**, gate init **-1**, jitter | — | Warm from 40.85%; target: concat 42.74% |
 
-Drop cause (fusion-only): frozen heads only accept pure-video features; random aux + residual shift drops accuracy. **Cannot warm from gaze+pose 42.74%** — that encoder sees 5ch adapter-fused RGB, not pure RGB.
+Fusion-only drop cause: frozen heads only accept pure-video features; random aux + residual shift drops accuracy. **Cannot warm from gaze+pose 42.74%** — that encoder sees 5ch adapter-fused RGB, not pure RGB.
+
+Why joint (40.85%) flat-lined after ep1 — cross-attn was double-braked:
+1. `W_o` zero-init **and** gate bias −4 (sigmoid≈0.018) simultaneously → fusion output ≈0.
+2. Fusion LR 1e-5 (0.5×heads) → gate/W_o cannot escape noise in 5 epochs before early-stop.
+3. Aux encoders (gaze conv-stem, IMU GRU) are cold-random with no representation pretraining, unlike the concat adapter which got a full stage-1 at LR 1e-4.
+4. Fixed 1.0s train horizon (frame-cache alignment) removed jitter regularization → ep1 peak then drift.
+5. Depth asymmetry vs concat: concat routes gaze through **all 24 encoder + 12 predictor layers**; this cross-attn injects aux once at the encoder output (1 layer) and discards fused gaze/IMU tokens.
+
+Joint A changes (1)(2)(4) + patience 6 / 15 epochs. Deeper fusion (`fusion_num_layers` 2–4, keep aux tokens into predictor) and gaze-encoder pretraining are the next levers if A is not enough.
 
 ```text
-# NEW: joint tri-modal (pred LoRA + heads + fusion) from video joint 40.44%
-scripts/submit_b12_tri_modal_joint_from_p01video_jointv2_1xh100.slurm
+# NEWEST: joint A (unbraked fusion) warm from tri-modal joint 40.85%
+scripts/submit_b12_tri_modal_jointA_unbrake_1xh100.slurm
 # Run dir:
-/scratch/ll5914/experiments/tri_modal_joint_from_p01video_jointv2/action_anticipation_frozen/tri-modal-joint-from-videov2-vitl16-256-10ep-1xh100/
+/scratch/ll5914/experiments/tri_modal_jointA_unbrake/action_anticipation_frozen/tri-modal-jointA-unbrake-vitl16-256-15ep-1xh100/
+
+# Joint tri-modal (pred LoRA + heads + fusion) from video joint 40.44% → 40.85%
+scripts/submit_b12_tri_modal_joint_from_p01video_jointv2_1xh100.slurm
 
 # Legacy fusion-only (failed to beat 40.44%)
 scripts/submit_b12_tri_modal_s2_from_p01video_jointv2_1xh100.slurm
