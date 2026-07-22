@@ -59,9 +59,12 @@ IMU = SLAM 6D proxy (gyro+vel), not raw accelerometer CSV. **MTP multi-horizon i
 | Fusion-only resume (LR **1e-5**, bs**32**) | Fusion only from best | **39.80%** peak | Early-stopped @ep5 below video 40.44%; floor held at 39.82% |
 | **Joint** from video 40.44% | Fusion + **pred LoRA** + **heads** | **40.85%** @ep1 | **First tri-modal > video baseline**; early-stopped @ep5, flat after ep1 |
 | **Joint A "unbrake"** | Same + fusion LR **2e-4**, gate **-1**, jitter | ≤**40.77%** | Failed: never beat floor 40.85%; early-stop path |
-| **Joint B "deep+keepaux"** (running) | Fusion **L=3** + **keep aux tokens** into predictor | — | Warm from 40.85%; frame cache on; target concat 42.74% |
+| **Joint B "deep+keepaux"** (running) | Fusion **L=3** + **keep aux tokens** into predictor | **40.90%** @ep2 | Warm from 40.85%; still far from concat 42.74% |
+| **Idea 1 hybrid** (queued/running) | **5ch concat** + late **IMU cross-attn** | — | Warm from gaze+pose **42.74%**; CA only refines IMU |
 
-Fusion-only drop cause: frozen heads only accept pure-video features; random aux + residual shift drops accuracy. **Cannot warm from gaze+pose 42.74%** — that encoder sees 5ch adapter-fused RGB, not pure RGB.
+**Does Idea 1 use cross-attention?** Yes — but only as a **late IMU refinement** on top of the proven concat backbone (not a replacement for concat).
+
+Fusion-only drop cause: frozen heads only accept pure-video features; random aux + residual shift drops accuracy. Pure-RGB tri-modal **cannot warm from gaze+pose 42.74%** (5ch vs RGB). Idea 1 **can**, because the encoder still sees adapter-fused RGB.
 
 Why joint (40.85%) flat-lined / Plan A failed — pathway depth, not just LR/gate:
 1. ~~`W_o` zero-init **and** gate bias −4~~ — Plan A unbraked this (gate −1, fusion LR 2e-4) and still peaked at 40.77%.
@@ -71,6 +74,11 @@ Why joint (40.85%) flat-lined / Plan A failed — pathway depth, not just LR/gat
 Plan B addresses (3): `fusion_num_layers=3` + `keep_aux_tokens_in_predictor=True` (aux as fixed predictor context prefix across AR steps). Frame cache re-enabled (fixed 1.0s horizon) for util-kill dodge.
 
 ```text
+# NEWEST: Idea 1 hybrid — concat(42.74%) + late IMU cross-attn
+scripts/submit_b12_concat_plus_cross_attn_from_gazepose42_1xh100.slurm
+# Run dir:
+/scratch/ll5914/experiments/concat_plus_cross_attn_from_gazepose42/action_anticipation_frozen/concat-plus-ca-from-gazepose42-vitl16-256-12ep-1xh100/
+
 # NEWEST: joint B (deep fusion + keep aux) warm from tri-modal joint 40.85%
 scripts/submit_b12_tri_modal_jointB_deep_keepaux_1xh100.slurm
 # Run dir:

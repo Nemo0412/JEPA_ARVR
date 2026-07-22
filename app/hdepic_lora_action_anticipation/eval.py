@@ -69,6 +69,7 @@ from app.hdepic_lora_action_anticipation.predictor_lora import (
     trainable_predictor_lora_params,
 )
 from app.hdepic_lora_action_anticipation.pose_map_builder import GazePoseInputMapBuilder
+from app.hdepic_lora_action_anticipation.concat_plus_cross_attn import ConcatPlusCrossAttnAdaptedModel
 from app.hdepic_lora_action_anticipation.encoder_output_gaze_adapter import (
     EncoderOutputGazeAdapter,
     EncoderOutputGazeAdaptedModel,
@@ -836,6 +837,13 @@ def _patch_best_checkpointing_and_early_stop(base_eval, args_eval):
                 _unwrap_ddp(tri_modal_model),
                 str(path.parent / "tri_modal_fusion_latest.pt"),
             )
+            # Idea 1 hybrid also carries a frozen/trainable 5ch adapter.
+            inner = _unwrap_ddp(tri_modal_model)
+            if hasattr(inner, "input_adapter"):
+                original_torch_save(
+                    {"input_adapter": inner.input_adapter.state_dict()},
+                    path.parent / "binary_input_adapter_latest.pt",
+                )
 
         if improved:
             best_path = path.with_name("best.pt")
@@ -1476,6 +1484,8 @@ def main(args_eval, resume_preempt=False):
     # encoder_output_inject: zero-init encoder-output gaze inject (B8, design phase, never trained).
     encoder_output_inject_enabled = gaze_mode == "encoder_output_inject"
     tri_modal_fusion_enabled = gaze_mode == "projected_tri_modal_cross_attention"
+    # Idea 1: early 5ch concat (gaze+pose) + late IMU cross-attn on encoder tokens.
+    concat_plus_cross_attn_enabled = gaze_mode == "concat_plus_cross_attn"
     # past_window_baseline: B3 long-horizon past-window curriculum (pre-ViT-L, archived).
     # Not used in current ViT-L singleprobe; kept for reproducing B3 runs.
     past_window_cfg = dict(lora_cfg.get("past_window_baseline", {}))
@@ -1577,6 +1587,7 @@ def main(args_eval, resume_preempt=False):
         "binary_input_adapter_gaze_pose_matrix",
         "encoder_output_inject",
         "projected_tri_modal_cross_attention",
+        "concat_plus_cross_attn",
     } or bool(pred_dump_cfg.get("enabled", False))
     debug_subset_path = os.environ.get("DEBUG_SUBSET_PATH", "").strip() or None
     if debug_subset_path:
@@ -1691,6 +1702,51 @@ def main(args_eval, resume_preempt=False):
                 base_eval.validate = lambda **kwargs: validate_with_binary_input_adapter(
                     base_eval, map_builder, dumper, **val_metric_kwargs, **kwargs
                 )
+            local_validate_patched = True
+
+        elif concat_plus_cross_attn_enabled:
+            fusion_cfg = dict(gaze_cfg.get("fusion", {}))
+            logger.info(
+                "Enabling concat_plus_cross_attn (Idea 1): 5ch gaze+pose concat backbone + "
+                "late IMU cross-attn before predictor (layers=%s)",
+                fusion_cfg.get("fusion_num_layers", 1),
+            )
+            gaze_cfg.setdefault("fusion_checkpoint_path", str(run_dir / "tri_modal_fusion_latest.pt"))
+            gaze_cfg.setdefault("adapter_checkpoint_path", str(run_dir / "binary_input_adapter_latest.pt"))
+            if args_eval.get("resume_checkpoint", False):
+                gaze_cfg.setdefault("fusion", {})
+                gaze_cfg["fusion"].setdefault("load_checkpoint_path", str(gaze_cfg["fusion_checkpoint_path"]))
+                gaze_cfg.setdefault("input_adapter", {})
+                gaze_cfg["input_adapter"].setdefault(
+                    "load_checkpoint_path", str(gaze_cfg["adapter_checkpoint_path"])
+                )
+            gaze_cfg.setdefault("input_adapter", {})
+            gaze_cfg["input_adapter"].setdefault("in_channels", 5)
+            gaze_cfg["input_adapter"].setdefault("temporal_kernel", 3)
+            gaze_cfg.setdefault("pose", {})
+            gaze_cfg["pose"].setdefault("enabled", True)
+            gaze_cfg["pose"].setdefault("interframe_k_max", 128)
+            gaze_cfg.setdefault("pose_map", {})
+            gaze_cfg["pose_map"].setdefault("patch_height", 128)
+            gaze_cfg["pose_map"].setdefault("patch_width", 9)
+            gaze_cfg["pose_map"].setdefault("layout", "topleft")
+            gaze_cfg["pose_map"].setdefault("normalize", "none")
+            fusion_cfg.setdefault("use_gaze_branch", False)
+            fusion_cfg.setdefault("use_imu_branch", True)
+            gaze_cfg["fusion"] = fusion_cfg
+            _patch_init_module_for_concat_plus_cross_attn(base_eval, gaze_cfg)
+            _patch_opt_for_tri_modal_fusion(base_eval, gaze_cfg)
+            if args_eval.get("resume_checkpoint", False):
+                _patch_load_checkpoint_for_tri_modal_fusion(base_eval, gaze_cfg)
+                _patch_load_checkpoint_for_binary_input_adapter(base_eval, gaze_cfg)
+            map_builder = GazePoseInputMapBuilder(gaze_cfg, gate=gate)
+            imu_loader = ImuTrajectoryLoader(gaze_cfg, gate=gate)
+            base_eval.train_one_epoch = lambda **kwargs: train_one_epoch_with_tri_modal_fusion(
+                base_eval, map_builder, imu_loader, **kwargs
+            )
+            base_eval.validate = lambda **kwargs: validate_with_tri_modal_fusion(
+                base_eval, dumper, map_builder, imu_loader, **val_metric_kwargs, **kwargs
+            )
             local_validate_patched = True
 
         elif tri_modal_fusion_enabled:
@@ -2529,6 +2585,106 @@ def _patch_init_module_for_tri_modal_fusion(base_eval, gaze_cfg: dict):
         return wrapped
 
     base_eval.init_module = init_module_with_tri_modal_fusion
+
+
+def _patch_init_module_for_concat_plus_cross_attn(base_eval, gaze_cfg: dict):
+    """Idea 1: wrap V-JEPA with 5ch concat adapter + IMU-only late cross-attn."""
+    original_init_module = base_eval.init_module
+    fusion_cfg = dict(gaze_cfg.get("fusion", {}))
+    adapter_cfg = dict(gaze_cfg.get("input_adapter", {}))
+    fusion_cfg.setdefault("use_gaze_branch", False)
+    fusion_cfg.setdefault("use_imu_branch", True)
+
+    def init_module_with_concat_plus_cross_attn(*args, **kwargs):
+        model = original_init_module(*args, **kwargs)
+        device = next(model.parameters()).device
+        embed_dim = int(model.embed_dim)
+        grid_size = int(model.grid_size)
+        n_v, _n_g, n_i = compute_token_budgets(
+            grid_size * grid_size,
+            gaze_grid_size=int(fusion_cfg.get("gaze_grid_size", 10)),
+            gaze_token_ratio=float(fusion_cfg.get("gaze_token_ratio", 0.5)),
+            imu_token_ratio=float(fusion_cfg.get("imu_token_ratio", 0.1)),
+        )
+        adapter = BinaryMapInputAdapter(
+            hidden_dim=int(adapter_cfg.get("hidden_dim", 8)),
+            scale=float(adapter_cfg.get("scale", 1.0)),
+            temporal_kernel=int(adapter_cfg.get("temporal_kernel", 3)),
+            binary_center=float(adapter_cfg.get("binary_center", 0.0)),
+            residual_clamp=float(adapter_cfg.get("residual_clamp", 1.0)),
+            in_channels=int(adapter_cfg.get("in_channels", 5)),
+        ).to(device)
+        adapter_ckpt = adapter_cfg.get("load_checkpoint_path")
+        if adapter_ckpt:
+            _load_binary_input_adapter_checkpoint(adapter, str(adapter_ckpt))
+        raw_attn = fusion_cfg.get("fusion_attn_dim")
+        attn_dim = int(raw_attn) if raw_attn not in (None, "", 0) else embed_dim
+        fusion = ProjectedTriModalCrossAttention(
+            embed_dim=embed_dim,
+            attn_dim=attn_dim,
+            num_heads=int(fusion_cfg.get("fusion_num_heads", 4)),
+            num_layers=int(fusion_cfg.get("fusion_num_layers", 1)),
+            dropout=float(fusion_cfg.get("dropout", 0.0)),
+            use_gated_residual=bool(fusion_cfg.get("use_gated_residual", True)),
+            use_gaze_branch=False,
+            use_imu_branch=True,
+            gate_bias_init=float(fusion_cfg.get("gate_bias_init", -4.0)),
+        ).to(device)
+        imu_encoder = ImuTemporalEncoder(
+            embed_dim=embed_dim,
+            input_dim=6,
+            hidden_dim=int(fusion_cfg.get("imu_hidden_dim", 128)),
+            num_imu_tokens=n_i,
+            encoder_type=str(fusion_cfg.get("imu_encoder_type", "gru")),
+            num_layers=int(fusion_cfg.get("imu_num_layers", 1)),
+            dropout=float(fusion_cfg.get("imu_dropout", 0.1)),
+        ).to(device)
+        wrapped = ConcatPlusCrossAttnAdaptedModel(
+            model,
+            input_adapter=adapter,
+            fusion=fusion,
+            imu_encoder=imu_encoder,
+            fusion_cfg=fusion_cfg,
+        )
+        wrapped.embed_dim = model.embed_dim
+        for param in wrapped.base_model.parameters():
+            param.requires_grad = False
+        if adapter_cfg.get("freeze", True):
+            for param in wrapped.input_adapter.parameters():
+                param.requires_grad = False
+            logger.info("Froze binary input adapter params for concat_plus_cross_attn")
+        else:
+            for param in wrapped.input_adapter.parameters():
+                param.requires_grad = True
+        for param in trainable_tri_modal_fusion_params(wrapped):
+            param.requires_grad = True
+        restored_encoder_lora = set_encoder_lora_trainable(wrapped.base_model, trainable=True)
+        if restored_encoder_lora and adapter_cfg.get("freeze_encoder_lora", True):
+            set_encoder_lora_trainable(wrapped.base_model, trainable=False)
+            logger.info("Froze encoder LoRA params after concat_plus_cross_attn init")
+        load_path = fusion_cfg.get("load_checkpoint_path")
+        if load_path and Path(load_path).exists():
+            load_tri_modal_fusion_checkpoint(wrapped, str(load_path))
+            logger.info("Loaded fusion checkpoint for concat_plus_cross_attn: %s", load_path)
+        fusion_n = sum(p.numel() for p in trainable_tri_modal_fusion_params(wrapped))
+        logger.info(
+            "Attached ConcatPlusCrossAttn: embed_dim=%d n_video=%d n_imu=%d "
+            "attn_dim=%d heads=%d layers=%d fusion_trainable=%d adapter_trainable=%d",
+            embed_dim,
+            n_v,
+            n_i,
+            attn_dim,
+            int(fusion_cfg.get("fusion_num_heads", 4)),
+            int(fusion_cfg.get("fusion_num_layers", 1)),
+            fusion_n,
+            sum(p.numel() for p in wrapped.input_adapter.parameters() if p.requires_grad),
+        )
+        wrapped = _wrap_trainable_model_for_ddp(wrapped)
+        base_eval._tri_modal_fusion_model = wrapped
+        base_eval._binary_input_adapter_model = wrapped
+        return wrapped
+
+    base_eval.init_module = init_module_with_concat_plus_cross_attn
 
 
 def _patch_opt_for_tri_modal_fusion(base_eval, gaze_cfg: dict):
