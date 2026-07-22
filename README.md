@@ -91,16 +91,23 @@ scripts/submit_prefill_p01_clip_frame_cache.slurm
 
 #### How we raise GPU utilization (tri-modal / decode-bound jobs)
 
-Cluster cancels jobs with **AveUtil &lt; 60% for &gt;2h**. Tri-modal fusion-only is decode-bound: `decord.get_batch` ≈10–20s/batch vs GPU step ≈4s → theoretical util ≈20–30% even with async prefetch.
+Cluster cancels jobs with **AveUtil &lt; 60% for &gt;2h**. Tri-modal is decode-bound: `decord.get_batch` ≈10–20s/batch vs GPU step ≈4s → theoretical util ≈20–30% even with async prefetch.
+
+**Honest status: mitigated, not “forever ≥60%”.** Two complementary layers:
+
+1. **Actually raise util (primary):** scratch **decoded-clip cache** + **fixed anticipation 1.0s** so cache keys are deterministic. After prefill (~7k `.npy` for P01), decode → `np.load` (tens of ms) and the GPU can stay busy. This is what can push AveUtil toward/above 60%.
+2. **Survive util-kill / walltime (safety net):** `#SBATCH --time=01:50:00` (under the 2h window) + `USR1/TERM` auto-`sbatch` of the same script. Even if a chunk’s AveUtil is still low (cold cache, first epoch, jitter on), training **continues** on the next job with `latest.pt` + warm cache.
 
 | Layer | What we do | Effect |
 |---|---|---|
-| **Decoded-clip cache** | `TRI_MODAL_FRAME_CACHE` on scratch; uint8 `(T,H,W,C)` keyed by `video_id`+frame indices (`clip_frame_cache.py`) | After prefill/warmup, decode → `np.load` (tens of ms) → GPU can stay busy (**target AveUtil ≥60%**) |
-| **Cache-aligned train horizon** | `train_anticipation_time_sec=[1.0,1.0]` (same as val / `phd_reference` point) | Deterministic indices → cache keys match prefill; mild vs old `[0.25,1.75]` |
+| **Decoded-clip cache** | `TRI_MODAL_FRAME_CACHE` on scratch; uint8 `(T,H,W,C)` keyed by `video_id`+frame indices (`clip_frame_cache.py`) | After prefill/warmup, decode → `np.load` → GPU can stay busy (**target AveUtil ≥60%**) |
+| **Cache-aligned train horizon** | `train_anticipation_time_sec=[1.0,1.0]` (same as val / `phd_reference` point) | Deterministic indices → cache keys match prefill |
 | **CPU prefill** | `submit_prefill_p01_clip_frame_cache.slurm` | Warms cache without holding a GPU |
 | **Prefetch RAM budget** | `num_workers=16`, `prefetch_factor=2`, `TRI_MODAL_PREFETCH_DEPTH=4`, `pin_memory=False` | Avoid ~60GB in-flight float batches that stalled workers (prior util≈19%) |
 | **Wall-clock dodge** | `#SBATCH --time=01:50:00` + `USR1/TERM` auto-`sbatch` resume | Survives util-kill / timeout; next chunk inherits warm cache + `latest.pt` |
 | **Best-metric floor** | Always restore best tracker + `best_metric_floor` | Weaker vals cannot overwrite a stronger `best.pt` after resume |
+
+**Plan A vs Plan B tradeoff:** Plan A restored train anticipation jitter `[0.25,1.75]` and therefore **disabled** the frame cache (random horizons → unbounded/miss keys) — util stayed decode-bound and relied mainly on the 1:50 auto-resubmit dodge. Plan B **re-enables** the frame cache with fixed 1.0s, so it is the stabler util recipe.
 
 Logs to watch: `decode:` / `batch_wait:` should fall well below `step:` once `TRI_MODAL_FRAME_CACHE stats: hit_rate` is high.
 #### Best P01 checkpoint (saved on scratch)
@@ -120,7 +127,7 @@ Logs to watch: `decode:` / `batch_wait:` should fall well below `step:` once `TR
 2. **Gaze joint collapse:** full probe + predictor LoRA caused action forgetting. Joint keeps pooler frozen and trains **heads only**.
 3. **Arch depth14 `KeyError: 'predictor'`:** depth must be set under `model_kwargs.pretrain_kwargs.predictor`, not `model_kwargs.predictor`.
 4. **Tri-modal val crash:** `ClipBalancedDecodeVideosToClips.mtp_horizons_sec` AttributeError in workers — defensive `getattr` (MTP unused for 1s tri-modal).
-5. **Tri-modal util-kill:** video decode ≫ GPU step. Mitigations: scratch **decoded-clip cache** (`TRI_MODAL_FRAME_CACHE`), slim DataLoader prefetch, `/dev/shm` staging, **1:50** auto-resubmit chunks (see “How we raise GPU utilization” above).
+5. **Tri-modal util-kill:** video decode ≫ GPU step. Not “always ≥60%”; mitigated by (a) scratch **decoded-clip cache** + fixed 1.0s anticipation to actually raise util, (b) **1:50** auto-resubmit chunks so training survives a low-util segment. Plan A (jitter) turned cache off; Plan B turns it back on — see “How we raise GPU utilization” above.
 
 ---
 
