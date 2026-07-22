@@ -477,6 +477,8 @@ class TriModalFusionAdaptedModel(nn.Module):
         self.n_video_spatial = n_v
         self.n_gaze_tokens = n_g
         self.n_imu_tokens = n_i
+        # Set each forward by ``_fuse_for_predictor`` when keep_aux is enabled.
+        self._n_aux_context_tokens = 0
 
     def _temporal_slots(self, num_frames: int) -> int:
         if num_frames % self.tubelet_size != 0:
@@ -554,14 +556,36 @@ class TriModalFusionAdaptedModel(nn.Module):
         imu_batch: Optional[tuple[torch.Tensor, torch.Tensor]],
     ) -> torch.Tensor:
         if not self.use_gaze_branch and not self.use_imu_branch:
+            self._n_aux_context_tokens = 0
             return x_full
         embed_dim = self.embed_dim
         use_hierarchical = x_full.size(-1) > embed_dim
-        x_last = x_full[:, :, -embed_dim:] if use_hierarchical else x_full
         z_video, z_gaze, z_imu = self._encode_modalities(x_full, gaze_map, imu_batch)
-        z_video_fused, _, _ = self.fusion(z_video, z_gaze, z_imu)
+        z_video_fused, z_gaze_fused, z_imu_fused = self.fusion(z_video, z_gaze, z_imu)
         z_flat = _flatten_modal_tokens(z_video_fused)
+        # Plan B: keep fused gaze/IMU as a persistent predictor context prefix.
+        # They stay fixed across AR rollout steps while only video tokens slide.
+        keep_aux = bool(self.fusion_cfg.get("keep_aux_tokens_in_predictor", False))
+        n_aux = 0
+        if keep_aux:
+            aux_parts = []
+            if z_gaze_fused is not None:
+                aux_parts.append(_flatten_modal_tokens(z_gaze_fused))
+            if z_imu_fused is not None:
+                aux_parts.append(_flatten_modal_tokens(z_imu_fused))
+            if aux_parts:
+                z_aux = torch.cat(aux_parts, dim=1)
+                n_aux = int(z_aux.size(1))
+                z_flat = torch.cat([z_aux, z_flat], dim=1)
+        self._n_aux_context_tokens = n_aux
         if use_hierarchical:
+            # Hierarchical encoder features only exist for video tokens; pad aux
+            # with zeros on the shallow dims so channel width matches.
+            if n_aux > 0:
+                shallow = x_full[:, :, :-embed_dim]
+                bsz, n_vid, shallow_dim = shallow.shape
+                aux_shallow = shallow.new_zeros((bsz, n_aux, shallow_dim))
+                return torch.cat([torch.cat([aux_shallow, shallow], dim=1), z_flat], dim=-1)
             return torch.cat([x_full[:, :, :-embed_dim], z_flat], dim=-1)
         return z_flat
 
@@ -597,27 +621,39 @@ class TriModalFusionAdaptedModel(nn.Module):
         if torch.is_tensor(x_pred_input) and not torch.isfinite(x_pred_input).all():
             return None
 
-        if int(getattr(base, "num_steps", 1)) > 1 and hasattr(base, "_forward_sliding_window"):
+        n_aux = int(getattr(self, "_n_aux_context_tokens", 0) or 0)
+        if (
+            int(getattr(base, "num_steps", 1)) > 1
+            and hasattr(base, "_forward_sliding_window")
+            and n_aux == 0
+        ):
             return base._forward_sliding_window(x_pred_input, anticipation_times, x_accumulate)
 
         return self._forward_single_step(base, x_pred_input, x_accumulate, anticipation_times)
 
     def _forward_single_step(self, base, x_pred_input, x_accumulate, anticipation_times):
-        bsz, n_ctx, _ = x_pred_input.size()
+        bsz, n_ctx, feat_dim = x_pred_input.size()
         embed_dim = base.encoder.embed_dim
         device = x_pred_input.device
         spatial_tokens = int(base.grid_size**2)
         chunk_tokens = int(spatial_tokens * (base.num_output_frames // base.tubelet_size))
-        local_ctxt_positions = torch.arange(n_ctx, device=device).unsqueeze(0).repeat(bsz, 1)
-        local_tgt_positions = torch.arange(chunk_tokens, device=device).unsqueeze(0).repeat(bsz, 1)
-        local_tgt_positions += n_ctx
+        n_aux = int(getattr(self, "_n_aux_context_tokens", 0) or 0)
+        if n_aux < 0 or n_aux >= n_ctx:
+            n_aux = 0
         horizon_chunks = (anticipation_times * base.frames_per_second / base.tubelet_size).to(torch.int64)
         rollout_steps = (horizon_chunks + (base.num_output_frames // base.tubelet_size)).clamp(min=1)
         max_steps = int(rollout_steps.max().item())
-        x_window = x_pred_input
+        # Aux tokens (if any) are a fixed prefix; only the video suffix slides.
+        aux = x_pred_input[:, :n_aux] if n_aux > 0 else None
+        x_window_vid = x_pred_input[:, n_aux:] if n_aux > 0 else x_pred_input
         target_by_sample = [None for _ in range(bsz)]
         rollout_for_classifier = []
         for step in range(max_steps):
+            x_window = torch.cat([aux, x_window_vid], dim=1) if aux is not None else x_window_vid
+            n_ctx_cur = int(x_window.size(1))
+            local_ctxt_positions = torch.arange(n_ctx_cur, device=device).unsqueeze(0).repeat(bsz, 1)
+            local_tgt_positions = torch.arange(chunk_tokens, device=device).unsqueeze(0).repeat(bsz, 1)
+            local_tgt_positions = local_tgt_positions + n_ctx_cur
             pred_out = base.predictor(x_window, masks_x=local_ctxt_positions, masks_y=local_tgt_positions)
             pred_full = pred_out[0] if isinstance(pred_out, tuple) else pred_out
             pred_for_classifier = pred_full[:, :, -embed_dim:] if pred_full.size(-1) != embed_dim else pred_full
@@ -625,9 +661,10 @@ class TriModalFusionAdaptedModel(nn.Module):
             for b in range(bsz):
                 if step == int(rollout_steps[b].item()) - 1:
                     target_by_sample[b] = pred_for_classifier[b : b + 1]
-            pred_for_input = pred_full if pred_full.size(-1) == x_window.size(-1) else pred_for_classifier
-            x_window = torch.cat([x_window[:, chunk_tokens:, :], pred_for_input], dim=1)
+            pred_for_input = pred_full if pred_full.size(-1) == feat_dim else pred_for_classifier
+            x_window_vid = torch.cat([x_window_vid[:, chunk_tokens:, :], pred_for_input], dim=1)
         target_tokens = torch.cat(target_by_sample, dim=0)
+        x_window = torch.cat([aux, x_window_vid], dim=1) if aux is not None else x_window_vid
         final_window = x_window[:, :, -embed_dim:] if x_window.size(-1) != embed_dim else x_window
         return_mode = getattr(base, "return_mode", "observed_plus_target")
         if return_mode == "target_only":
