@@ -74,7 +74,28 @@ class InterframePoseMapBuilder:
 
     def build(self, clips: torch.Tensor, metadata) -> torch.Tensor:
         bsz, _, frames, height, width = clips.shape
-        maps = clips.new_zeros((bsz, 1, frames, height, width))
+        return self._rasterize(metadata, bsz, frames, height, width, device=clips.device, dtype=clips.dtype)
+
+    def build_cpu(self, metadata, frames: int, height: int, width: int) -> torch.Tensor:
+        """CPU pose maps for async prefetch (overlap with GPU train step)."""
+        if not isinstance(metadata, list):
+            metadata = [metadata]
+        bsz = len(metadata)
+        return self._rasterize(
+            metadata, bsz, int(frames), int(height), int(width), device=torch.device("cpu"), dtype=torch.float32
+        )
+
+    def _rasterize(
+        self,
+        metadata,
+        bsz: int,
+        frames: int,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        maps = torch.zeros((bsz, 1, frames, height, width), device=device, dtype=dtype)
         if self.force_zero_pose:
             return maps
         ph = min(self.patch_height, int(height))
@@ -95,7 +116,7 @@ class InterframePoseMapBuilder:
                     self.patch_width,
                     normalize=self.normalize,
                 )
-                patch_t = torch.as_tensor(patch, device=clips.device, dtype=clips.dtype)
+                patch_t = torch.as_tensor(patch, device=device, dtype=dtype)
                 if ph != self.patch_height or pw != self.patch_width:
                     patch_t = patch_t.unsqueeze(0).unsqueeze(0)
                     patch_t = F.interpolate(patch_t, size=(ph, pw), mode="nearest").squeeze(0).squeeze(0)
@@ -115,4 +136,9 @@ class GazePoseInputMapBuilder:
     def build(self, clips: torch.Tensor, metadata) -> torch.Tensor:
         gaze_map = self.gaze_builder.build(clips, metadata)
         pose_map = self.pose_builder.build(clips, metadata)
+        return torch.cat([gaze_map, pose_map], dim=1)
+
+    def build_cpu(self, metadata, frames: int, height: int, width: int) -> torch.Tensor:
+        gaze_map = self.gaze_builder.build_cpu(metadata, frames, height, width)
+        pose_map = self.pose_builder.build_cpu(metadata, frames, height, width)
         return torch.cat([gaze_map, pose_map], dim=1)
