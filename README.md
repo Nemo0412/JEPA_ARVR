@@ -58,24 +58,26 @@ IMU = SLAM 6D proxy (gyro+vel), not raw accelerometer CSV. **MTP multi-horizon i
 | Fusion-only cold (LR 1e-4, bs16) | Fusion only | 39.28% | Still below video; val dropped ep1→3; util-kill AveUtil≈36% |
 | Fusion-only resume (LR **1e-5**, bs**32**) | Fusion only from best | **39.80%** peak | Early-stopped @ep5 below video 40.44%; floor held at 39.82% |
 | **Joint** from video 40.44% | Fusion + **pred LoRA** + **heads** | **40.85%** @ep1 | **First tri-modal > video baseline**; early-stopped @ep5, flat after ep1 |
-| **Joint A "unbrake"** (running) | Same + fusion LR **2e-4**, gate init **-1**, jitter | — | Warm from 40.85%; target: concat 42.74% |
+| **Joint A "unbrake"** | Same + fusion LR **2e-4**, gate **-1**, jitter | ≤**40.77%** | Failed: never beat floor 40.85%; early-stop path |
+| **Joint B "deep+keepaux"** (running) | Fusion **L=3** + **keep aux tokens** into predictor | — | Warm from 40.85%; frame cache on; target concat 42.74% |
 
 Fusion-only drop cause: frozen heads only accept pure-video features; random aux + residual shift drops accuracy. **Cannot warm from gaze+pose 42.74%** — that encoder sees 5ch adapter-fused RGB, not pure RGB.
 
-Why joint (40.85%) flat-lined after ep1 — cross-attn was double-braked:
-1. `W_o` zero-init **and** gate bias −4 (sigmoid≈0.018) simultaneously → fusion output ≈0.
-2. Fusion LR 1e-5 (0.5×heads) → gate/W_o cannot escape noise in 5 epochs before early-stop.
-3. Aux encoders (gaze conv-stem, IMU GRU) are cold-random with no representation pretraining, unlike the concat adapter which got a full stage-1 at LR 1e-4.
-4. Fixed 1.0s train horizon (frame-cache alignment) removed jitter regularization → ep1 peak then drift.
-5. Depth asymmetry vs concat: concat routes gaze through **all 24 encoder + 12 predictor layers**; this cross-attn injects aux once at the encoder output (1 layer) and discards fused gaze/IMU tokens.
+Why joint (40.85%) flat-lined / Plan A failed — pathway depth, not just LR/gate:
+1. ~~`W_o` zero-init **and** gate bias −4~~ — Plan A unbraked this (gate −1, fusion LR 2e-4) and still peaked at 40.77%.
+2. Aux encoders (gaze conv-stem, IMU GRU) are cold-random with no representation pretraining, unlike the concat adapter which got a full stage-1 at LR 1e-4.
+3. Depth asymmetry vs concat: concat routes gaze through **all 24 encoder + 12 predictor layers**; cross-attn injected aux once (1 layer) and **discarded** fused gaze/IMU tokens.
 
-Joint A changes (1)(2)(4) + patience 6 / 15 epochs. Deeper fusion (`fusion_num_layers` 2–4, keep aux tokens into predictor) and gaze-encoder pretraining are the next levers if A is not enough.
+Plan B addresses (3): `fusion_num_layers=3` + `keep_aux_tokens_in_predictor=True` (aux as fixed predictor context prefix across AR steps). Frame cache re-enabled (fixed 1.0s horizon) for util-kill dodge.
 
 ```text
-# NEWEST: joint A (unbraked fusion) warm from tri-modal joint 40.85%
-scripts/submit_b12_tri_modal_jointA_unbrake_1xh100.slurm
+# NEWEST: joint B (deep fusion + keep aux) warm from tri-modal joint 40.85%
+scripts/submit_b12_tri_modal_jointB_deep_keepaux_1xh100.slurm
 # Run dir:
-/scratch/ll5914/experiments/tri_modal_jointA_unbrake/action_anticipation_frozen/tri-modal-jointA-unbrake-vitl16-256-15ep-1xh100/
+/scratch/ll5914/experiments/tri_modal_jointB_deep_keepaux/action_anticipation_frozen/tri-modal-jointB-deep-keepaux-vitl16-256-15ep-1xh100/
+
+# Plan A (failed unbrake) — kept for reference
+scripts/submit_b12_tri_modal_jointA_unbrake_1xh100.slurm
 
 # Joint tri-modal (pred LoRA + heads + fusion) from video joint 40.44% → 40.85%
 scripts/submit_b12_tri_modal_joint_from_p01video_jointv2_1xh100.slurm
