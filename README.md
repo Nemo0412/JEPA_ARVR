@@ -44,6 +44,7 @@ Cluster runs use **1×H100** unless noted.
 | Tri-modal **joint** (fusion + pred LoRA + heads from video joint) | **40.85%** @ep1 | First pure-RGB tri-modal above video 40.44%; early-stopped @ep5 |
 | **concat+crossattention v1** (5ch concat + late IMU CA) | **43.60%** @ep4 | Early-stopped @ep9; +0.86 vs plain concat 42.74% |
 | **concat+crossattention v2** (L=3 + keep_aux + soft-gate + light adapter FT) | **43.92%** @ep4 | **P01 leader**; early-stopped @ep9; +0.32 vs v1 / +1.18 vs concat |
+| **concat+crossattention v2-jitter** (same arch; train horizon `[0.25,1.75]`; no frame cache) | — | **Running**; warm from v2 43.92%; util via 1:50 auto-resubmit |
 
 **P01 leader:** **concat+crossattention v2** **43.92%** @ep4.  
 **v1:** 43.60%. **Plain concat:** 42.74%. **Video:** 40.44%.
@@ -61,6 +62,7 @@ Cluster runs use **1×H100** unless noted.
 | Pure tri-modal **joint** | Fusion + pred LoRA + heads | **40.85%** @ep1 | Beats video only |
 | **concat+crossattention v1** | IMU CA + pred LoRA + heads (adapter frozen, L=1) | **43.60%** @ep4 | Done; early-stop @ep9 |
 | **concat+crossattention v2** | Same + **L=3**, **keep_aux**, gate reset **−2**, adapter FT `lr_mult=0.25` | **43.92%** @ep4 | **Done**; warm from v1; early-stop @ep9 |
+| **concat+crossattention v2-jitter** | Same as v2; **no** gate reset; train `[0.25,1.75]`; **frame cache OFF** | — | **Running**; warm from v2 43.92%; floor 43.91892 |
 
 Val Top-5:
 
@@ -70,6 +72,11 @@ Val Top-5:
 | **v2** | 43.17 | 43.24 | 43.84 | **43.92** | 43.32 | 43.23 | 43.76 | 43.54 | 43.47 |
 
 ```text
+# Running: concat+crossattention v2-jitter (train [0.25,1.75], no frame cache; warm from 43.92%)
+scripts/submit_b12_concat_plus_cross_attn_v2_jitter_1xh100.slurm
+# Run dir:
+/scratch/ll5914/experiments/concat_plus_cross_attn_v2_jitter/action_anticipation_frozen/concat-plus-ca-v2-jitter-vitl16-256-12ep-1xh100/
+
 # P01 leader: concat+crossattention v2 — 43.92% @ep4
 scripts/submit_b12_concat_plus_cross_attn_v2_1xh100.slurm
 # Run dir:
