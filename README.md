@@ -42,40 +42,40 @@ Cluster runs use **1×H100** unless noted.
 | Tri-modal soft-FT (enc LoRA+heads+fusion from video joint) | **39.82%** → 39.58% | Declining; util-killed @ep3 (`13594209`) |
 | Tri-modal **fusion-only** (freeze backbone; cold from video joint) | **39.80%** peak | Below video joint; early-stopped @ep5 after frame-cache resume chain |
 | Tri-modal **joint** (fusion + pred LoRA + heads from video joint) | **40.85%** @ep1 | First pure-RGB tri-modal above video 40.44%; early-stopped @ep5 |
-| **concat+crossattention** (5ch concat + late IMU CA) | **43.60%** @ep4 | **P01 leader**; early-stopped @ep9 (patience 5); +0.86 vs concat |
-| **concat+crossattention v2** (running) | — | L=3 + keep_aux + soft-gate −2 + light adapter FT from 43.60% |
+| **concat+crossattention v1** (5ch concat + late IMU CA) | **43.60%** @ep4 | Early-stopped @ep9; +0.86 vs plain concat 42.74% |
+| **concat+crossattention v2** (L=3 + keep_aux + soft-gate + light adapter FT) | **43.92%** @ep4 | **P01 leader**; early-stopped @ep9; +0.32 vs v1 / +1.18 vs concat |
 
-**P01 leader:** **concat+crossattention** **43.60%** @ep4.  
-**Previous concat baseline:** gaze+pose joint v2 **42.74%**.  
-**Video baseline:** joint v2 **40.44%**.
+**P01 leader:** **concat+crossattention v2** **43.92%** @ep4.  
+**v1:** 43.60%. **Plain concat:** 42.74%. **Video:** 40.44%.
 
 #### Tri-modal / concat+crossattention — status 2026-07-23
 
 **Method name: concat+crossattention** (`gaze.mode=concat_plus_cross_attn`)
-- **Concat:** 5ch gaze+pose `BinaryMapInputAdapter` + frozen encoder LoRA (warm from 42.74% → then 43.60%).
-- **Cross-attention:** IMU-only late projected CA before predictor; train CA (+ optional light adapter FT) + predictor LoRA + heads.
+- **Concat:** 5ch gaze+pose `BinaryMapInputAdapter` + frozen encoder LoRA.
+- **Cross-attention:** IMU-only late projected CA before predictor; train CA (+ light adapter FT in v2) + predictor LoRA + heads.
 - Gaze stays in concat only (not re-injected into CA).
 
 | Recipe | Trainable | Best Top-5 | Outcome |
 |---|---|---:|---|
 | Soft-FT / fusion-only / pure tri-modal A–B | various | ≤**40.90%** | Cannot beat plain concat 42.74% |
 | Pure tri-modal **joint** | Fusion + pred LoRA + heads | **40.85%** @ep1 | Beats video only |
-| **concat+crossattention v1** | IMU CA + pred LoRA + heads (adapter frozen) | **43.60%** @ep4 | **Done**; early-stop @ep9 |
-| **concat+crossattention v2** (running) | Same + **L=3**, **keep_aux**, gate reset **−2**, adapter FT `lr_mult=0.25` | — | Warm from v1 43.60%; floor 43.5994 |
+| **concat+crossattention v1** | IMU CA + pred LoRA + heads (adapter frozen, L=1) | **43.60%** @ep4 | Done; early-stop @ep9 |
+| **concat+crossattention v2** | Same + **L=3**, **keep_aux**, gate reset **−2**, adapter FT `lr_mult=0.25` | **43.92%** @ep4 | **Done**; warm from v1; early-stop @ep9 |
 
-Val Top-5 (v1 completed):
+Val Top-5:
 
-| ep | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+| | ep1 | ep2 | ep3 | ep4 | ep5 | ep6 | ep7 | ep8 | ep9 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| top5 | 42.47 | 43.30 | 42.62 | **43.60** | 43.00 | 43.07 | 43.52 | 43.45 | 42.77 |
+| **v1** | 42.47 | 43.30 | 42.62 | **43.60** | 43.00 | 43.07 | 43.52 | 43.45 | 42.77 |
+| **v2** | 43.17 | 43.24 | 43.84 | **43.92** | 43.32 | 43.23 | 43.76 | 43.54 | 43.47 |
 
 ```text
-# NEWEST: concat+crossattention v2 (L=3, keep_aux, soft-gate, light adapter FT)
+# P01 leader: concat+crossattention v2 — 43.92% @ep4
 scripts/submit_b12_concat_plus_cross_attn_v2_1xh100.slurm
 # Run dir:
 /scratch/ll5914/experiments/concat_plus_cross_attn_v2/action_anticipation_frozen/concat-plus-ca-v2-L3-keepaux-softgate-vitl16-256-12ep-1xh100/
 
-# P01 leader v1: concat+crossattention (43.60% @ep4)
+# v1: concat+crossattention — 43.60% @ep4
 scripts/submit_b12_concat_plus_cross_attn_from_gazepose42_1xh100.slurm
 # Run dir:
 /scratch/ll5914/experiments/concat_plus_cross_attn_from_gazepose42/action_anticipation_frozen/concat-plus-ca-from-gazepose42-vitl16-256-12ep-1xh100/
@@ -112,17 +112,27 @@ Logs to watch: `decode:` / `batch_wait:` should fall well below `step:` once `TR
 #### Best P01 checkpoint (saved on scratch)
 
 ```text
-# P01 leader: concat+crossattention — 43.60% @ep4 (early-stopped @ep9)
+# P01 leader: concat+crossattention v2 — 43.92% @ep4 (early-stopped @ep9)
+/scratch/ll5914/experiments/concat_plus_cross_attn_v2/action_anticipation_frozen/concat-plus-ca-v2-L3-keepaux-softgate-vitl16-256-12ep-1xh100/
+  best.pt
+  predictor_lora_best.pt
+  encoder_lora_best.pt
+  binary_input_adapter_best.pt
+  tri_modal_fusion_best.pt
+  topk_log_r0.csv
+  TRAINING_DONE
+
+# v1 — 43.60% @ep4
 /scratch/ll5914/experiments/concat_plus_cross_attn_from_gazepose42/action_anticipation_frozen/concat-plus-ca-from-gazepose42-vitl16-256-12ep-1xh100/
   best.pt
   predictor_lora_best.pt
   encoder_lora_best.pt
   binary_input_adapter_best.pt
-  tri_modal_fusion_best.pt          # late IMU cross-attn
+  tri_modal_fusion_best.pt
   topk_log_r0.csv
   TRAINING_DONE
 
-# Previous plain-concat leader — 42.74% @ep2
+# Previous plain-concat — 42.74% @ep2
 /scratch/ll5914/experiments/p01_gazepose_pred_joint_heads_clip/action_anticipation_frozen/p01-gazepose-pred-joint-heads-vitl16-256-10ep/
   best.pt
   predictor_lora_best.pt
