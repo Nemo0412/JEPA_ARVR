@@ -1735,7 +1735,7 @@ def main(args_eval, resume_preempt=False):
             fusion_cfg.setdefault("use_imu_branch", True)
             gaze_cfg["fusion"] = fusion_cfg
             _patch_init_module_for_concat_plus_cross_attn(base_eval, gaze_cfg)
-            _patch_opt_for_tri_modal_fusion(base_eval, gaze_cfg)
+            _patch_opt_for_concat_plus_cross_attn(base_eval, gaze_cfg)
             if args_eval.get("resume_checkpoint", False):
                 _patch_load_checkpoint_for_tri_modal_fusion(base_eval, gaze_cfg)
                 _patch_load_checkpoint_for_binary_input_adapter(base_eval, gaze_cfg)
@@ -2666,10 +2666,20 @@ def _patch_init_module_for_concat_plus_cross_attn(base_eval, gaze_cfg: dict):
         if load_path and Path(load_path).exists():
             load_tri_modal_fusion_checkpoint(wrapped, str(load_path))
             logger.info("Loaded fusion checkpoint for concat_plus_cross_attn: %s", load_path)
+        # Optional soft-open: reset gated-residual final bias after warm-load
+        # (shared across stacked layers; useful when expanding L and wanting a less
+        # closed identity start without wiping Q/K/V/W_o).
+        if fusion_cfg.get("reset_gate_bias_after_load") is not None:
+            bias = float(fusion_cfg["reset_gate_bias_after_load"])
+            for proj in (wrapped.fusion.video_proj, wrapped.fusion.imu_proj, wrapped.fusion.gaze_proj):
+                if proj is None:
+                    continue
+                nn.init.constant_(proj.gate[2].bias, bias)
+            logger.info("Reset fusion gate bias after load to %.2f (soft-open)", bias)
         fusion_n = sum(p.numel() for p in trainable_tri_modal_fusion_params(wrapped))
         logger.info(
             "Attached ConcatPlusCrossAttn: embed_dim=%d n_video=%d n_imu=%d "
-            "attn_dim=%d heads=%d layers=%d fusion_trainable=%d adapter_trainable=%d",
+            "attn_dim=%d heads=%d layers=%d fusion_trainable=%d adapter_trainable=%d keep_aux=%s",
             embed_dim,
             n_v,
             n_i,
@@ -2678,6 +2688,7 @@ def _patch_init_module_for_concat_plus_cross_attn(base_eval, gaze_cfg: dict):
             int(fusion_cfg.get("fusion_num_layers", 1)),
             fusion_n,
             sum(p.numel() for p in wrapped.input_adapter.parameters() if p.requires_grad),
+            bool(fusion_cfg.get("keep_aux_tokens_in_predictor", False)),
         )
         wrapped = _wrap_trainable_model_for_ddp(wrapped)
         base_eval._tri_modal_fusion_model = wrapped
@@ -2685,6 +2696,97 @@ def _patch_init_module_for_concat_plus_cross_attn(base_eval, gaze_cfg: dict):
         return wrapped
 
     base_eval.init_module = init_module_with_concat_plus_cross_attn
+
+
+def _patch_opt_for_concat_plus_cross_attn(base_eval, gaze_cfg: dict):
+    """Like tri-modal fusion opt, plus optional trainable 5ch adapter group."""
+    from evals.action_anticipation_frozen.utils import CosineWDSchedule, WarmupCosineLRSchedule
+
+    fusion_cfg = dict(gaze_cfg.get("fusion", {}))
+    adapter_cfg = dict(gaze_cfg.get("input_adapter", {}))
+    lr_mult = float(fusion_cfg.get("lr_mult", 0.05))
+    wd = float(fusion_cfg.get("weight_decay", 0.0001))
+    adapter_lr_mult = float(adapter_cfg.get("lr_mult", 0.25))
+    adapter_wd = float(adapter_cfg.get("weight_decay", 0.0001))
+
+    def init_opt(classifiers, iterations_per_epoch, opt_kwargs, num_epochs, use_bfloat16=False):
+        if not classifiers:
+            raise ValueError("concat_plus_cross_attn requires at least one classifier")
+        model = getattr(base_eval, "_tri_modal_fusion_model", None)
+        if model is None:
+            raise RuntimeError("concat_plus_cross_attn model was not registered before init_opt")
+        fusion_params = trainable_tri_modal_fusion_params(model)
+        if not fusion_params:
+            raise RuntimeError("concat_plus_cross_attn enabled but no trainable fusion params found")
+        adapter_params = trainable_binary_input_adapter_params(model)
+        param_groups = []
+        classifier_param_count = 0
+        classifier_heads_used = 0
+        first_kwargs = opt_kwargs[0]
+        for classifier, kwargs in zip(classifiers, opt_kwargs):
+            base_params = [p for p in classifier.parameters() if p.requires_grad]
+            if not base_params:
+                continue
+            head_idx = classifier_heads_used
+            classifier_heads_used += 1
+            classifier_param_count += sum(p.numel() for p in base_params)
+            warmup_steps = int((kwargs.get("warmup") or 0.0) * iterations_per_epoch)
+            param_groups.append(
+                {
+                    "diagnostic_name": f"classifier_head_{head_idx}",
+                    "params": base_params,
+                    "mc_warmup_steps": warmup_steps,
+                    "mc_start_lr": kwargs.get("start_lr"),
+                    "mc_ref_lr": _opt_ref_lr(kwargs),
+                    "mc_final_lr": kwargs.get("final_lr"),
+                    "mc_ref_wd": kwargs.get("ref_wd"),
+                    "mc_final_wd": kwargs.get("final_wd"),
+                }
+            )
+        warmup_steps = int((first_kwargs.get("warmup") or 0.0) * iterations_per_epoch)
+        ref_lr = _opt_ref_lr(first_kwargs) or 0.0
+        param_groups.append(
+            {
+                "diagnostic_name": "tri_modal_fusion",
+                "params": fusion_params,
+                "mc_warmup_steps": warmup_steps,
+                "mc_start_lr": (first_kwargs.get("start_lr") or 0.0) * lr_mult,
+                "mc_ref_lr": ref_lr * lr_mult,
+                "mc_final_lr": (first_kwargs.get("final_lr") or 0.0) * lr_mult,
+                "mc_ref_wd": wd,
+                "mc_final_wd": wd,
+            }
+        )
+        if adapter_params:
+            param_groups.append(
+                {
+                    "diagnostic_name": "binary_input_adapter",
+                    "params": adapter_params,
+                    "mc_warmup_steps": warmup_steps,
+                    "mc_start_lr": (first_kwargs.get("start_lr") or 0.0) * adapter_lr_mult,
+                    "mc_ref_lr": ref_lr * adapter_lr_mult,
+                    "mc_final_lr": (first_kwargs.get("final_lr") or 0.0) * adapter_lr_mult,
+                    "mc_ref_wd": adapter_wd,
+                    "mc_final_wd": adapter_wd,
+                }
+            )
+        logger.info(
+            "Optimizer split (concat+CA): classifiers=%d heads=%d, fusion=%d params lr_mult=%.3f, "
+            "adapter=%d params lr_mult=%.3f",
+            classifier_param_count,
+            classifier_heads_used,
+            sum(p.numel() for p in fusion_params),
+            lr_mult,
+            sum(p.numel() for p in adapter_params),
+            adapter_lr_mult,
+        )
+        optimizer = torch.optim.AdamW(param_groups)
+        scheduler = WarmupCosineLRSchedule(optimizer, T_max=int(num_epochs * iterations_per_epoch))
+        wd_scheduler = CosineWDSchedule(optimizer, T_max=int(num_epochs * iterations_per_epoch))
+        scaler = make_grad_scaler(use_bfloat16)
+        return [optimizer], [scaler], [scheduler], [wd_scheduler]
+
+    base_eval.init_opt = init_opt
 
 
 def _patch_opt_for_tri_modal_fusion(base_eval, gaze_cfg: dict):
