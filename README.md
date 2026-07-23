@@ -37,60 +37,51 @@ Cluster runs use **1×H100** unless noted.
 | Video joint **predictor depth +2** (depth=14, LoRA+heads, copy-init) | **40.74%** | Incomplete: killed ~2h low-GPU-util (`SIGNAL Terminated`, job `13593918`); best so far @ resumed ep1 / logged as epoch 3 |
 | Gaze+pose stage-1 (gaze map + SLAM pose matrix + encoder LoRA) | 39.16% | Pose = SLAM `pose_6d` (IMU-fused trajectory; not raw IMU CSV) |
 | Gaze+pose stage-2 (predictor LoRA only) | 40.59% | Previous P01 best (completed) |
-| Gaze+pose **joint v2** (predictor + **heads**; pooler frozen) | **42.74%** @ep2 | Previous P01 leader; early-stopped @ep5 (patience 3) |
+| Gaze+pose **joint v2** (predictor + **heads**; pooler frozen) | **42.74%** @ep2 | Previous P01 leader (plain concat); early-stopped @ep5 |
 | Gaze+pose joint v1 (predictor + **full probe** @ 2e-5) | 37.42% → 28.02% | **Collapsed**; early-stopped @ep5 (forgetting, not NaN) |
 | Tri-modal soft-FT (enc LoRA+heads+fusion from video joint) | **39.82%** → 39.58% | Declining; util-killed @ep3 (`13594209`) |
 | Tri-modal **fusion-only** (freeze backbone; cold from video joint) | **39.80%** peak | Below video joint; early-stopped @ep5 after frame-cache resume chain |
 | Tri-modal **joint** (fusion + pred LoRA + heads from video joint) | **40.85%** @ep1 | First pure-RGB tri-modal above video 40.44%; early-stopped @ep5 |
-| **Idea 1 hybrid** (concat + late IMU cross-attn) | **43.30%** @ep2 | **New P01 leader** (+0.56 vs concat 42.74%); training continues |
+| **concat+crossattention** (5ch concat + late IMU CA) | **43.60%** @ep4 | **P01 leader**; early-stopped @ep9 (patience 5); +0.86 vs concat |
 
-**P01 leader:** Idea 1 hybrid (**concat + late IMU cross-attn**) **43.30%** @ep2.  
+**P01 leader:** **concat+crossattention** **43.60%** @ep4.  
 **Previous concat baseline:** gaze+pose joint v2 **42.74%**.  
 **Video baseline:** joint v2 **40.44%**.
 
-#### Tri-modal / hybrid — status 2026-07-22
+#### Tri-modal / concat+crossattention — status 2026-07-23
 
-Architecture notes:
-- Pure tri-modal: `ProjectedTriModalCrossAttention` on RGB encoder output (`gaze.mode=projected_tri_modal_cross_attention`).
-- **Idea 1 hybrid:** `gaze.mode=concat_plus_cross_attn` — keep **5ch gaze+pose concat** backbone, add **IMU-only late cross-attn** before predictor.
+**Method name: concat+crossattention** (`gaze.mode=concat_plus_cross_attn`)
+- **Concat:** frozen 5ch gaze+pose `BinaryMapInputAdapter` + frozen encoder LoRA (warm from 42.74%).
+- **Cross-attention:** IMU-only late projected CA before predictor (cold init, gate bias −4); train CA + predictor LoRA + heads.
+- Gaze stays in concat only (not re-injected into CA).
 
 | Recipe | Trainable | Best Top-5 | Outcome |
 |---|---|---:|---|
 | Soft-FT from video joint | Fusion + enc LoRA + heads | 39.82% | Video path drifted; worse than 40.44% |
-| Fusion-only cold (LR 1e-4, bs16) | Fusion only | 39.28% | Still below video; val dropped ep1→3; util-kill AveUtil≈36% |
-| Fusion-only resume (LR **1e-5**, bs**32**) | Fusion only from best | **39.80%** peak | Early-stopped @ep5 below video 40.44%; floor held at 39.82% |
-| **Joint** from video 40.44% | Fusion + **pred LoRA** + **heads** | **40.85%** @ep1 | First pure-RGB tri-modal > video; early-stopped @ep5 |
-| **Joint A "unbrake"** | Same + fusion LR **2e-4**, gate **-1**, jitter | ≤**40.77%** | Failed: never beat floor 40.85% |
-| **Joint B "deep+keepaux"** | Fusion **L=3** + **keep aux tokens** | **40.90%** @ep2 | Still far from concat 42.74%; superseded by Idea 1 |
-| **Idea 1 hybrid** (running) | Frozen concat adapter/enc LoRA; train **IMU CA + pred LoRA + heads** | **43.30%** @ep2 | **Beats concat**; ep1 42.47 → ep2 **43.30** → ep3 42.62 (patience 1/5) |
+| Fusion-only cold / resume | Fusion only | **39.80%** peak | Below video 40.44% |
+| Pure tri-modal **joint** | Fusion + pred LoRA + heads | **40.85%** @ep1 | Beats video; loses to concat |
+| Pure tri-modal A / B | Unbrake / deep+keepaux | ≤**40.90%** | Cannot close gap to concat 42.74% |
+| **concat+crossattention** | IMU CA + pred LoRA + heads | **43.60%** @ep4 | **Done**; ep curve: 42.47 → 43.30 → 42.62 → **43.60** → … → early-stop @ep9 |
 
-**Does Idea 1 use cross-attention?** Yes — but only as a **late IMU refinement** on top of the proven concat backbone (gaze already enters via 5ch adapter; CA does not re-inject gaze).
+Val Top-5 (completed run):
 
-Why Idea 1 can warm from 42.74% while pure tri-modal cannot: encoder still sees **adapter-fused RGB** (same input distribution as concat joint). Pure-RGB tri-modal cannot load that checkpoint.
+| ep | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| top5 | 42.47 | 43.30 | 42.62 | **43.60** | 43.00 | 43.07 | 43.52 | 43.45 | 42.77 |
 
-Why pure late cross-attn lost to concat (A/B): pathway depth — concat routes gaze through all encoder+predictor layers; pure CA injects once after encoder.
+Can it go higher? Modest headroom only (~0.2–0.5pt likely): deeper IMU CA (L=2–3), `keep_aux` into predictor, light unfreeze of adapter, or soft-open gate. Large jumps unlikely without a new signal (e.g. better IMU featurization / multi-horizon).
 
 ```text
-# NEWEST: Idea 1 hybrid — concat(42.74%) + late IMU cross-attn
+# P01 leader: concat+crossattention (43.60% @ep4)
 scripts/submit_b12_concat_plus_cross_attn_from_gazepose42_1xh100.slurm
 # Run dir:
 /scratch/ll5914/experiments/concat_plus_cross_attn_from_gazepose42/action_anticipation_frozen/concat-plus-ca-from-gazepose42-vitl16-256-12ep-1xh100/
 
-# NEWEST: joint B (deep fusion + keep aux) warm from tri-modal joint 40.85%
+# Pure tri-modal joint B / A / joint / fusion-only (reference; all ≤40.90%)
 scripts/submit_b12_tri_modal_jointB_deep_keepaux_1xh100.slurm
-# Run dir:
-/scratch/ll5914/experiments/tri_modal_jointB_deep_keepaux/action_anticipation_frozen/tri-modal-jointB-deep-keepaux-vitl16-256-15ep-1xh100/
-
-# Plan A (failed unbrake) — kept for reference
 scripts/submit_b12_tri_modal_jointA_unbrake_1xh100.slurm
-
-# Joint tri-modal (pred LoRA + heads + fusion) from video joint 40.44% → 40.85%
 scripts/submit_b12_tri_modal_joint_from_p01video_jointv2_1xh100.slurm
-
-# Legacy fusion-only (failed to beat 40.44%)
 scripts/submit_b12_tri_modal_s2_from_p01video_jointv2_1xh100.slurm
-
-# Optional CPU prefill (no GPU → no util-kill) before/while GPU runs
 scripts/submit_prefill_p01_clip_frame_cache.slurm
 ```
 
@@ -118,7 +109,7 @@ Logs to watch: `decode:` / `batch_wait:` should fall well below `step:` once `TR
 #### Best P01 checkpoint (saved on scratch)
 
 ```text
-# NEW leader (Idea 1 hybrid) — 43.30% @ep2
+# P01 leader: concat+crossattention — 43.60% @ep4 (early-stopped @ep9)
 /scratch/ll5914/experiments/concat_plus_cross_attn_from_gazepose42/action_anticipation_frozen/concat-plus-ca-from-gazepose42-vitl16-256-12ep-1xh100/
   best.pt
   predictor_lora_best.pt
@@ -126,12 +117,13 @@ Logs to watch: `decode:` / `batch_wait:` should fall well below `step:` once `TR
   binary_input_adapter_best.pt
   tri_modal_fusion_best.pt          # late IMU cross-attn
   topk_log_r0.csv
+  TRAINING_DONE
 
-# Previous concat leader — 42.74% @ep2
+# Previous plain-concat leader — 42.74% @ep2
 /scratch/ll5914/experiments/p01_gazepose_pred_joint_heads_clip/action_anticipation_frozen/p01-gazepose-pred-joint-heads-vitl16-256-10ep/
-  best.pt                      # probe / classifier @ ep2 (42.74%)
+  best.pt
   predictor_lora_best.pt
-  encoder_lora_best.pt         # frozen warm-start from stage-1
+  encoder_lora_best.pt
   binary_input_adapter_best.pt
   topk_log_r0.csv
 ```
