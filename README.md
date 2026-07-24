@@ -59,7 +59,7 @@ Empirically, **late-fusing RGB / gaze / IMU as peer streams** tops out ≤**40.9
 3. **Warm-start ladder** — concat 42.74% is a transferable 5ch backbone; pure-RGB late CA cannot load it (3ch vs 5ch). Concat+CA warms from concat, then adds IMU on top (+1.18).
 4. **Modality roles** — gaze/pose = *where* (early spatial); IMU/SLAM trajectory = *how the head/body moved* (late temporal KV). Re-injecting gaze into CA double-counts the spatial cue and dilutes IMU.
 
-Full write-up with charts: see the analysis canvas linked from the training chat / open beside Cursor (`concat-ca-vs-late-fusion.canvas.tsx`).
+Full write-up with charts (open beside chat): [`concat-ca-vs-late-fusion.canvas.tsx`](/home/ll5914/.cursor/projects/home-ll5914-Jepa-yifan/canvases/concat-ca-vs-late-fusion.canvas.tsx).
 
 #### Tri-modal / concat+crossattention — status 2026-07-24
 
