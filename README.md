@@ -84,6 +84,27 @@ Val Top-5:
 | **v2** | 43.17 | 43.24 | 43.84 | **43.92** | 43.32 | 43.23 | 43.76 | 43.54 | 43.47 |
 | **v2-jitter** | 42.64 | **43.39** | 42.94 | 43.24 | — | — | — | — | — |
 
+#### MTP (Multi-Time Prediction) — optional, video-only
+
+Gated by `experiment.lora.mtp.enabled` (default off). Does not change the single-horizon path.
+
+| Recipe | Head | Backbone | Horizons | Status |
+|---|---|---|---|---|
+| **communicating MLP** (current) | 3 residual MLPs + mutual self-attn | shared 1× anticipative forward | **2 / 4 / 6 s** | **Training** |
+| Legacy cascaded | short→long feature cascade | multi-horizon predictor / AR | 1 / 5 / 10 s | Script kept |
+
+```text
+# Train: communicating-MLP MTP @ 2/4/6s (warm from video joint 40.44%)
+scripts/submit_p01_video_mtp_2_4_6_ll5914.slurm
+# Val-only (after train; restores MTP MLP weights via latest.pt):
+scripts/submit_p01_video_mtp_2_4_6_val_ll5914.slurm
+# Run dir:
+/scratch/ll5914/experiments/p01_video_mtp_2_4_6/action_anticipation_frozen/p01-video-mtp-comm-mlp-2-4-6-vitl16-256-8ep/
+
+# Legacy cascaded MTP @ 1/5/10s
+scripts/submit_p01_video_mtp_1_5_10_ll5914.slurm
+```
+
 ```text
 # Running: concat+crossattention v2-jitter (train [0.25,1.75], no frame cache; warm from 43.92%)
 scripts/submit_b12_concat_plus_cross_attn_v2_jitter_1xh100.slurm
