@@ -10,7 +10,7 @@ eval_name: app.hdepic_lora_action_anticipation
 
 ---
 
-## Best Val Action Top-5 (as of 2026-07-17)
+## Best Val Action Top-5 (as of 2026-07-24)
 
 Metric: **val action Top-5 accuracy** from `topk_log_r0.csv`.  
 Backbone: **ViT-L/16 @ 256**, horizon ≈ **1s**, temporal sampling `phd_reference` unless noted.  
@@ -43,13 +43,25 @@ Cluster runs use **1×H100** unless noted.
 | Tri-modal **fusion-only** (freeze backbone; cold from video joint) | **39.80%** peak | Below video joint; early-stopped @ep5 after frame-cache resume chain |
 | Tri-modal **joint** (fusion + pred LoRA + heads from video joint) | **40.85%** @ep1 | First pure-RGB tri-modal above video 40.44%; early-stopped @ep5 |
 | **concat+crossattention v1** (5ch concat + late IMU CA) | **43.60%** @ep4 | Early-stopped @ep9; +0.86 vs plain concat 42.74% |
-| **concat+crossattention v2** (L=3 + keep_aux + soft-gate + light adapter FT) | **43.92%** @ep4 | **P01 leader**; early-stopped @ep9; +0.32 vs v1 / +1.18 vs concat |
-| **concat+crossattention v2-jitter** (same arch; train horizon `[0.25,1.75]`; no frame cache) | — | **Running**; warm from v2 43.92%; util via 1:50 auto-resubmit |
+| **concat+crossattention v2** (L=3 + keep_aux + soft-gate + light adapter FT) | **43.92%** @ep4 | **P01 leader (current best)**; early-stopped @ep9; +0.32 vs v1 / +1.18 vs concat |
+| **concat+crossattention v2-jitter** (same arch; train horizon `[0.25,1.75]`; no frame cache) | **43.39%** @ep2 (so far) | Still running; **below** 43.92% floor (patience 4/6); no new `best.pt` |
 
-**P01 leader:** **concat+crossattention v2** **43.92%** @ep4.  
-**v1:** 43.60%. **Plain concat:** 42.74%. **Video:** 40.44%.
+**P01 leader (current best): concat+crossattention v2 — 43.92% @ep4.**  
+No later recipe (pure late-fusion tri-modal, Plan A/B, or v2-jitter so far) has beaten this.  
+**v1:** 43.60%. **Plain concat:** 42.74%. **Video:** 40.44%. **Pure RGB tri-modal:** ≤40.90%.
 
-#### Tri-modal / concat+crossattention — status 2026-07-23
+#### Why early Video+Gaze concat + late IMU CA beats separating Gaze from Video
+
+Empirically, **late-fusing RGB / gaze / IMU as peer streams** tops out ≤**40.90%**, while **early-fusing RGB+gaze(+pose) in the ViT, then cross-attending only IMU** reaches **43.92%**. Short version of the mechanism:
+
+1. **Gaze is spatially registered with pixels** — a binary gaze/pose map on the same `H×W` grid lets the frozen ViT self-attend “what I looked at” for the full encoder depth. Peer-token late CA never shares that patch grid.
+2. **Depth asymmetry** — concat rides ~24 ViT blocks; pure tri-modal CA was shallow (often L=1) with a near-closed gate (`gate≈−4`, zero `W_o`), so aux modalities barely moved the representation.
+3. **Warm-start ladder** — concat 42.74% is a transferable 5ch backbone; pure-RGB late CA cannot load it (3ch vs 5ch). Concat+CA warms from concat, then adds IMU on top (+1.18).
+4. **Modality roles** — gaze/pose = *where* (early spatial); IMU/SLAM trajectory = *how the head/body moved* (late temporal KV). Re-injecting gaze into CA double-counts the spatial cue and dilutes IMU.
+
+Full write-up with charts: see the analysis canvas linked from the training chat / open beside Cursor (`concat-ca-vs-late-fusion.canvas.tsx`).
+
+#### Tri-modal / concat+crossattention — status 2026-07-24
 
 **Method name: concat+crossattention** (`gaze.mode=concat_plus_cross_attn`)
 - **Concat:** 5ch gaze+pose `BinaryMapInputAdapter` + frozen encoder LoRA.
@@ -61,8 +73,8 @@ Cluster runs use **1×H100** unless noted.
 | Soft-FT / fusion-only / pure tri-modal A–B | various | ≤**40.90%** | Cannot beat plain concat 42.74% |
 | Pure tri-modal **joint** | Fusion + pred LoRA + heads | **40.85%** @ep1 | Beats video only |
 | **concat+crossattention v1** | IMU CA + pred LoRA + heads (adapter frozen, L=1) | **43.60%** @ep4 | Done; early-stop @ep9 |
-| **concat+crossattention v2** | Same + **L=3**, **keep_aux**, gate reset **−2**, adapter FT `lr_mult=0.25` | **43.92%** @ep4 | **Done**; warm from v1; early-stop @ep9 |
-| **concat+crossattention v2-jitter** | Same as v2; **no** gate reset; train `[0.25,1.75]`; **frame cache OFF** | — | **Running**; warm from v2 43.92%; floor 43.91892 |
+| **concat+crossattention v2** | Same + **L=3**, **keep_aux**, gate reset **−2**, adapter FT `lr_mult=0.25` | **43.92%** @ep4 | **P01 leader**; warm from v1; early-stop @ep9 |
+| **concat+crossattention v2-jitter** | Same as v2; **no** gate reset; train `[0.25,1.75]`; **frame cache OFF** | **43.39%** @ep2 (so far) | Running; below floor 43.91892; patience 4/6 |
 
 Val Top-5:
 
@@ -70,6 +82,7 @@ Val Top-5:
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | **v1** | 42.47 | 43.30 | 42.62 | **43.60** | 43.00 | 43.07 | 43.52 | 43.45 | 42.77 |
 | **v2** | 43.17 | 43.24 | 43.84 | **43.92** | 43.32 | 43.23 | 43.76 | 43.54 | 43.47 |
+| **v2-jitter** | 42.64 | **43.39** | 42.94 | 43.24 | — | — | — | — | — |
 
 ```text
 # Running: concat+crossattention v2-jitter (train [0.25,1.75], no frame cache; warm from 43.92%)
