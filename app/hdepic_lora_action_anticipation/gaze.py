@@ -75,6 +75,7 @@ class ClipBalancedDecodeVideosToClips(wds.PipelineStage):
         decoder_num_threads=-1,
         mtp_horizons_sec=None,
         mtp_intervals=None,
+        mtp_label_mode="primary_from_sample",
     ):
         self.frames_per_clip = frames_per_clip
         self.fps = fps
@@ -91,9 +92,10 @@ class ClipBalancedDecodeVideosToClips(wds.PipelineStage):
         self.label_horizon_schedule = list(label_horizon_schedule or [])
         self.cache_reader = bool(cache_reader)
         self.decoder_num_threads = int(decoder_num_threads)
-        # Optional MTP multi-horizon labels (1s/5s/10s). Off by default.
+        # Optional MTP multi-horizon labels. Off by default.
         self.mtp_horizons_sec = [float(h) for h in (mtp_horizons_sec or [])]
         self.mtp_intervals = dict(mtp_intervals or {})
+        self.mtp_label_mode = str(mtp_label_mode or "primary_from_sample").lower()
         self._reader_path: str | None = None
         self._reader_state: tuple[VideoReader, float, int] | None = None
         self._binary_gate = None
@@ -394,9 +396,10 @@ class ClipBalancedDecodeVideosToClips(wds.PipelineStage):
 
                     intervals = mtp_intervals.get(str(video_id), [])
                     mtp_verbs, mtp_nouns, mtp_mask = [], [], []
+                    label_mode = str(getattr(self, "mtp_label_mode", "primary_from_sample") or "primary_from_sample").lower()
                     for hi, h in enumerate(mtp_horizons):
-                        if hi == 0:
-                            # Primary horizon: keep this sample's annotated action.
+                        if hi == 0 and label_mode == "primary_from_sample":
+                            # Legacy: primary horizon keeps this sample's annotated action.
                             mtp_verbs.append(labels_verb)
                             mtp_nouns.append(labels_noun)
                             mtp_mask.append(1.0)
@@ -659,10 +662,12 @@ def make_clip_balanced_webvid(
     prefetch_factor=4,
     mtp_horizons_sec=None,
     mtp_intervals=None,
+    mtp_label_mode="primary_from_sample",
     **kwargs,
 ):
     del base_path, kwargs
     mtp_horizons_sec = [float(h) for h in (mtp_horizons_sec or [])]
+    mtp_label_mode = str(mtp_label_mode or "primary_from_sample").lower()
     if emit_binary_map and binary_map_cfg is not None and bool(binary_map_cfg.get("aug_aware", False)):
         binary_map_cfg = dict(binary_map_cfg)
         binary_map_cfg["aug_aware_training"] = bool(training)
@@ -721,6 +726,7 @@ def make_clip_balanced_webvid(
         decoder_num_threads=decoder_num_threads,
         mtp_horizons_sec=mtp_horizons_sec or None,
         mtp_intervals=mtp_intervals,
+        mtp_label_mode=mtp_label_mode,
     )
     if emit_binary_map:
         tuple_keys = ("video", "verb", "noun", "metadata", "anticipation_time", "binary_map")
