@@ -84,23 +84,31 @@ Val Top-5:
 | **v2** | 43.17 | 43.24 | 43.84 | **43.92** | 43.32 | 43.23 | 43.76 | 43.54 | 43.47 |
 | **v2-jitter** | 42.64 | **43.39** | 42.94 | 43.24 | — | — | — | — | — |
 
-#### MTP (Multi-Time Prediction) — optional, video-only
+#### MTP (Multi-Time Prediction) — optional
 
-Gated by `experiment.lora.mtp.enabled` (default off). Does not change the single-horizon path.
+Two protocols (both gated / separate from single-horizon concat+CA):
 
-| Recipe | Head | Backbone | Horizons | Status |
+| Protocol | Data | Context | Heads | Status |
 |---|---|---|---|---|
-| **communicating MLP** (current) | 3 residual MLPs + mutual self-attn | shared 1× anticipative forward | **2 / 4 / 6 s** | **Training** |
-| Legacy cascaded | short→long feature cascade | multi-horizon predictor / AR | 1 / 5 / 10 s | Script kept |
+| **Streaming MTP (current)** | Temporal **half-split** per video (1st half train / 2nd half val) | Grows **4→6→8→10s** from half origin, then slides 10s; tick every 2s; predict **+2/+4/+6s** | Communicating MLPs | **Training** |
+| Fixed-clip MTP (legacy) | `clip_split` fixed ~4s clips | Fixed observation | Communicating MLPs or cascaded | Scripts kept |
+
+When context tokens exceed the predictor budget, **attention-importance prune before predictor** (`keep≤4096`, rebased positions).
 
 ```text
-# Train: communicating-MLP MTP @ 2/4/6s (warm from video joint 40.44%)
-scripts/submit_p01_video_mtp_2_4_6_ll5914.slurm
-# Val-only (after train; restores MTP MLP weights via latest.pt):
-scripts/submit_p01_video_mtp_2_4_6_val_ll5914.slurm
+# Streaming MTP train (half-split + grow context + prune-before-predictor)
+scripts/submit_p01_stream_mtp_2_4_6_ll5914.slurm
+# Val-only:
+scripts/submit_p01_stream_mtp_2_4_6_val_ll5914.slurm
+# Index builder:
+scripts/make_hdepic_stream_half_split.py
 # Run dir:
-/scratch/ll5914/experiments/p01_video_mtp_2_4_6/action_anticipation_frozen/p01-video-mtp-comm-mlp-2-4-6-vitl16-256-8ep/
+/scratch/ll5914/experiments/p01_stream_mtp_2_4_6/
+# Index:
+/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/stream_half_split/
 
+# Legacy fixed-clip communicating-MLP MTP @ 2/4/6s (clip_split)
+scripts/submit_p01_video_mtp_2_4_6_ll5914.slurm
 # Legacy cascaded MTP @ 1/5/10s
 scripts/submit_p01_video_mtp_1_5_10_ll5914.slurm
 ```
