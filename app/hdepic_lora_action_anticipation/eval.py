@@ -1877,8 +1877,9 @@ def main(args_eval, resume_preempt=False):
         baseline_train_loop = base_eval.train_one_epoch is _UPSTREAM_TRAIN_ONE_EPOCH
         _patch_for_predictor_lora(base_eval, predictor_lora_cfg, baseline_train_loop=baseline_train_loop)
 
-    # Multi-Time Prediction (1s/5s/10s cascading). Opt-in only; leaves single-horizon
-    # path untouched when experiment.lora.mtp.enabled is false/absent.
+    # Multi-Time Prediction (optional). Off unless experiment.lora.mtp.enabled.
+    # New default recipe: communicating_mlp @ 2/4/6s (shared backbone, no RNN).
+    # Legacy cascaded + multi_predict still available via config.
     mtp_cfg = parse_mtp_cfg(lora_cfg)
     if mtp_cfg is not None:
         if gaze_mode not in {"none", ""}:
