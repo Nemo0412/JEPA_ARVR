@@ -536,24 +536,16 @@ def main():
     val_ds = StreamMTPDataset(args.val_csv, args.video_root, args.img_size)
     train_sampler = ContextBucketBatchSampler(train_ds, args.batch_size, shuffle=True, seed=args.seed)
     val_sampler = ContextBucketBatchSampler(val_ds, args.batch_size, shuffle=False, seed=args.seed)
-    train_loader = DataLoader(
-        train_ds,
-        batch_sampler=train_sampler,
+    loader_kwargs = dict(
         num_workers=args.num_workers,
         collate_fn=collate_stream,
         pin_memory=False,
         persistent_workers=False,
-        prefetch_factor=2 if args.num_workers > 0 else None,
     )
-    val_loader = DataLoader(
-        val_ds,
-        batch_sampler=val_sampler,
-        num_workers=args.num_workers,
-        collate_fn=collate_stream,
-        pin_memory=False,
-        persistent_workers=False,
-        prefetch_factor=2 if args.num_workers > 0 else None,
-    )
+    if args.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = 2
+    train_loader = DataLoader(train_ds, batch_sampler=train_sampler, **loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_sampler=val_sampler, **loader_kwargs)
 
     base = build_model(device, args.max_frames, args.fps, args.img_size, str(args.checkpoint))
     for p in base.encoder.parameters():
