@@ -6,8 +6,8 @@
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:h100:1
 #SBATCH --cpus-per-task=24
-#SBATCH --mem=384GB
-#SBATCH --time=08:00:00
+#SBATCH --mem=512GB
+#SBATCH --time=12:00:00
 #SBATCH --output=/scratch/ll5914/logs/p01_stream_mtp_%j.out
 #SBATCH --error=/scratch/ll5914/logs/p01_stream_mtp_%j.err
 
@@ -18,6 +18,9 @@ set -euo pipefail
 #   - growing context 4→6→8→10s from half origin, then slide 10s; tick every 2s
 #   - prune-before-predictor (keep≤4096) when long contexts overflow predictor budget
 # Separate from fixed-clip anticipative eval; does not change that path.
+#
+# 2026-07-26: prior job 14708915 OOMed (~ep1 itr940) from caching VideoReaders in
+# dataloader workers; now open/close per sample + fewer workers + bs=1.
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
 PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
@@ -68,8 +71,8 @@ ARGS=(
   --fps 8
   --img-size 256
   --keep-count 4096
-  --batch-size 2
-  --num-workers 6
+  --batch-size 1
+  --num-workers 2
   --epochs 8
   --lr 2e-5
 )

@@ -186,28 +186,27 @@ class StreamMTPDataset(Dataset):
         with Path(csv_path).open() as f:
             for row in csv.DictReader(f):
                 self.rows.append(row)
-        self._readers: dict[str, VideoReader] = {}
+        # Do NOT cache VideoReaders across samples: 27 long videos × N workers
+        # previously ballooned host RAM and triggered Slurm oom_kill.
 
     def __len__(self):
         return len(self.rows)
-
-    def _vr(self, video_id: str) -> VideoReader:
-        if video_id not in self._readers:
-            pid = video_id.split("_")[0]
-            path = self.video_root / pid / f"{video_id}.MP4"
-            self._readers[video_id] = VideoReader(
-                str(path), ctx=cpu(0), num_threads=1, width=self.img_size, height=self.img_size
-            )
-        return self._readers[video_id]
 
     def __getitem__(self, idx: int):
         r = self.rows[idx]
         video_id = str(r["video_id"])
         frame_idx = np.asarray(_parse_int_list(r["frame_indices"]), dtype=np.int64)
-        vr = self._vr(video_id)
-        frame_idx = np.clip(frame_idx, 0, len(vr) - 1)
-        frames = vr.get_batch(frame_idx.tolist()).asnumpy()  # T,H,W,C
-        clip = torch.from_numpy(frames).permute(3, 0, 1, 2).contiguous()  # C,T,H,W uint8
+        pid = video_id.split("_")[0]
+        path = self.video_root / pid / f"{video_id}.MP4"
+        vr = VideoReader(
+            str(path), ctx=cpu(0), num_threads=1, width=self.img_size, height=self.img_size
+        )
+        try:
+            frame_idx = np.clip(frame_idx, 0, len(vr) - 1)
+            frames = vr.get_batch(frame_idx.tolist()).asnumpy()  # T,H,W,C
+        finally:
+            del vr
+        clip = torch.from_numpy(np.ascontiguousarray(frames)).permute(3, 0, 1, 2).contiguous()
         return {
             "clip": clip,
             "context_sec": float(r["context_sec"]),
@@ -542,14 +541,18 @@ def main():
         batch_sampler=train_sampler,
         num_workers=args.num_workers,
         collate_fn=collate_stream,
-        pin_memory=True,
+        pin_memory=False,
+        persistent_workers=False,
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_ds,
         batch_sampler=val_sampler,
         num_workers=args.num_workers,
         collate_fn=collate_stream,
-        pin_memory=True,
+        pin_memory=False,
+        persistent_workers=False,
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
 
     base = build_model(device, args.max_frames, args.fps, args.img_size, str(args.checkpoint))
