@@ -90,13 +90,15 @@ Two protocols (both gated / separate from single-horizon concat+CA):
 
 | Protocol | Data | Context | Heads | Status |
 |---|---|---|---|---|
-| **Streaming MTP (current)** | Temporal **half-split** per video (1st half train / 2nd half val) | Grows **4→6→8→10s** from half origin, then slides 10s; tick every 2s; predict **+2/+4/+6s** | Communicating MLPs | **Training** |
+| **Streaming MTP (current)** | Temporal **half-split** per video (1st half train / 2nd half val) | Grows **4→6→8→10s** from half origin, then slides 10s; tick every 2s; predict **+2/+4/+6s** | Communicating MLPs | **Training** (1:50 auto-resubmit + mid-step ckpt) |
 | Fixed-clip MTP (legacy) | `clip_split` fixed ~4s clips | Fixed observation | Communicating MLPs or cascaded | Scripts kept |
 
 When context tokens exceed the predictor budget, **attention-importance prune before predictor** (`keep≤4096`, rebased positions).
 
 ```text
 # Streaming MTP train (half-split + grow context + prune-before-predictor)
+# Survives util-kill: --time=01:50:00 + USR1/TERM auto-sbatch; --save-every 200;
+# mid-epoch resume (train/val); /dev/shm stage of P01 (~18G) to raise util.
 scripts/submit_p01_stream_mtp_2_4_6_ll5914.slurm
 # Val-only:
 scripts/submit_p01_stream_mtp_2_4_6_val_ll5914.slurm
