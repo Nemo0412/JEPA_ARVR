@@ -90,7 +90,7 @@ Two protocols (both gated / separate from single-horizon concat+CA):
 
 | Protocol | Data | Context | Heads | Status |
 |---|---|---|---|---|
-| **Streaming MTP (current)** | Temporal **half-split** per video (1st half train / 2nd half val) | Grows **4→6→8→10s** from half origin, then slides 10s; tick every 2s; predict **+2/+4/+6s** | Communicating MLPs | **Training** (1:50 auto-resubmit + mid-step ckpt) |
+| **Streaming MTP (current)** | Temporal **half-split** per video (1st half train / 2nd half val) | Grows **4→6→8→10s** from half origin, then slides 10s; tick every 2s; predict **+2/+4/+6s** | Communicating MLPs | **Training** (video-only + concat+CA tri-modal) |
 | Fixed-clip MTP (legacy) | `clip_split` fixed ~4s clips | Fixed observation | Communicating MLPs or cascaded | Scripts kept |
 
 When context tokens exceed the predictor budget, **attention-importance prune before predictor** (`keep≤4096`, rebased positions).
@@ -100,11 +100,14 @@ When context tokens exceed the predictor budget, **attention-importance prune be
 # Survives util-kill: --time=01:50:00 + USR1/TERM auto-sbatch; --save-every 200;
 # mid-epoch resume (train/val); /dev/shm stage of P01 (~18G) to raise util.
 scripts/submit_p01_stream_mtp_2_4_6_ll5914.slurm
+# Streaming MTP + concat+CA (video+gaze+pose), warm from 43.92% v2:
+scripts/submit_p01_stream_mtp_concat_ca_2_4_6_ll5914.slurm
+# → /scratch/ll5914/experiments/p01_stream_mtp_concat_ca_2_4_6/
 # Val-only:
 scripts/submit_p01_stream_mtp_2_4_6_val_ll5914.slurm
 # Index builder:
 scripts/make_hdepic_stream_half_split.py
-# Run dir:
+# Run dir (video-only):
 /scratch/ll5914/experiments/p01_stream_mtp_2_4_6/
 # Index:
 /scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/stream_half_split/
