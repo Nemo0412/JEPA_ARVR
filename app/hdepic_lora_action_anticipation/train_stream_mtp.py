@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import os
+import signal
 import sys
 import time
 from collections import defaultdict
@@ -225,6 +226,7 @@ class ContextBucketBatchSampler(Sampler[list[int]]):
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
         self.epoch = 0
+        self.start_batch = 0  # mid-epoch resume: skip this many batches without decode
         buckets: dict[int, list[int]] = defaultdict(list)
         for i, r in enumerate(dataset.rows):
             buckets[int(r["n_model_frames"])].append(i)
@@ -232,6 +234,9 @@ class ContextBucketBatchSampler(Sampler[list[int]]):
 
     def set_epoch(self, epoch: int):
         self.epoch = int(epoch)
+
+    def set_start_batch(self, start_batch: int):
+        self.start_batch = max(0, int(start_batch))
 
     def __iter__(self):
         rng = np.random.RandomState(self.seed + self.epoch)
@@ -244,7 +249,8 @@ class ContextBucketBatchSampler(Sampler[list[int]]):
                 batches.append(order[i : i + self.batch_size])
         if self.shuffle:
             rng.shuffle(batches)
-        yield from batches
+        # Deterministic order for a given (seed, epoch) → safe mid-epoch resume.
+        yield from batches[self.start_batch :]
 
     def __len__(self):
         return sum(math.ceil(len(v) / self.batch_size) for v in self.buckets.values())
@@ -377,6 +383,45 @@ def load_lora_sidecars(model, enc_path: str | None, pred_path: str | None):
 
 
 # ── train / val loops ────────────────────────────────────────────────────────
+def save_checkpoint(
+    path: Path,
+    *,
+    epoch: int,
+    step: int,
+    model,
+    mtp_clf,
+    optimizer,
+    scaler,
+    best: float,
+    horizons,
+    verb_map,
+    noun_map,
+    action_map,
+    history,
+    phase: str = "train",
+    metric_state=None,
+):
+    ck = {
+        "epoch": int(epoch),
+        "step": int(step),
+        "phase": str(phase),
+        "model": model.state_dict(),
+        "mtp_classifier": mtp_clf.state_dict(),
+        "optimizer": optimizer.state_dict() if optimizer is not None else None,
+        "scaler": scaler.state_dict() if scaler is not None else None,
+        "best": float(best),
+        "horizons": list(horizons),
+        "verb_map": verb_map,
+        "noun_map": noun_map,
+        "action_map": {f"{v},{n}": i for (v, n), i in action_map.items()},
+        "history": history,
+        "metric_state": metric_state,
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(ck, tmp)
+    os.replace(tmp, path)
+
+
 def run_epoch(
     model,
     classifier,
@@ -393,6 +438,11 @@ def run_epoch(
     train: bool = True,
     anticipation_sec: float = 2.0,
     log_every: int = 20,
+    start_step: int = 0,
+    save_every: int = 0,
+    save_fn=None,
+    stop_flag=None,
+    metric_state=None,
 ):
     model.train(mode=train)
     classifier.train(mode=train)
@@ -401,8 +451,23 @@ def run_epoch(
     counts = defaultdict(int)
     loss_meter = 0.0
     n_steps = 0
+    if metric_state:
+        for k, v in (metric_state.get("totals") or {}).items():
+            totals[k] = float(v)
+        for k, v in (metric_state.get("counts") or {}).items():
+            counts[k] = int(v)
+        loss_meter = float(metric_state.get("loss_meter", 0.0))
+        n_steps = int(metric_state.get("n_steps", 0))
     t0 = time.time()
-    for it, batch in enumerate(loader):
+    stopped_early = False
+    last_it = start_step - 1
+    # Sampler should already skip [0, start_step); local_it is offset from start_step.
+    for local_it, batch in enumerate(loader):
+        it = start_step + local_it
+        if stop_flag is not None and stop_flag["stop"]:
+            stopped_early = True
+            break
+        last_it = it
         clips = batch["clip"].to(device, non_blocking=True).float().div_(255.0)
         clips = clips.sub_(IMAGENET_MEAN.to(device)).div_(IMAGENET_STD.to(device))
         mtp_verbs = batch["mtp_verbs"].to(device, non_blocking=True)
@@ -488,9 +553,31 @@ def run_epoch(
                 100.0 * totals["primary_action_top5"] / max(1, counts["primary_action_top5"]),
                 float(batch["context_sec"][0]),
             )
+        if save_every > 0 and save_fn is not None and ((it + 1) % save_every == 0):
+            # next resume should continue at it+1
+            phase = "train" if train else "val"
+            save_fn(
+                step=it + 1,
+                phase=phase,
+                metric_state={
+                    "totals": dict(totals),
+                    "counts": dict(counts),
+                    "loss_meter": loss_meter,
+                    "n_steps": n_steps,
+                },
+            )
+            logger.info("Periodic checkpoint at %s step=%d", phase, it + 1)
     metrics = {k: (totals[k] / max(1, counts[k])) for k in totals}
     metrics["loss"] = loss_meter / max(1, n_steps)
     metrics["seconds"] = time.time() - t0
+    metrics["last_step"] = int(last_it + 1)
+    metrics["stopped_early"] = bool(stopped_early)
+    metrics["_metric_state"] = {
+        "totals": dict(totals),
+        "counts": dict(counts),
+        "loss_meter": loss_meter,
+        "n_steps": n_steps,
+    }
     return metrics
 
 
@@ -516,6 +603,7 @@ def main():
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--epochs", type=int, default=8)
     ap.add_argument("--lr", type=float, default=2e-5)
+    ap.add_argument("--save-every", type=int, default=200, help="Save latest.pt every N train steps (0=off)")
     ap.add_argument("--val-only", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -529,6 +617,11 @@ def main():
     primary_idx = horizons.index(primary_h) if primary_h in horizons else 0
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    done_flag = args.out_dir / "TRAINING_DONE"
+    if done_flag.is_file() and not args.val_only:
+        logger.info("TRAINING_DONE present (%s); exiting.", done_flag)
+        return
+
     verb_map, noun_map, action_map = load_action_maps(args.train_csv)
     logger.info("vocab verbs=%d nouns=%d actions=%d", len(verb_map), len(noun_map), len(action_map))
 
@@ -587,36 +680,149 @@ def main():
     best = -1.0
     history = []
     start_epoch = 0
+    start_step = 0
+    resume_phase = "train"
+    resume_metric_state = None
     latest = args.out_dir / "latest.pt"
     if latest.is_file():
         ck = torch.load(latest, map_location="cpu", weights_only=False)
         model.load_state_dict(ck["model"], strict=False)
         mtp_clf.load_state_dict(ck["mtp_classifier"], strict=False)
-        optimizer.load_state_dict(ck["optimizer"])
-        start_epoch = int(ck.get("epoch", 0)) + 1
+        if ck.get("optimizer") is not None:
+            optimizer.load_state_dict(ck["optimizer"])
+        if ck.get("scaler") is not None:
+            try:
+                scaler.load_state_dict(ck["scaler"])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not restore GradScaler state: %s", exc)
         best = float(ck.get("best", -1.0))
-        logger.info("Resumed from %s epoch=%d best=%.4f", latest, start_epoch, best)
+        history = list(ck.get("history") or [])
+        # Mid-epoch resume: epoch=current, step=next train index.
+        # Legacy checkpoints (pre mid-step) only stored completed epoch → start at epoch+1.
+        if "step" in ck:
+            start_epoch = int(ck.get("epoch", 0))
+            start_step = int(ck.get("step", 0))
+            resume_phase = str(ck.get("phase", "train"))
+            resume_metric_state = ck.get("metric_state")
+        else:
+            start_epoch = int(ck.get("epoch", 0)) + 1
+            start_step = 0
+            resume_phase = "train"
+            resume_metric_state = None
+        logger.info(
+            "Resumed from %s epoch=%d step=%d phase=%s best=%.4f",
+            latest,
+            start_epoch,
+            start_step,
+            resume_phase,
+            best,
+        )
+
+    stop_flag = {"stop": False}
+    _ckpt_ctx = {"epoch": start_epoch, "step": start_step, "phase": resume_phase}
+
+    def _periodic_save(step: int, phase: str, metric_state=None):
+        _ckpt_ctx["step"] = int(step)
+        _ckpt_ctx["phase"] = str(phase)
+        save_checkpoint(
+            latest,
+            epoch=_ckpt_ctx["epoch"],
+            step=step,
+            model=model,
+            mtp_clf=mtp_clf,
+            optimizer=optimizer,
+            scaler=scaler,
+            best=best,
+            horizons=horizons,
+            verb_map=verb_map,
+            noun_map=noun_map,
+            action_map=action_map,
+            history=history,
+            phase=phase,
+            metric_state=metric_state,
+        )
+
+    def _on_signal(signum, _frame):
+        logger.warning("Caught signal %s — saving latest and stopping after current step", signum)
+        stop_flag["stop"] = True
+        try:
+            _periodic_save(step=max(0, int(_ckpt_ctx["step"])), phase=str(_ckpt_ctx["phase"]))
+            logger.info("Emergency checkpoint written to %s", latest)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed emergency checkpoint: %s", exc)
+
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+    if hasattr(signal, "SIGUSR1"):
+        signal.signal(signal.SIGUSR1, _on_signal)
 
     if args.val_only:
         metrics = run_epoch(
             model, mtp_clf, val_loader, device, horizons, weights, primary_idx,
             verb_map, noun_map, action_map, train=False, anticipation_sec=args.anticipation_sec,
+            stop_flag=stop_flag,
         )
         logger.info("VAL_ONLY metrics: %s", json.dumps({k: round(v, 5) if isinstance(v, float) else v for k, v in metrics.items()}))
         (args.out_dir / "val_only_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
         return
 
     for epoch in range(start_epoch, args.epochs):
+        _ckpt_ctx["epoch"] = epoch
         train_sampler.set_epoch(epoch)
-        tr = run_epoch(
-            model, mtp_clf, train_loader, device, horizons, weights, primary_idx,
-            verb_map, noun_map, action_map, optimizer=optimizer, scaler=scaler, train=True,
-            anticipation_sec=args.anticipation_sec,
-        )
+        val_sampler.set_epoch(epoch)
+        epoch_start_step = start_step if (epoch == start_epoch and resume_phase == "train") else 0
+        val_start_step = start_step if (epoch == start_epoch and resume_phase == "val") else 0
+        skip_train = bool(epoch == start_epoch and resume_phase == "val")
+        if skip_train:
+            logger.info("Skipping train for epoch %d (resume_phase=val step=%d)", epoch, val_start_step)
+            tr = {"loss": float("nan"), "stopped_early": False, "last_step": 0}
+        else:
+            _ckpt_ctx["phase"] = "train"
+            train_sampler.set_start_batch(epoch_start_step)
+            tr = run_epoch(
+                model, mtp_clf, train_loader, device, horizons, weights, primary_idx,
+                verb_map, noun_map, action_map, optimizer=optimizer, scaler=scaler, train=True,
+                anticipation_sec=args.anticipation_sec,
+                start_step=epoch_start_step,
+                save_every=int(args.save_every),
+                save_fn=_periodic_save,
+                stop_flag=stop_flag,
+                metric_state=(resume_metric_state if epoch_start_step > 0 else None),
+            )
+            train_sampler.set_start_batch(0)
+            if tr.get("stopped_early"):
+                _periodic_save(
+                    step=int(tr["last_step"]),
+                    phase="train",
+                    metric_state=tr.get("_metric_state"),
+                )
+                logger.warning("Stopped early during train epoch=%d step=%d", epoch, tr["last_step"])
+                return
+
+        # End-of-train save before potentially long val (util-kill safety).
+        if not skip_train:
+            _periodic_save(step=0, phase="val", metric_state=None)
+        _ckpt_ctx["phase"] = "val"
+        val_sampler.set_start_batch(val_start_step)
         va = run_epoch(
             model, mtp_clf, val_loader, device, horizons, weights, primary_idx,
             verb_map, noun_map, action_map, train=False, anticipation_sec=args.anticipation_sec,
+            start_step=val_start_step,
+            save_every=int(args.save_every),
+            save_fn=_periodic_save,
+            stop_flag=stop_flag,
+            metric_state=(resume_metric_state if (skip_train and val_start_step > 0) else None),
         )
+        val_sampler.set_start_batch(0)
+        if va.get("stopped_early"):
+            _periodic_save(
+                step=int(va["last_step"]),
+                phase="val",
+                metric_state=va.get("_metric_state"),
+            )
+            logger.warning("Stopped early during val epoch=%d step=%d", epoch, va["last_step"])
+            return
+
         primary = float(va.get("primary_action_top5", 0.0))
         logger.info(
             "epoch %d train_loss=%.4f val_primary_top5=%.2f%% %s",
@@ -625,26 +831,54 @@ def main():
             100.0 * primary,
             {k: round(100.0 * va[k], 2) for k in va if k.startswith("action_top5")},
         )
-        history.append({"epoch": epoch, "train": tr, "val": va})
-        ck = {
-            "epoch": epoch,
-            "model": model.state_dict(),
-            "mtp_classifier": mtp_clf.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "best": best,
-            "horizons": horizons,
-            "verb_map": verb_map,
-            "noun_map": noun_map,
-            "action_map": {f"{v},{n}": i for (v, n), i in action_map.items()},
-        }
-        torch.save(ck, latest)
+        tr_pub = {k: v for k, v in tr.items() if not str(k).startswith("_")}
+        va_pub = {k: v for k, v in va.items() if not str(k).startswith("_")}
+        history.append({"epoch": epoch, "train": tr_pub, "val": va_pub})
+        # Completed epoch → next resume starts at epoch+1 / step 0.
+        save_checkpoint(
+            latest,
+            epoch=epoch + 1,
+            step=0,
+            model=model,
+            mtp_clf=mtp_clf,
+            optimizer=optimizer,
+            scaler=scaler,
+            best=best,
+            horizons=horizons,
+            verb_map=verb_map,
+            noun_map=noun_map,
+            action_map=action_map,
+            history=history,
+            phase="train",
+            metric_state=None,
+        )
         if primary > best:
             best = primary
-            ck["best"] = best
-            torch.save(ck, args.out_dir / "best.pt")
+            save_checkpoint(
+                args.out_dir / "best.pt",
+                epoch=epoch + 1,
+                step=0,
+                model=model,
+                mtp_clf=mtp_clf,
+                optimizer=optimizer,
+                scaler=scaler,
+                best=best,
+                horizons=horizons,
+                verb_map=verb_map,
+                noun_map=noun_map,
+                action_map=action_map,
+                history=history,
+                phase="train",
+                metric_state=None,
+            )
             logger.info("New best primary_action_top5=%.4f", best)
         (args.out_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+        # Clear mid-epoch resume state for subsequent epochs.
+        start_step = 0
+        resume_phase = "train"
+        resume_metric_state = None
 
+    done_flag.write_text(f"finished epochs={args.epochs} best={best}\n", encoding="utf-8")
     logger.info("Done. best primary_action_top5=%.4f", best)
 
 
