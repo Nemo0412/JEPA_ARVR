@@ -762,8 +762,12 @@ def main():
             verb_map, noun_map, action_map, train=False, anticipation_sec=args.anticipation_sec,
             stop_flag=stop_flag,
         )
-        logger.info("VAL_ONLY metrics: %s", json.dumps({k: round(v, 5) if isinstance(v, float) else v for k, v in metrics.items()}))
-        (args.out_dir / "val_only_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        metrics_pub = {k: v for k, v in metrics.items() if not str(k).startswith("_")}
+        logger.info(
+            "VAL_ONLY metrics: %s",
+            json.dumps({k: round(v, 5) if isinstance(v, float) else v for k, v in metrics_pub.items()}),
+        )
+        (args.out_dir / "val_only_metrics.json").write_text(json.dumps(metrics_pub, indent=2), encoding="utf-8")
         return
 
     for epoch in range(start_epoch, args.epochs):
