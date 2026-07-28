@@ -84,15 +84,18 @@ Val Top-5:
 | **v2** | 43.17 | 43.24 | 43.84 | **43.92** | 43.32 | 43.23 | 43.76 | 43.54 | 43.47 |
 | **v2-jitter** | 42.64 | **43.39** | 42.94 | 43.24 | — | — | — | — | — |
 
-#### MTP (Multi-Time Prediction) — status 2026-07-27
+#### MTP (Multi-Time Prediction) — status 2026-07-28
 
 Separate from single-horizon concat+CA @1s. Stream protocol: temporal **half-split** per video; context grows **4→6→8→10s** then slides; tick every 2s; predict **+2/+4/+6s** with communicating MLPs; prune `keep≤4096` when tokens overflow. Survives util-kill via `#SBATCH --time=01:50:00` + USR1/TERM auto-`sbatch` + mid-step `latest.pt` (`--save-every 200`).
 
 | Run | Backbone / warm-start | Best so far (val action Top-5) | Status |
 |---|---|---|---|
-| **Streaming MTP video-only** | Video LoRA from video joint v2 | **ep1: @2s 25.82% / @4s 21.75% / @6s 19.30%** (ep0: 23.87 / 21.00 / 19.80) | **Running** — ep2 val in progress (`14826985`); 8 ep planned |
-| **Streaming MTP + concat+CA** | concat+CA v2 **43.92%** (adapter+fusion+LoRA) | — | **Queued** (`14828588`, waiting on GRES after video-only chunk) |
+| **Streaming MTP video-only** | Video LoRA from video joint v2 | **ep2: @2s 25.88% / @4s 22.31% / @6s 19.77%** (ep0 23.87/21.00/19.80; ep1 25.82/21.75/19.30; ep3–4 declined) | **Queued** resume ep5 train; best still ep2; 8 ep planned |
+| **Streaming MTP + concat+CA** | concat+CA v2 **43.92%** (adapter+fusion+LoRA) | no full val yet | **Queued** resume; ep0 train ~**4000/4542**; train≈ @2s 35.8 / @4s 33.7 / @6s 32.1 |
 | Fixed-clip MTP (legacy) | video-only / clip_split | — | Scripts kept; not the active protocol |
+
+**Shared ckpt (for yh6416 / Yifan):**  
+`/scratch/ll5914/share/yh6416/stream_mtp_concat_ca_2_4_6/latest.pt` (+ `STATUS.txt`)
 
 ```text
 # Streaming MTP video-only
@@ -102,6 +105,8 @@ scripts/submit_p01_stream_mtp_2_4_6_ll5914.slurm
 # Streaming MTP + concat+CA (video+gaze+pose), warm from 43.92% v2
 scripts/submit_p01_stream_mtp_concat_ca_2_4_6_ll5914.slurm
 # → /scratch/ll5914/experiments/p01_stream_mtp_concat_ca_2_4_6/
+# Shared copy:
+# → /scratch/ll5914/share/yh6416/stream_mtp_concat_ca_2_4_6/
 
 # Index (shared):
 scripts/make_hdepic_stream_half_split.py
