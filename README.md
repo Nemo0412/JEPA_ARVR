@@ -84,31 +84,55 @@ Val Top-5:
 | **v2** | 43.17 | 43.24 | 43.84 | **43.92** | 43.32 | 43.23 | 43.76 | 43.54 | 43.47 |
 | **v2-jitter** | 42.64 | **43.39** | 42.94 | 43.24 | — | — | — | — | — |
 
-#### MTP (Multi-Time Prediction) — status 2026-07-28
+#### MTP (Multi-Time Prediction) — status 2026-07-29
 
 Separate from single-horizon concat+CA @1s. Stream protocol: temporal **half-split** per video; context grows **4→6→8→10s** then slides; tick every 2s; predict **+2/+4/+6s** with communicating MLPs; prune `keep≤4096` when tokens overflow. Survives util-kill via `#SBATCH --time=01:50:00` + USR1/TERM auto-`sbatch` + mid-step `latest.pt` (`--save-every 200`).
 
-| Run | Backbone / warm-start | Best so far (val action Top-5) | Status |
+| Run | Backbone / warm-start | Best val action Top-5 (@2s / @4s / @6s) | Status |
 |---|---|---|---|
-| **Streaming MTP video-only** | Video LoRA from video joint v2 | **ep2: @2s 25.88% / @4s 22.31% / @6s 19.77%** (ep0 23.87/21.00/19.80; ep1 25.82/21.75/19.30; ep3–4 declined) | **Queued** resume ep5 train; best still ep2; 8 ep planned |
-| **Streaming MTP + concat+CA** | concat+CA v2 **43.92%** (adapter+fusion+LoRA) | no full val yet | **Queued** resume; ep0 train ~**4000/4542**; train≈ @2s 35.8 / @4s 33.7 / @6s 32.1 |
-| Fixed-clip MTP (legacy) | video-only / clip_split | — | Scripts kept; not the active protocol |
+| **Streaming MTP video-only** | Video LoRA from video joint v2 | **ep2: 25.88 / 22.31 / 19.77** | **Done** (8/8 ep). Peak @ep2; ep3–7 flat/decline (ep7: 24.52 / 18.33 / 14.54) |
+| **Streaming MTP + concat+CA** | concat+CA v2 **43.92%** (adapter+fusion+LoRA) | **ep1: 23.22 / 20.60 / 18.26** (ep0: 22.41 / 20.32 / 18.61) | **Running** — ep2 val in progress (~2.5k/4450); still below video-only best |
+| Fixed-clip MTP (legacy) | video-only / clip_split | — | Scripts kept |
 
-**Shared ckpt (for yh6416 / Yifan):**  
-`/scratch/ll5914/share/yh6416/stream_mtp_concat_ca_2_4_6/latest.pt` (+ `STATUS.txt`)
+**Shared ckpt (yh6416 / Yifan):** `/scratch/ll5914/share/yh6416/stream_mtp_concat_ca_2_4_6/` (`latest.pt` + `STATUS.txt`)
+
+**Throughput (concat+CA):** ≈ **1.6 s/step**, ~2.0–2.1 h / train epoch (4542) + similar for val. Main cost is **not** “missing a second GPU” alone.
+
+##### Why concat+CA stream MTP is slow — and how to speed it up
+
+Bottlenecks (in priority order):
+
+1. **Per-sample CPU aux** — each `__getitem__` decode video **and** rasterize gaze+pose map + SLAM IMU (no stream-tick cache). Only `num_workers=2`; GPU often waits.
+2. **Long context** — up to **80 frames / 10s** (vs 1s recipe’s 32 frames + frame cache + `bs=4`).
+3. **`bs=1`** — ContextBucket sampler keeps same `n_model_frames` per batch; short-context buckets (4/6/8s) could use `bs>1`, long 10s stay 1.
+4. **Heavier GPU graph** — 5ch adapter + L=3 fusion (~27M trainable) + IMU encoder + pre-prune importance on full tokens + `keep_aux` predictor prefix.
+5. **Fat checkpoints** — ~2.4G `latest.pt` every 200 steps (I/O tax under 1:50 chunks).
+
+**Acceleration plan (next work, recommended order):**
+
+| Priority | Change | Expected gain | Notes |
+|---|---|---|---|
+| **P0** | **Stream-tick aux+RGB cache** on scratch (key=`video_id+frame_indices`) | large (cut CPU wait) | Mirror 1s `TRI_MODAL_FRAME_CACHE`; store uint8 clip + aux2ch + imu; deterministic ticks → high hit rate |
+| **P0** | Raise **`num_workers` 2→8** + prefetch; keep builders lazy/picklable | medium | Cheap; still needed even with cache cold-start |
+| **P1** | **Bucket-wise batch size** (e.g. 4s/`bs=4`, 6–8s/`bs=2`, 10s/`bs=1`) | medium | Same ContextBucketSampler; watch H100 mem with prune |
+| **P1** | Async aux like 1s `_TriModalBatchPrefetcher` (decode ‖ gaze/IMU) | medium | Overlap CPU stages if cache miss |
+| **P2** | Slim periodic ckpt (weights-only / omit opt+scaler every N) | small–medium | Keep full ckpt less often for resume safety |
+| **P2** | Freeze fusion after warm-in, or `fusion_num_layers=1` for MTP | small GPU | Trade accuracy; A/B later |
+| **P3** | 2×GPU: **two jobs in parallel** (video ∥ CA) first; DDP same-run later | wall-clock | QOS allows ≤24 GPUs/user; DDP needs code + still needs P0 or GPU idles |
+
+Do **not** expect 2-GPU DDP alone to ~2× this run until P0 cache exists.
 
 ```text
-# Streaming MTP video-only
+# Streaming MTP video-only (FINISHED — best ep2 25.88%@2s)
 scripts/submit_p01_stream_mtp_2_4_6_ll5914.slurm
 # → /scratch/ll5914/experiments/p01_stream_mtp_2_4_6/
 
-# Streaming MTP + concat+CA (video+gaze+pose), warm from 43.92% v2
+# Streaming MTP + concat+CA (RUNNING)
 scripts/submit_p01_stream_mtp_concat_ca_2_4_6_ll5914.slurm
 # → /scratch/ll5914/experiments/p01_stream_mtp_concat_ca_2_4_6/
-# Shared copy:
-# → /scratch/ll5914/share/yh6416/stream_mtp_concat_ca_2_4_6/
+# Shared: /scratch/ll5914/share/yh6416/stream_mtp_concat_ca_2_4_6/
 
-# Index (shared):
+# Index:
 scripts/make_hdepic_stream_half_split.py
 # → /scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/stream_half_split/
 
