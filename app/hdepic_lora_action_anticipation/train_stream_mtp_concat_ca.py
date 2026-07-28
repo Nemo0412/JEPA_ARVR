@@ -57,21 +57,32 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 
 class StreamMTPConcatCADataset(base.StreamMTPDataset):
-    """Video decode + gaze/pose map + IMU for each stream tick."""
+    """Video decode + gaze/pose map + IMU for each stream tick.
 
-    def __init__(
-        self,
-        csv_path: Path,
-        video_root: Path,
-        img_size: int,
-        map_builder: GazePoseInputMapBuilder,
-        imu_loader: ImuTrajectoryLoader,
-    ):
+    Builders hold ``threading.Lock`` (unpicklable). Store only ``gaze_cfg`` and
+    lazily construct per-process so DataLoader ``num_workers>0`` (spawn) works.
+    """
+
+    def __init__(self, csv_path: Path, video_root: Path, img_size: int, gaze_cfg: dict):
         super().__init__(csv_path, video_root, img_size)
-        self.map_builder = map_builder
-        self.imu_loader = imu_loader
+        self.gaze_cfg = dict(gaze_cfg)
+        self._map_builder = None
+        self._imu_loader = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_map_builder"] = None
+        state["_imu_loader"] = None
+        return state
+
+    def _ensure_aux_loaders(self):
+        if self._map_builder is None or self._imu_loader is None:
+            gate = GazeTokenGate({**self.gaze_cfg, "mode": "token_gate", "learnable_gate": False})
+            self._map_builder = GazePoseInputMapBuilder(self.gaze_cfg, gate=gate)
+            self._imu_loader = ImuTrajectoryLoader(self.gaze_cfg, gate=gate)
 
     def __getitem__(self, idx: int):
+        self._ensure_aux_loaders()
         sample = super().__getitem__(idx)
         r = self.rows[idx]
         video_id = str(r["video_id"])
@@ -87,8 +98,8 @@ class StreamMTPConcatCADataset(base.StreamMTPDataset):
         t = int(sample["clip"].shape[1])
         h = int(sample["clip"].shape[2])
         w = int(sample["clip"].shape[3])
-        aux = self.map_builder.build_cpu([meta], t, h, w)[0]  # 2,T,H,W
-        imu = self.imu_loader.load_batch([meta], torch.device("cpu"))
+        aux = self._map_builder.build_cpu([meta], t, h, w)[0]  # 2,T,H,W
+        imu = self._imu_loader.load_batch([meta], torch.device("cpu"))
         sample["aux_map"] = aux
         sample["imu"] = imu[0][0] if imu is not None else torch.zeros(t, 128, 6)
         sample["imu_len"] = imu[1][0] if imu is not None else torch.ones(t, dtype=torch.long)
@@ -542,15 +553,12 @@ def main():
         args.pose_mapping_json,
         args.img_size,
     )
-    gate = GazeTokenGate({**gaze_cfg, "mode": "token_gate", "learnable_gate": False})
-    map_builder = GazePoseInputMapBuilder(gaze_cfg, gate=gate)
-    imu_loader = ImuTrajectoryLoader(gaze_cfg, gate=gate)
 
     verb_map, noun_map, action_map = base.load_action_maps(args.train_csv)
     logger.info("vocab verbs=%d nouns=%d actions=%d", len(verb_map), len(noun_map), len(action_map))
 
-    train_ds = StreamMTPConcatCADataset(args.train_csv, args.video_root, args.img_size, map_builder, imu_loader)
-    val_ds = StreamMTPConcatCADataset(args.val_csv, args.video_root, args.img_size, map_builder, imu_loader)
+    train_ds = StreamMTPConcatCADataset(args.train_csv, args.video_root, args.img_size, gaze_cfg)
+    val_ds = StreamMTPConcatCADataset(args.val_csv, args.video_root, args.img_size, gaze_cfg)
     train_sampler = base.ContextBucketBatchSampler(train_ds, args.batch_size, shuffle=True, seed=args.seed)
     val_sampler = base.ContextBucketBatchSampler(val_ds, args.batch_size, shuffle=False, seed=args.seed)
     loader_kwargs = dict(
