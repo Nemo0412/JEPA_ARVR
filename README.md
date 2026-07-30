@@ -8,6 +8,12 @@ Upstream backbone lives in the `vjepa2` submodule / external V-JEPA2 tree. Proje
 eval_name: app.hdepic_lora_action_anticipation
 ```
 
+### Streaming baselines (`baselines/`, branch `baseline`)
+
+Same HD-EPIC P01 **stream** protocol (+2/+4/+6s) comparisons live under [`baselines/`](baselines/)
+(RU-LSTM, vit_tiny≈18M, Qwen2-VL-2B, VLESA). Progress snapshot and numbers:
+[`baselines/README.md`](baselines/README.md).
+
 ---
 
 ## Best Val Action Top-5 (as of 2026-07-24)
