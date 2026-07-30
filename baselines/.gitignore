@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+.eggs/
+.venv/
+venv/
+.DS_Store
+.idea/
+.vscode/
+
+# Vendored nested repos
+rulstm/.git/
+vlesa/.git/
+
+# Checkpoints / heavy artifacts
+*.pt
+*.pth
+*.pth.tar
+*.ckpt
+*.bin
+*.safetensors
+
+# Local experiment dumps
+**/history.json
+**/param_count.json
+**/val_metrics.json
+**/compare_vs_*.json
+**/TRAINING_DONE
+*.out
+*.err
+logs/
