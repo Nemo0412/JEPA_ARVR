@@ -21,12 +21,13 @@ V-JEPA training code remains in the main repo (`app/hdepic_lora_action_anticipat
 | [`rulstm_hdepic/`](rulstm_hdepic/) | Streaming RU-LSTM on HD-EPIC P01 |
 | [`jepa_tiny_18m/`](jepa_tiny_18m/) | From-scratch V-JEPA `vit_tiny` ≈18–20M vs RU-LSTM |
 | [`qwen_vl_stream/`](qwen_vl_stream/) | Qwen2-VL-2B LoRA probe (official smallest Qwen-VL) |
+| [`jepa_causal_decoder/`](jepa_causal_decoder/) | **Exp A:** causal decoder on frozen ViT-L latents (vs JEPA predictor) |
 | [`vlesa/`](vlesa/) | Upstream [VLESA](https://github.com/HanjiangHu/VLESA) (vendor) |
 | [`vlesa_latency/`](vlesa_latency/) | VLESA safety-filter GPU latency bench |
 
 ---
 
-## Progress (2026-07-30)
+## Progress (2026-07-31)
 
 ### 1) V-JEPA video-only vanilla (reference)
 
@@ -62,7 +63,16 @@ V-JEPA training code remains in the main repo (`app/hdepic_lora_action_anticipat
 - Fairness note: still **~5×** JEPA vanilla params; use as “smallest official Qwen-VL”
   on the **same stream protocol**, not param-matched
 
-### 5) Other
+### 5) Exp A — causal decoder on JEPA latents (architecture ablation)
+
+- **Goal:** same frozen ViT-L + frames + MTP; swap anticipative predictor ↔
+  param-matched causal Transformer decoder (d=384, L=12, H=12 ≈29M)
+- Code: [`jepa_causal_decoder/`](jepa_causal_decoder/)
+- Out: `/scratch/ll5914/experiments/p01_stream_causal_decoder_2_4_6/`
+- Job: `p01_causal_dec` (submitted; auto-resubmit under 2h util window)
+- Fairness: decoder from scratch; JEPA vanilla keeps pretrained predictor + LoRA
+
+### 6) Other
 
 - **VLESA** latency harness under `vlesa_latency/` (local safety-filter GPU latency)
 - Stronger JEPA (concat-CA / MTP variants) tracked in main `JEPA_ARVR` training jobs,
@@ -76,6 +86,7 @@ V-JEPA training code remains in the main repo (`app/hdepic_lora_action_anticipat
 | RU-LSTM stream | ~18M temporal | **6.58** | **19.28** | done |
 | V-JEPA vit_tiny | ~19.9M | 5.91 | 18.77 | best@ep6; not > RU |
 | Qwen2-VL-2B LoRA probe | ~2B | TBD | TBD | submitted |
+| Causal decoder on ViT-L latents (exp A) | enc frozen + ~29M decoder | TBD | TBD | submitted |
 
 ---
 
@@ -85,6 +96,7 @@ V-JEPA training code remains in the main repo (`app/hdepic_lora_action_anticipat
 sbatch baselines/rulstm_hdepic/submit_rulstm_p01_stream.slurm
 sbatch baselines/jepa_tiny_18m/submit_stream_tiny_18m.slurm
 sbatch baselines/qwen_vl_stream/submit_qwen_stream.slurm
+sbatch baselines/jepa_causal_decoder/submit_causal_decoder_stream.slurm
 ```
 
 Absolute paths in `.slurm` / scripts point at NYU Torch scratch; edit for other machines.
