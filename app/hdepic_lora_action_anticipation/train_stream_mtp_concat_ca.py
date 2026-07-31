@@ -279,6 +279,8 @@ class PrunedConcatCAStreamModel(nn.Module):
         prune_mode: str = "encoder_attn",
         recency_strength: float = 1.0,
         prune_chunk_size: int = 256,
+        recent_keep_sec: float = 0.0,
+        tubelet_sec: float = 0.25,
     ):
         super().__init__()
         self.concat_ca = concat_ca
@@ -288,6 +290,8 @@ class PrunedConcatCAStreamModel(nn.Module):
         self.prune_mode = str(prune_mode)
         self.recency_strength = float(recency_strength)
         self.prune_chunk_size = int(prune_chunk_size)
+        self.recent_keep_sec = float(recent_keep_sec)
+        self.tubelet_sec = float(tubelet_sec)
         self.embed_dim = concat_ca.embed_dim
         if self.prune_mode not in ("encoder_attn", "postfuse_recency"):
             raise ValueError(f"Unknown prune_mode={self.prune_mode!r}")
@@ -341,12 +345,37 @@ class PrunedConcatCAStreamModel(nn.Module):
         if N <= self.keep:
             return x_pred
         gp = self.gp if self.pruner is None else self.pruner.gp
-        K = min(self.keep, (N // gp) * gp)
+        K = min(self.keep, max(gp, (self.keep // gp) * gp))
+        K = min(K, (N // gp) * gp)
         if K >= N:
             return x_pred
-        scores = self._score_video_tokens(video)
-        _, idx = scores.topk(K, dim=1)
-        idx = idx.sort(dim=1).values
+
+        # Hard-reserve the most recent R seconds (anticipation-critical), then
+        # fill the remaining budget from older tokens by prune scores.
+        recent_n = 0
+        if self.recent_keep_sec > 0 and self.tubelet_sec > 0:
+            recent_slots = max(1, int(round(self.recent_keep_sec / self.tubelet_sec)))
+            recent_n = min(N, recent_slots * gp)
+            recent_n = (recent_n // gp) * gp
+        recent_n = min(recent_n, K)
+
+        if recent_n >= K:
+            # Entire budget is recent contiguous suffix.
+            idx = torch.arange(N - K, N, device=video.device).unsqueeze(0).expand(B, -1)
+        elif recent_n > 0:
+            older_n = N - recent_n
+            older = video[:, :older_n]
+            need = K - recent_n
+            scores = self._score_video_tokens(older)
+            _, older_idx = scores.topk(need, dim=1)
+            older_idx = older_idx.sort(dim=1).values
+            recent_idx = torch.arange(older_n, N, device=video.device).unsqueeze(0).expand(B, -1)
+            idx = torch.cat([older_idx, recent_idx], dim=1)
+        else:
+            scores = self._score_video_tokens(video)
+            _, idx = scores.topk(K, dim=1)
+            idx = idx.sort(dim=1).values
+
         video = video.gather(1, idx.unsqueeze(-1).expand(-1, -1, D))
         return torch.cat([x_pred[:, :n_aux], video], dim=1) if n_aux > 0 else video
 
@@ -395,6 +424,7 @@ def build_concat_ca_model(
     reset_gate_bias: float | None = None,
     prune_mode: str = "encoder_attn",
     recency_strength: float = 1.0,
+    recent_keep_sec: float = 0.0,
 ):
     base_model = base.build_model(device, max_frames, fps, img_size, checkpoint)
     for p in base_model.encoder.parameters():
@@ -496,11 +526,13 @@ def build_concat_ca_model(
         gp=gp,
         prune_mode=prune_mode,
         recency_strength=recency_strength,
+        recent_keep_sec=recent_keep_sec,
+        tubelet_sec=2.0 / float(max(1, fps)),  # tubelet_size=2 frames
     ).to(device)
     n_pred = sum(p.numel() for p in wrapped.base_model.parameters() if p.requires_grad)
     logger.info(
         "Built concat+CA stream MTP: n_video_spatial=%d n_imu=%d keep=%d adapter_train=%d "
-        "fusion_train=%d pred_lora_train=%d freeze_fusion=%s prune_mode=%s recency=%.2f",
+        "fusion_train=%d pred_lora_train=%d freeze_fusion=%s prune_mode=%s recency=%.2f recent_keep=%.2fs",
         n_v,
         n_i,
         keep_count,
@@ -510,6 +542,7 @@ def build_concat_ca_model(
         freeze_fusion,
         prune_mode,
         recency_strength,
+        recent_keep_sec,
     )
     return model
 
@@ -740,6 +773,12 @@ def main():
         default=1.0,
         help="For prune-mode=postfuse_recency: scores *= (1 + strength * recency).",
     )
+    ap.add_argument(
+        "--recent-keep-sec",
+        type=float,
+        default=0.0,
+        help="Hard-reserve the last R seconds of video tokens before scored prune of older context.",
+    )
     ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument(
         "--batch-size-by-frames",
@@ -883,6 +922,7 @@ def main():
         reset_gate_bias=None,  # keep learned gate from 43.92%
         prune_mode=str(args.prune_mode),
         recency_strength=float(args.recency_strength),
+        recent_keep_sec=float(args.recent_keep_sec),
     )
     base_enc = model.concat_ca.base_model
     classifier = AttentiveClassifier(

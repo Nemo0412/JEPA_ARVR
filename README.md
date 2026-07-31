@@ -8,6 +8,12 @@ Upstream backbone lives in the `vjepa2` submodule / external V-JEPA2 tree. Proje
 eval_name: app.hdepic_lora_action_anticipation
 ```
 
+### Streaming baselines (`baselines/`, branch `baseline`)
+
+Same HD-EPIC P01 **stream** protocol (+2/+4/+6s) comparisons live under [`baselines/`](baselines/)
+(RU-LSTM, vit_tiny≈18M, Qwen2-VL-2B, VLESA). Progress snapshot and numbers:
+[`baselines/README.md`](baselines/README.md).
+
 ---
 
 ## Best Val Action Top-5 (as of 2026-07-24)
@@ -84,41 +90,31 @@ Val Top-5:
 | **v2** | 43.17 | 43.24 | 43.84 | **43.92** | 43.32 | 43.23 | 43.76 | 43.54 | 43.47 |
 | **v2-jitter** | 42.64 | **43.39** | 42.94 | 43.24 | — | — | — | — | — |
 
-#### MTP (Multi-Time Prediction) — status 2026-07-31
+#### MTP (Multi-Time Prediction) — status 2026-08-01
 
-Separate from single-horizon concat+CA @1s. Stream protocol: temporal **half-split** per video; context grows **4→6→8→10s** then slides; tick every 2s; predict **+2/+4/+6s** with communicating MLPs; prune `keep≤4096` when tokens overflow (6s+ contexts). Survives util-kill via `#SBATCH --time=01:50:00` + USR1/TERM auto-`sbatch` + mid-step `latest.pt` (`--save-every 200`).
+Separate from single-horizon concat+CA @1s. Stream protocol: temporal **half-split** per video; context grows **4→6→8→10s** then slides; tick every 2s; predict **+2/+4/+6s** with communicating MLPs; prune `keep≤4096` on 6s+ contexts.
 
-| Run | Backbone / warm-start | Best val action Top-5 (@2s / @4s / @6s) | Status |
-|---|---|---|---|
-| **Streaming MTP video-only** | Video LoRA from video joint v2 | **ep2: 25.88 / 22.31 / 19.77** | **Done** (8/8 ep). Peak @ep2 |
-| **concat+CA stream (orig)** | CA v2 43.92%; train fusion+heads | **ep2: 23.59 / 20.88 / 18.52** | Done (user-stopped). Overfit (train@2s~93%) |
-| **v2-fast** | Freeze fusion+adapter; CA pred LoRA; tick cache | **ep1: 24.15 / 21.19 / 19.14** | Done (early-stop). Faster; still −1.73pp vs video |
-| **v3 hybrid** | Freeze fusion; **video-stream** pred LoRA + MTP heads warm | **ep2: 25.08 / 21.53 / 18.86** | **Best CA so far.** −0.80pp vs video-only |
-| **v4 soft-fusion** | Continue v3; light-unfreeze fusion @0.1× lr | ep0: 23.03 / … (declining) | Harmful — fusion unfreeze hurts; do not continue |
-| **v5 P0 prune A/B** | Init v3 best; freeze fusion; **`--prune-mode postfuse_recency`** | TBD | **Submitted** — isolate prune fix |
+| Run | Recipe | Best @2s/@4s/@6s | vs video 25.88% | Status |
+|---|---|---|---|---|
+| **Video-only stream** | video joint LoRA | **25.88 / 22.31 / 19.77** | — | Done |
+| CA orig | train fusion | 23.59 / 20.88 / 18.52 | −2.29pp | Done (overfit) |
+| v2-fast | freeze fusion; CA pred | 24.15 / 21.19 / 19.14 | −1.73pp | Done |
+| **v3 hybrid** | freeze fusion; **video** pred+MTP warm | **25.08 / 21.53 / 18.86** | **−0.80pp** | **Best CA so far** |
+| v4 soft-fusion | unfreeze fusion @0.1× | ~23.03 | worse | Aborted |
+| v5 P0 prune | init v3 + switch to postfuse prune | 23.87 peak | −2.01pp | **Failed** (prune mid-switch mismatch) |
+| **v6 fresh prune** | v3 recipe **from scratch** + postfuse + **recent-keep 2s** | TBD | TBD | **Submitted** |
+| v3 val prune probe | frozen v3 best, inference-only prune A/B | TBD | TBD | **Submitted** |
 
-**Hypothesis (why CA should beat video but hasn't on stream):** 1s concat+CA is P01 leader (43.92% > video 40.44%). Stream fails mainly from **protocol mismatch + prune misalignment**, not from a bad arch: encoder last-attn importance (pre-fuse) is used to drop **post-fuse** video tokens on 10s (~60% dropped), which can erase IMU/gaze-conditioned tokens. Soft-unfreezing fusion (v4) overfit; freezing fusion + video stream heads (v3) almost closed the gap.
-
-**P0 prune fix (v5):** score fused video tokens by post-fusion self-attn receive, reweight by temporal recency (`scores *= 1 + λ·recency`), keep IMU `keep_aux` prefix. A/B vs v3 with same weights/recipe.
+**Takeaway:** Architecture still theoretically ≥ video (1s: 43.92% > 40.44%). Stream gap is transfer + prune. Freezing fusion + video stream heads (v3) nearly closed it; unfreezing fusion and mid-run prune swaps hurt. Next: train with the new prune **from epoch 0** (v6), and val-only probes to isolate prune at inference.
 
 ```text
-# Video-only stream MTP — 25.88%@2s
-scripts/submit_p01_stream_mtp_2_4_6_ll5914.slurm
-→ /scratch/ll5914/experiments/p01_stream_mtp_2_4_6/
-
-# concat+CA ladders
-scripts/submit_p01_stream_mtp_concat_ca_2_4_6_ll5914.slurm          # orig
-scripts/submit_p01_stream_mtp_concat_ca_v2_fast_ll5914.slurm         # 24.15%
-scripts/submit_p01_stream_mtp_concat_ca_v3_hyb_ll5914.slurm          # 25.08% (best CA)
-scripts/submit_p01_stream_mtp_concat_ca_v4_softfuse_ll5914.slurm     # failed
-scripts/submit_p01_stream_mtp_concat_ca_v5_prune_p0_ll5914.slurm     # P0 prune A/B (running)
-→ /scratch/ll5914/experiments/p01_stream_mtp_concat_ca_v5_prune_p0_2_4_6/
-
-# Tick cache (shared)
-/scratch/ll5914/datasets/HD-EPIC/caches/stream_mtp_concat_ca_ticks_256/
+scripts/submit_p01_stream_mtp_2_4_6_ll5914.slurm              # video 25.88%
+scripts/submit_p01_stream_mtp_concat_ca_v3_hyb_ll5914.slurm   # CA best 25.08%
+scripts/submit_p01_stream_mtp_concat_ca_v6_fresh_prune_ll5914.slurm
+scripts/submit_p01_stream_mtp_concat_ca_v3_val_prune_probe_ll5914.slurm
+# PRUNE_MODE=encoder_attn|postfuse_recency sbatch ...
+→ /scratch/ll5914/experiments/p01_stream_mtp_concat_ca_v6_fresh_prune_2_4_6/
 ```
-
-Speed-ups already in use for CA stream: tick disk cache, `num_workers=8`, adaptive bs by `n_model_frames`, freeze fusion for anti-overfit.
 
 ```text
 # Index:
