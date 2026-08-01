@@ -263,11 +263,55 @@ def topk_acc(logits: torch.Tensor, labels: torch.Tensor, k: int) -> float:
     return float((pred == labels.unsqueeze(-1)).any(dim=-1).float().mean().item())
 
 
+def trainable_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+    """Only LoRA + heads (~9M) — full 2B dump is slow and trips NFS EBUSY on replace."""
+    return {n: p.detach().cpu() for n, p in model.named_parameters() if p.requires_grad}
+
+
+def load_trainable_state(model: nn.Module, state: dict) -> None:
+    """Load full state_dict or trainable-only parameter dict (strict=False)."""
+    if not state:
+        return
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    logger.info(
+        "Loaded checkpoint keys=%d missing=%d unexpected=%d",
+        len(state),
+        len(missing),
+        len(unexpected),
+    )
+
+
 def save_ckpt(path: Path, **payload):
+    """Atomic save with retries — NFS often returns EBUSY on os.replace of large files."""
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.parent / f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
     torch.save(payload, tmp)
-    os.replace(tmp, path)
+    last_err: Exception | None = None
+    for attempt in range(8):
+        try:
+            os.replace(tmp, path)
+            return
+        except OSError as exc:  # noqa: BLE001
+            last_err = exc
+            # errno 16 = EBUSY on NFS when previous handle still open
+            time.sleep(0.4 * (attempt + 1))
+    # Last resort: copy into place then unlink tmp
+    try:
+        import shutil
+
+        bak = path.with_suffix(path.suffix + ".new")
+        shutil.copy2(tmp, bak)
+        os.replace(bak, path)
+        tmp.unlink(missing_ok=True)
+        return
+    except Exception as exc:  # noqa: BLE001
+        last_err = exc
+    try:
+        tmp.unlink(missing_ok=True)
+    except OSError:
+        pass
+    raise RuntimeError(f"Failed to save checkpoint to {path}: {last_err}")
 
 
 def main():
@@ -311,13 +355,6 @@ def main():
         return
 
     stop_flag = {"stop": False}
-
-    def _on_signal(signum, _frame):
-        logger.warning("Caught signal %s — stop after current step", signum)
-        stop_flag["stop"] = True
-
-    signal.signal(signal.SIGTERM, _on_signal)
-    signal.signal(signal.SIGINT, _on_signal)
 
     verb_map, noun_map, action_map = load_action_maps(args.train_csv)
     logger.info("vocab v=%d n=%d a=%d", len(verb_map), len(noun_map), len(action_map))
@@ -372,7 +409,7 @@ def main():
     hidden = int(getattr(backbone.config, "hidden_size", None) or backbone.config.text_config.hidden_size)
     model = QwenStreamProbe(
         backbone, hidden, horizons, len(verb_map), len(noun_map), len(action_map)
-    )
+    ).to(device)
     for p in model.heads.parameters():
         p.requires_grad = True
 
@@ -423,9 +460,10 @@ def main():
     start_epoch = 0
     start_step = 0
     resume_phase = "train"
+    resume_metric_state = None
     if latest.is_file():
         ck = torch.load(latest, map_location="cpu", weights_only=False)
-        model.load_state_dict(ck["model"], strict=False)
+        load_trainable_state(model, ck.get("model") or {})
         if ck.get("optimizer") is not None:
             try:
                 optimizer.load_state_dict(ck["optimizer"])
@@ -436,31 +474,105 @@ def main():
         start_epoch = int(ck.get("epoch", 0))
         start_step = int(ck.get("step", 0))
         resume_phase = str(ck.get("phase", "train"))
+        resume_metric_state = ck.get("metric_state")
+        # Stuck guard: phase=val with no mid-val progress and no finished epoch in
+        # history used to skip train forever while val never checkpointed.
+        # Weights after a completed train are still valid — keep phase=val, but
+        # ensure step advances via periodic val saves below.
         logger.info(
-            "Resumed epoch=%d step=%d phase=%s best=%.4f",
+            "Resumed epoch=%d step=%d phase=%s best=%.4f history=%d",
             start_epoch,
             start_step,
             resume_phase,
             best,
+            len(history),
         )
 
-    def run_epoch(loader, sampler, train: bool, epoch: int, start_step: int = 0):
+    _ckpt_ctx = {
+        "epoch": start_epoch,
+        "step": start_step,
+        "phase": resume_phase,
+        "best": best,
+        "history": history,
+        "metric_state": resume_metric_state,
+    }
+
+    def _write_latest(*, epoch: int, step: int, phase: str, metric_state=None):
+        _ckpt_ctx.update(
+            epoch=int(epoch),
+            step=int(step),
+            phase=str(phase),
+            best=float(best),
+            history=history,
+            metric_state=metric_state,
+        )
+        save_ckpt(
+            latest,
+            epoch=int(epoch),
+            step=int(step),
+            phase=str(phase),
+            model=trainable_state_dict(model),
+            optimizer=optimizer.state_dict(),
+            best=float(best),
+            history=history,
+            metric_state=metric_state,
+            trainable_only=True,
+        )
+
+    def _on_signal(signum, _frame):
+        logger.warning("Caught signal %s — stop after current step", signum)
+        stop_flag["stop"] = True
+        try:
+            _write_latest(
+                epoch=int(_ckpt_ctx["epoch"]),
+                step=max(0, int(_ckpt_ctx["step"])),
+                phase=str(_ckpt_ctx["phase"]),
+                metric_state=_ckpt_ctx.get("metric_state"),
+            )
+            logger.info("Emergency checkpoint @ phase=%s step=%s", _ckpt_ctx["phase"], _ckpt_ctx["step"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Emergency save failed: %s", exc)
+
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+    if hasattr(signal, "SIGUSR1"):
+        signal.signal(signal.SIGUSR1, _on_signal)
+
+    def run_epoch(
+        loader,
+        sampler,
+        train: bool,
+        epoch: int,
+        start_step: int = 0,
+        metric_state=None,
+    ):
         model.train(train)
         sampler.set_epoch(epoch)
         sampler.set_start_batch(start_step)
         totals, counts = defaultdict(float), defaultdict(int)
         loss_meter = 0.0
         n_steps = 0
+        if metric_state:
+            for k, v in (metric_state.get("totals") or {}).items():
+                totals[k] = float(v)
+            for k, v in (metric_state.get("counts") or {}).items():
+                counts[k] = int(v)
+            loss_meter = float(metric_state.get("loss_meter", 0.0))
+            n_steps = int(metric_state.get("n_steps", 0))
         t0 = time.time()
         optimizer.zero_grad(set_to_none=True)
         last_it = start_step - 1
         stopped = False
+        phase = "train" if train else "val"
+        _ckpt_ctx["epoch"] = epoch
+        _ckpt_ctx["phase"] = phase
         for local_it, batch in enumerate(loader):
             it = start_step + local_it
             if stop_flag["stop"]:
                 stopped = True
                 break
             last_it = it
+            _ckpt_ctx["step"] = it + 1
             inputs = build_qwen_inputs(processor, batch["frames"], args.frame_size)
             inputs = {k: v.to(device) if torch.is_tensor(v) else v for k, v in inputs.items()}
             mtp_verbs = batch["mtp_verbs"].to(device)
@@ -531,11 +643,18 @@ def main():
 
             loss_meter += float(head_loss.detach().item()) if torch.isfinite(head_loss.detach()) else 0.0
             n_steps += 1
+            ms = {
+                "totals": dict(totals),
+                "counts": dict(counts),
+                "loss_meter": loss_meter,
+                "n_steps": n_steps,
+            }
+            _ckpt_ctx["metric_state"] = ms
             if it % args.log_every == 0:
                 p5 = totals["primary_action_top5"] / max(1, counts["primary_action_top5"])
                 logger.info(
                     "%s itr=%d/%d loss=%.4f primary@%gs top5≈%.1f ctx=%.0fs",
-                    "train" if train else "val",
+                    phase,
                     it,
                     len(sampler),
                     loss_meter / max(1, n_steps),
@@ -543,81 +662,94 @@ def main():
                     100.0 * p5,
                     float(batch["context_sec"][0]),
                 )
-            if train and args.save_every > 0 and it > 0 and it % args.save_every == 0:
-                save_ckpt(
-                    latest,
-                    epoch=epoch,
-                    step=it + 1,
-                    phase="train",
-                    model=model.state_dict(),
-                    optimizer=optimizer.state_dict(),
-                    best=best,
-                    history=history,
-                )
-                logger.info("Periodic checkpoint at train step=%d", it)
+            # Periodic save for BOTH train and val (val used to never checkpoint → stuck loop)
+            if args.save_every > 0 and it > 0 and (it + 1) % args.save_every == 0:
+                try:
+                    _write_latest(epoch=epoch, step=it + 1, phase=phase, metric_state=ms)
+                    logger.info("Periodic checkpoint at %s step=%d", phase, it + 1)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Periodic save failed (continuing): %s", exc)
 
         metrics = {k: totals[k] / max(1, counts[k]) for k in totals}
         metrics["loss"] = loss_meter / max(1, n_steps)
         metrics["seconds"] = time.time() - t0
         metrics["last_step"] = int(last_it + 1)
         metrics["stopped_early"] = stopped
+        metrics["_metric_state"] = {
+            "totals": dict(totals),
+            "counts": dict(counts),
+            "loss_meter": loss_meter,
+            "n_steps": n_steps,
+        }
         return metrics
 
     if args.val_only:
         va = run_epoch(val_loader, val_sampler, train=False, epoch=0, start_step=0)
-        (args.out_dir / "val_only_metrics.json").write_text(json.dumps(va, indent=2))
-        logger.info("VAL_ONLY %s", {k: round(100 * v, 2) if isinstance(v, float) and v <= 1.5 else v for k, v in va.items() if "top" in k or k == "loss"})
+        pub = {k: v for k, v in va.items() if not str(k).startswith("_")}
+        (args.out_dir / "val_only_metrics.json").write_text(json.dumps(pub, indent=2))
+        logger.info(
+            "VAL_ONLY %s",
+            {
+                k: round(100 * v, 2) if isinstance(v, float) and v <= 1.5 else v
+                for k, v in pub.items()
+                if "top" in k or k == "loss"
+            },
+        )
         return
 
     for epoch in range(start_epoch, args.epochs):
         skip_train = epoch == start_epoch and resume_phase == "val"
         train_start = start_step if (epoch == start_epoch and resume_phase == "train") else 0
         val_start = start_step if (epoch == start_epoch and resume_phase == "val") else 0
+        epoch_metric_state = resume_metric_state if epoch == start_epoch else None
 
         if not skip_train:
-            tr = run_epoch(train_loader, train_sampler, train=True, epoch=epoch, start_step=train_start)
+            tr = run_epoch(
+                train_loader,
+                train_sampler,
+                train=True,
+                epoch=epoch,
+                start_step=train_start,
+                metric_state=(epoch_metric_state if resume_phase == "train" else None),
+            )
             train_sampler.set_start_batch(0)
             if tr.get("stopped_early"):
-                save_ckpt(
-                    latest,
-                    epoch=epoch,
-                    step=int(tr["last_step"]),
-                    phase="train",
-                    model=model.state_dict(),
-                    optimizer=optimizer.state_dict(),
-                    best=best,
-                    history=history,
-                )
-                logger.warning("Stopped early during train epoch=%d", epoch)
+                try:
+                    _write_latest(
+                        epoch=epoch,
+                        step=int(tr["last_step"]),
+                        phase="train",
+                        metric_state=tr.get("_metric_state"),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Stop-save train failed: %s", exc)
+                logger.warning("Stopped early during train epoch=%d step=%d", epoch, tr["last_step"])
                 return
-            save_ckpt(
-                latest,
-                epoch=epoch,
-                step=0,
-                phase="val",
-                model=model.state_dict(),
-                optimizer=optimizer.state_dict(),
-                best=best,
-                history=history,
-            )
+            _write_latest(epoch=epoch, step=0, phase="val", metric_state=None)
         else:
             tr = {"loss": float("nan"), "stopped_early": False, "last_step": 0}
             logger.info("Skipping train for epoch %d (resume_phase=val step=%d)", epoch, val_start)
 
-        va = run_epoch(val_loader, val_sampler, train=False, epoch=epoch, start_step=val_start)
+        va = run_epoch(
+            val_loader,
+            val_sampler,
+            train=False,
+            epoch=epoch,
+            start_step=val_start,
+            metric_state=(epoch_metric_state if skip_train else None),
+        )
         val_sampler.set_start_batch(0)
         if va.get("stopped_early"):
-            save_ckpt(
-                latest,
-                epoch=epoch,
-                step=int(va["last_step"]),
-                phase="val",
-                model=model.state_dict(),
-                optimizer=optimizer.state_dict(),
-                best=best,
-                history=history,
-            )
-            logger.warning("Stopped early during val epoch=%d", epoch)
+            try:
+                _write_latest(
+                    epoch=epoch,
+                    step=int(va["last_step"]),
+                    phase="val",
+                    metric_state=va.get("_metric_state"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Stop-save val failed: %s", exc)
+            logger.warning("Stopped early during val epoch=%d step=%d", epoch, va["last_step"])
             return
 
         primary = float(va.get("primary_action_top5", 0.0))
@@ -629,17 +761,10 @@ def main():
             100.0 * float(va.get("primary_action_top1", 0.0)),
             {k: round(100.0 * va[k], 2) for k in sorted(va) if k.startswith("action_top")},
         )
-        history.append({"epoch": epoch, "train": {k: v for k, v in tr.items()}, "val": {k: v for k, v in va.items()}})
-        save_ckpt(
-            latest,
-            epoch=epoch + 1,
-            step=0,
-            phase="train",
-            model=model.state_dict(),
-            optimizer=optimizer.state_dict(),
-            best=best,
-            history=history,
-        )
+        tr_pub = {k: v for k, v in tr.items() if not str(k).startswith("_")}
+        va_pub = {k: v for k, v in va.items() if not str(k).startswith("_")}
+        history.append({"epoch": epoch, "train": tr_pub, "val": va_pub})
+        _write_latest(epoch=epoch + 1, step=0, phase="train", metric_state=None)
         if primary > best:
             best = primary
             save_ckpt(
@@ -647,15 +772,17 @@ def main():
                 epoch=epoch + 1,
                 step=0,
                 phase="train",
-                model=model.state_dict(),
+                model=trainable_state_dict(model),
                 optimizer=optimizer.state_dict(),
                 best=best,
                 history=history,
+                trainable_only=True,
             )
             logger.info("New best primary_action_top5=%.4f", best)
         (args.out_dir / "history.json").write_text(json.dumps(history, indent=2))
         start_step = 0
         resume_phase = "train"
+        resume_metric_state = None
 
     done_flag.write_text(f"finished epochs={args.epochs} best={best}\n")
     logger.info("Done. best primary_action_top5=%.4f", best)

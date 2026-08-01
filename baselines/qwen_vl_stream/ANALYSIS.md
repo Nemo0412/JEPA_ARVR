@@ -19,3 +19,11 @@ Still ~5× V-JEPA vanilla (~400M); no official ~400M Qwen-VL exists.
 
 Qwen remains preferable for open-vocab language explanations; not for this
 closed-set streaming metric.
+
+## Ops note (2026-08-01)
+
+Training was stuck: after epoch-0 train, `latest.pt` stayed at `phase=val
+step=0` because (1) val had no periodic checkpoints and (2) full 4.5GB
+`os.replace` hit NFS `EBUSY`. Fix in `train_stream_qwen_probe.py`: save
+**trainable-only** (~9M), periodic saves on **train and val**, metric_state
+resume, retrying atomic save. Job re-queued from existing epoch-0 weights.
