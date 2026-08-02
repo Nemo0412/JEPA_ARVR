@@ -145,92 +145,72 @@ flowchart TB
 
 ---
 
-## Progress (2026-08-02)
+## Results (updated 2026-08-02)
 
-### Status snapshot (cluster)
+Primary metric: **val action Top-5 @ +2s** (unless noted). Paths under `/scratch/ll5914/experiments/`.
 
-| Job / arm | State | Notes |
-|-----------|-------|-------|
-| V-JEPA vanilla | **done** | best action@2s Top-5 **25.88%** |
-| Exp A causal decoder | queued (resume) | 4 epochs done; best **25.67%** @ep2; ep3 24.40% |
-| Qwen2-VL-2B | queued (resume) | 3 epochs; best **20.95%** @ep0; ep2 dropped to 17.95% |
-| Qwen-style on ViT-L | **RUNNING** | epoch-0 train ~late; decoder ~22.4M; no full val yet |
-| Scratch predictor | queued | param_report: pred ~22.1M / train ~95.5M |
-| Encoder-heavy | queued | last-2 blocks ~25.2M / train ~98.6M |
-| Decoder-heavy | queued | decoder ~29.4M / train ~102.9M |
+### Leaderboard (action @ +2s Top-5)
 
-### 1) V-JEPA video-only vanilla (reference)
+| Rank | Method | Params (approx) | Top-5 @2s | Top-1 @2s | Best epoch | Status |
+|-----:|--------|-----------------|----------:|----------:|-----------:|--------|
+| 1 | **V-JEPA vanilla** (ViT-L frozen + pred LoRA) | 401M tot / 89M train | **25.88** | — | 2 | **done** |
+| 2 | **Exp A** causal cross-attn decoder | enc frozen + ~29M dec | **25.67** | — | 2 | best@ep2; later ↓ |
+| 3 | Scratch JEPA predictor (re-init) | enc frozen + ~22M pred | **24.15** | — | 0 | ep0 only so far |
+| 4 | Encoder-heavy (last-2 ViT blocks) | ~25M enc + MTP | **21.57** | — | 0 | ep0 only so far |
+| 5 | **Qwen2-VL-2B** LoRA probe | ~2.2B / ~9M train | **20.95** | 7.22 | 0 | best@ep0; then ↓ |
+| 6 | RU-LSTM stream | ~18M temporal | **19.28** | 6.58 | — | **done** |
+| 7 | V-JEPA vit_tiny (from scratch) | ~19.9M | **18.77** | 5.91 | 6 | best@ep6 |
+| — | Qwen-style decoder-only on ViT-L | enc frozen + ~22M | — | — | — | train running; no val yet |
+| — | Decoder-heavy (no enc LoRA) | ~29M decoder | — | — | — | no completed val yet |
 
-- Config: **ViT-L frozen** + stream MTP; **~401M total / ~89M trainable**
-- Out: `/scratch/ll5914/experiments/p01_stream_mtp_2_4_6/`
-- **Best (epoch 2): action@2s Top-5 ≈ 25.88%** (@4s 22.31 · @6s 19.77)
+**Takeaway so far:** On this closed-set stream protocol, **JEPA-style anticipative / cross-attn decoder on ViT-L latents (~26%) ≫ full Qwen2-VL-2B probe (~21%)**, even though Qwen is ~5× larger in total params. Capacity-matched tiny JEPA still sits near RU-LSTM (~19%).
 
-### 2) RU-LSTM streaming (original-size temporal ~18M)
+### Per-arm detail
 
-- Out: `/scratch/ll5914/experiments/rulstm_hdepic_p01_stream/`
-- Val **action@2s: 6.58 / 19.28** (Top-1 / Top-5)
-- @4s: 5.34 / 16.40 · @6s: 4.69 / 15.04
+#### 1) V-JEPA video-only vanilla (reference)
+- Out: `p01_stream_mtp_2_4_6/`
+- Best **ep2**: action@2s Top-5 **25.88%** · @4s 22.31 · @6s 19.77
+- Later epochs drift down (ep3–5 ~24–25%)
 
-### 3) V-JEPA `vit_tiny` ≈18–20M (from scratch, video-only)
+#### 2) Exp A — causal cross-attn decoder on JEPA latents
+- Code: [`jepa_causal_decoder/`](jepa_causal_decoder/) · Out: `p01_stream_causal_decoder_2_4_6/`
+- Val @2s Top-5 by epoch: 23.56 → 24.80 → **25.67** → 24.40 → 23.53
+- **Best 25.67% @ep2** (~0.2 pt below vanilla)
 
-- Params: encoder ~5.6M + predictor 320×10 ~12.5M + heads ~1.9M → **~19.9M**
-- Out: `/scratch/ll5914/experiments/p01_stream_mtp_tiny18m_2_4_6/`
-- **Reliable best (epoch 6, full val): action@2s 5.91 / 18.77**
-- vs RU-LSTM @2s: **does not beat** main action (−0.67 / −0.51 pt)
+#### 3) Scratch JEPA predictor (control)
+- Code: [`jepa_scratch_predictor/`](jepa_scratch_predictor/) · Out: `p01_stream_scratch_predictor_2_4_6/`
+- **ep0**: action@2s Top-5 **24.15%** (@4s 21.47 · @6s 19.11) — strong without predictor pretrain
 
-### 4) Qwen-VL decoder baseline (full Qwen2-VL-2B)
-
-- Official smallest Qwen-VL ~2B; LoRA probe on same stream protocol
-- Out: `/scratch/ll5914/experiments/p01_stream_qwen2vl2b_2_4_6/`
-- Epochs 0/1/2 action@2s Top-5: **20.95 / 20.80 / 17.95** (best = ep0; later overfit/drop)
-- Still **~5×** JEPA total params — not param-matched
-
-### 5) Exp A — causal decoder on JEPA latents
-
-- Code: [`jepa_causal_decoder/`](jepa_causal_decoder/) · decoder ~29.4M from scratch
-- Out: `/scratch/ll5914/experiments/p01_stream_causal_decoder_2_4_6/`
-- Val action@2s Top-5 by epoch: 23.56 → 24.80 → **25.67** → 24.40
-- **Best 25.67% @ep2** — within ~0.2 pt of JEPA vanilla (25.88%)
-
-### 5b) From-scratch predictor (control for Exp A)
-
-- Code: [`jepa_scratch_predictor/`](jepa_scratch_predictor/)
-- Out: `/scratch/ll5914/experiments/p01_stream_scratch_predictor_2_4_6/`
-- Queued; predictor ~22.1M fully trainable (no pred pretrain/LoRA)
-
-### 5c) Encoder-heavy vs decoder-heavy allocation
-
+#### 4) Encoder-heavy vs decoder-heavy
 - Code: [`param_allocation/`](param_allocation/)
-- Encoder-heavy: last-2 ViT-L blocks ~25.2M · Decoder-heavy: causal decoder ~29.4M (no enc LoRA)
-- Both queued (have `param_report.json`, no completed val epoch yet)
+- **Encoder-heavy** (`p01_stream_encoder_heavy_2_4_6/`): **ep0 = 21.57%** @2s Top-5
+- **Decoder-heavy** (`p01_stream_decoder_heavy_2_4_6/`): training; no `history.json` val yet
 
-### 5d) Qwen-style decoder on ViT-L (KV-cache AR val)
+#### 5) Qwen2-VL-2B LoRA probe (full VLM)
+- Code: [`qwen_vl_stream/`](qwen_vl_stream/) · Out: `p01_stream_qwen2vl2b_2_4_6/`
+- Params: backbone ~2209M (vision→merger→embed→LLM); trainable ~8.8M
+- Val action@2s Top-5: **20.95 (ep0) / 20.80 (ep1) / 17.95 (ep2) / 18.66 (ep3)**
+- Best **20.95%**; clearly below JEPA vanilla / Exp A; slightly above RU-LSTM
 
-- Code: [`jepa_qwen_style_decoder/`](jepa_qwen_style_decoder/)
-- Out: `/scratch/ll5914/experiments/p01_stream_qwen_style_decoder_2_4_6/`
-- **Running** epoch-0 train (teacher forcing); val will use AR + KV cache
-- Decoder ~22.4M · 16 future slots
+#### 6) Qwen-style decoder-only on ViT-L (KV-cache AR val)
+- Code: [`jepa_qwen_style_decoder/`](jepa_qwen_style_decoder/) · Out: `p01_stream_qwen_style_decoder_2_4_6/`
+- Has checkpoints; **no completed val epoch in `history.json` yet**
 
-### 6) Other
+#### 7) RU-LSTM / vit_tiny (capacity baselines)
+- RU-LSTM (`rulstm_hdepic_p01_stream/`): action@2s **6.58 / 19.28** (t1/t5)
+- vit_tiny (`p01_stream_mtp_tiny18m_2_4_6/`): best reliable **5.91 / 18.77** @ep6 (does not beat RU on action@2s)
 
-- **VLESA** latency harness under `vlesa_latency/`
-- Stronger JEPA (concat-CA / MTP variants) tracked in main `JEPA_ARVR` jobs
+### Horizon table (best checkpoint each, action Top-5 %)
 
-### Snapshot table (action @ +2s Top-5)
-
-| Method | Params (approx) | Top-5 @2s | Status |
-|--------|-----------------|----------:|--------|
-| V-JEPA vanilla (ViT-L frozen) | 401M tot / 89M train | **25.88** | **done** |
-| Exp A causal decoder | enc frozen + ~29M | **25.67** | best@ep2; resume queued |
-| Qwen2-VL-2B LoRA probe | ~2.2B / ~9M train | **20.95** | best@ep0; ep2↓; queued |
-| RU-LSTM stream | ~18M | 19.28 | done |
-| V-JEPA vit_tiny | ~19.9M | 18.77 | best@ep6 |
-| Qwen-style on ViT-L | enc frozen + ~22M | — | **running** (ep0 train) |
-| Scratch JEPA predictor | enc frozen + ~22M pred | — | queued |
-| Encoder-heavy (last-2) | ~25M enc | — | queued |
-| Decoder-heavy (no enc LoRA) | ~29M decoder | — | queued |
-
-**Early read:** Exp A ≈ JEPA vanilla ≫ full Qwen2-VL-2B on this protocol. Scratch / allocation / Qwen-style still needed to separate pretrain vs architecture vs param placement.
+| Method | @2s | @4s | @6s |
+|--------|----:|----:|----:|
+| V-JEPA vanilla | **25.88** | 22.31 | 19.77 |
+| Exp A causal decoder | **25.67** | 22.31 | 19.55 |
+| Scratch predictor (ep0) | 24.15 | 21.47 | 19.11 |
+| Encoder-heavy (ep0) | 21.57 | 19.88 | 18.26 |
+| Qwen2-VL-2B (ep0) | 20.95 | 18.61 | 15.91 |
+| RU-LSTM | 19.28 | 16.40 | 15.04 |
+| vit_tiny (ep6) | 18.77 | 17.07 | 14.75 |
 
 ---
 

@@ -143,8 +143,14 @@ if [[ -f "${DONE_FLAG}" ]]; then
   echo "Qwen2-VL-2B stream probe complete: $(date)"
   exit 0
 fi
-request_resubmit
-if [[ "${_RESUBMITTED}" == "1" ]]; then
-  exit 0
+# Only auto-resubmit after clean signal/time-limit path (train_rc==0 or already flagged).
+# Do NOT resubmit on hard crashes — that burns the queue in a failure loop.
+if [[ "${train_rc}" -eq 0 || "${_RESUBMITTED}" == "1" ]]; then
+  request_resubmit
+  if [[ "${_RESUBMITTED}" == "1" ]]; then
+    exit 0
+  fi
+else
+  echo "Training crashed (rc=${train_rc}); NOT auto-resubmitting." >&2
 fi
 exit ${train_rc}

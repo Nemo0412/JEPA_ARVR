@@ -34,9 +34,14 @@ ANN_DIR="/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/stream_half_s
 OUT_DIR="/scratch/ll5914/experiments/p01_stream_mtp_tiny18m_2_4_6"
 CKPT="${OUT_DIR}/vitti_pred320x10_init.pt"
 DONE_FLAG="${OUT_DIR}/TRAINING_DONE"
+STOP_FLAG="${OUT_DIR}/STOP_REQUESTED"
 mkdir -p "${OUT_DIR}"
 
 VAL_ONLY="${VAL_ONLY:-0}"
+if [[ -f "${STOP_FLAG}" ]]; then
+  echo "STOP_REQUESTED present (${STOP_FLAG}); exiting without train/resubmit."
+  exit 0
+fi
 if [[ "${VAL_ONLY}" != "1" && -f "${DONE_FLAG}" ]]; then
   echo "Already done (${DONE_FLAG}); exiting."
   exit 0
@@ -48,7 +53,7 @@ _RESUBMITTED=0
 TRAIN_PID=""
 
 request_resubmit() {
-  if [[ "${VAL_ONLY}" == "1" || -f "${DONE_FLAG}" || "${_RESUBMITTED}" == "1" ]]; then
+  if [[ "${VAL_ONLY}" == "1" || -f "${DONE_FLAG}" || -f "${STOP_FLAG}" || "${_RESUBMITTED}" == "1" ]]; then
     return 0
   fi
   _RESUBMITTED=1
