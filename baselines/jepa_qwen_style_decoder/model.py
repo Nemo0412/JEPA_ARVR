@@ -225,18 +225,31 @@ class QwenStyleARDecoder(nn.Module):
 
 
 class QwenStyleStreamModel(nn.Module):
-    def __init__(self, base, decoder: QwenStyleARDecoder, pruner=None, prune_threshold: int = 4096, decode_mode: str = "teacher"):
+    def __init__(
+        self,
+        base,
+        decoder: QwenStyleARDecoder,
+        pruner=None,
+        prune_threshold: int = 4096,
+        decode_mode: str = "teacher",
+        train_encoder: bool = False,
+    ):
         super().__init__()
         self.base = base
         self.decoder = decoder
         self.pruner = pruner
         self.prune_threshold = int(prune_threshold)
         self.decode_mode = str(decode_mode)
+        self.train_encoder = bool(train_encoder)
         self.last_aux = None
 
     def forward(self, x, anticipation_times):
-        with torch.no_grad():
+        # Frozen encoder: skip autograd graph. LoRA / block FT needs grads.
+        if self.train_encoder and self.training:
             x_full = self.base.encoder(x)
+        else:
+            with torch.no_grad():
+                x_full = self.base.encoder(x)
         B, N, D_full = x_full.size()
         embed_dim = self.base.encoder.embed_dim
         if self.pruner is not None and N > self.prune_threshold:

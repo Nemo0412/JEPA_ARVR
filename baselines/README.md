@@ -42,7 +42,7 @@ Long context is handled by **sliding window + token prune / frame subsample**, n
 | 1 | **V-JEPA vanilla** | Frozen ViT-L + frozen enc LoRA | Pretrained **`vit_predictor`** (mask tokens, joint SA) + pred LoRA | **TokenPruner keep≤4096** | No | pred LoRA + MTP | `p01_stream_mtp_2_4_6` |
 | 2 | **Exp A causal decoder** | Same as (1) | **Cross-attn decoder**: causal queries ⊕ memory (parallel TF) | Same prune ≤4096 | No | ~29M decoder + MTP | `p01_stream_causal_decoder_2_4_6` |
 | 3 | **Scratch predictor** | Same as (1) | Same `vit_predictor` arch as (1), **weights re-init**, full train, no pred LoRA | Same prune | No | full predictor + MTP | `p01_stream_scratch_predictor_2_4_6` |
-| 4 | **Qwen-style on ViT-L** | Same as (1) | **Decoder-only** LM: vision = prefix; train TF; **val AR** | prune / `max_prefix` | **Yes on val AR** | ~29M decoder + MTP | `p01_stream_qwen_style_decoder_2_4_6` |
+| 4 | **Qwen-style on ViT-L** | Same as (1) | **Decoder-only** LM: vision = prefix; train TF; **val AR** | prune / `max_prefix` | **Yes on val AR** | ~22M decoder + MTP (± enc LoRA FT) | `p01_stream_qwen_style_*` |
 | 5a | **Encoder-heavy** | Pretrained ViT-L, **last 2 blocks** trainable | **None** (pool encoder tokens) | prune ≤4096 | No | ~25M enc blocks + MTP | `p01_stream_encoder_heavy_2_4_6` |
 | 5b | **Decoder-heavy** | Frozen ViT-L (**no** enc LoRA) | Same cross-attn decoder as Exp A | prune ≤4096 | No | ~29M decoder + MTP | `p01_stream_decoder_heavy_2_4_6` |
 | 6 | **Qwen2-VL-2B probe** | Qwen ViT (~675M) | Qwen **LLM decoder** (~1.5B) + LoRA | **~8 frames** subsample | (HF gen path; probe uses full forward) | LoRA~9M + heads | `p01_stream_qwen2vl2b_2_4_6` |
@@ -160,7 +160,8 @@ Primary metric: **val action Top-5 @ +2s** (unless noted). Paths under `/scratch
 | 5 | **Qwen2-VL-2B** LoRA probe | ~2.2B / ~9M train | **20.95** | 7.22 | 0 | best@ep0; then ↓ |
 | 6 | RU-LSTM stream | ~18M temporal | **19.28** | 6.58 | — | **done** |
 | 7 | V-JEPA vit_tiny (from scratch) | ~19.9M | **18.77** | 5.91 | 6 | best@ep6 |
-| — | Qwen-style decoder-only on ViT-L | enc frozen + ~22M | — | — | — | train running; no val yet |
+| — | Qwen-style decoder-only (frozen enc) | enc frozen + ~22M | — | — | — | mid-val ~23%@2s; resume fixed; no history yet |
+| — | Qwen-style + **enc LoRA FT** | enc LoRA + decoder | — | — | — | queued (`p01_stream_qwen_style_enc_lora_ft_2_4_6`) |
 | — | Decoder-heavy (no enc LoRA) | ~29M decoder | — | — | — | no completed val yet |
 
 **Takeaway so far:** On this closed-set stream protocol, **JEPA-style anticipative / cross-attn decoder on ViT-L latents (~26%) ≫ full Qwen2-VL-2B probe (~21%)**, even though Qwen is ~5× larger in total params. Capacity-matched tiny JEPA still sits near RU-LSTM (~19%).
@@ -193,8 +194,9 @@ Primary metric: **val action Top-5 @ +2s** (unless noted). Paths under `/scratch
 - Best **20.95%**; clearly below JEPA vanilla / Exp A; slightly above RU-LSTM
 
 #### 6) Qwen-style decoder-only on ViT-L (KV-cache AR val)
-- Code: [`jepa_qwen_style_decoder/`](jepa_qwen_style_decoder/) · Out: `p01_stream_qwen_style_decoder_2_4_6/`
-- Has checkpoints; **no completed val epoch in `history.json` yet**
+- Code: [`jepa_qwen_style_decoder/`](jepa_qwen_style_decoder/)
+- Frozen enc out: `p01_stream_qwen_style_decoder_2_4_6/` — train ep0 done; incomplete val showed running primary@2s **~23%**; walltime/resume bugs fixed (`resume_progress.json`, 3h50 wall)
+- Enc-LoRA FT: `submit_qwen_style_enc_lora_ft.slurm` → `p01_stream_qwen_style_enc_lora_ft_2_4_6/` (ViT-L frozen, LoRA trainable @1e-5)
 
 #### 7) RU-LSTM / vit_tiny (capacity baselines)
 - RU-LSTM (`rulstm_hdepic_p01_stream/`): action@2s **6.58 / 19.28** (t1/t5)
@@ -222,6 +224,7 @@ sbatch baselines/jepa_tiny_18m/submit_stream_tiny_18m.slurm
 sbatch baselines/qwen_vl_stream/submit_qwen_stream.slurm
 sbatch baselines/jepa_causal_decoder/submit_causal_decoder_stream.slurm
 sbatch baselines/jepa_qwen_style_decoder/submit_qwen_style_decoder.slurm
+sbatch baselines/jepa_qwen_style_decoder/submit_qwen_style_enc_lora_ft.slurm
 sbatch baselines/jepa_scratch_predictor/submit_scratch_predictor.slurm
 sbatch baselines/param_allocation/submit_encoder_heavy.slurm
 sbatch baselines/param_allocation/submit_decoder_heavy.slurm

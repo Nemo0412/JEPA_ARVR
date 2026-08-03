@@ -10,7 +10,7 @@ KV cache. This folder is the Qwen-style arm.
 
 | Piece | Setting |
 |-------|---------|
-| Vision encoder | Frozen ViT-L (+ frozen encoder LoRA), same checkpoint |
+| Vision encoder | Frozen ViT-L; optional **encoder LoRA finetune** (`--train-encoder-lora`) |
 | Data / protocol | HD-EPIC P01 stream half-split, +2/+4/+6s MTP |
 | Heads | Communicating-MLP MTP (same as stream JEPA) |
 | Decoder size | d=384, L=12, H=12 (≈ JEPA predictor / Exp A) |
@@ -43,12 +43,23 @@ video → [frozen ViT-L] → vision prefix
 | Vision | ViT-L | ViT-L | ViT-L | Qwen ViT |
 | Future module | mask-token SA | cross-attn decoder | **decoder-only + KV AR** | LLM |
 | KV cache | no | no | **yes (val)** | yes (gen) |
-| Trainable core | pred LoRA | ~29M decoder | ~29M decoder | LoRA ~9M on 2B |
+| Trainable core | pred LoRA | ~29M decoder | ~22M decoder (± enc LoRA) | LoRA ~9M on 2B |
+
+## Resume / walltime notes
+
+- Val `ar_kv` is slow (~4450 steps); Slurm walltime is **03:50:00** with `USR1@180`.
+- Mid-val resume uses lightweight `resume_progress.json` (val does not update weights).
+- Full `latest.pt` is still written on train periodic saves / epoch boundaries.
 
 ## Run
 
 ```bash
+# Frozen encoder (fair architecture compare)
 sbatch baselines/jepa_qwen_style_decoder/submit_qwen_style_decoder.slurm
+
+# Finetune encoder LoRA (ViT-L backbone still frozen)
+sbatch baselines/jepa_qwen_style_decoder/submit_qwen_style_enc_lora_ft.slurm
 ```
 
-Out: `/scratch/ll5914/experiments/p01_stream_qwen_style_decoder_2_4_6/`
+Out (frozen): `/scratch/ll5914/experiments/p01_stream_qwen_style_decoder_2_4_6/`  
+Out (enc-LoRA FT): `/scratch/ll5914/experiments/p01_stream_qwen_style_enc_lora_ft_2_4_6/`

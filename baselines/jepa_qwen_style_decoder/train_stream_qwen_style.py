@@ -19,7 +19,17 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+def _resolve_project_root() -> Path:
+    here = Path(__file__).resolve().parent
+    # JEPA_ARVR/baselines/jepa_qwen_style_decoder → parents[2] = JEPA_ARVR
+    cand = here.parents[2]
+    if (cand / "app" / "hdepic_lora_action_anticipation").is_dir():
+        return cand
+    env = os.environ.get("PROJECT_ROOT", "/home/ll5914/Jepa_yifan/JEPA_ARVR")
+    return Path(env)
+
+
+PROJECT_ROOT = _resolve_project_root()
 VJEPA_ROOT = Path(os.environ.get("VJEPA_ROOT", "/home/ll5914/ARVR_Video/vjepa2"))
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(VJEPA_ROOT))
@@ -79,6 +89,17 @@ def main():
     ap.add_argument("--video-root", type=Path, required=True)
     ap.add_argument("--checkpoint", type=Path, required=True)
     ap.add_argument("--encoder-lora", type=Path, default=None)
+    ap.add_argument(
+        "--train-encoder-lora",
+        action="store_true",
+        help="Finetune encoder LoRA (ViT-L backbone stays frozen).",
+    )
+    ap.add_argument(
+        "--encoder-lora-lr",
+        type=float,
+        default=None,
+        help="LR for encoder LoRA (default: 0.5 * --lr).",
+    )
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--horizons-sec", type=str, default="2,4,6")
     ap.add_argument("--loss-weights", type=str, default="1.0,0.7,0.5")
@@ -131,6 +152,14 @@ def main():
     for p in base.encoder.parameters():
         p.requires_grad = False
     stm.load_lora_sidecars(base, str(args.encoder_lora) if args.encoder_lora else None, None)
+    enc_lora_n = 0
+    if args.train_encoder_lora:
+        if not args.encoder_lora:
+            raise SystemExit("--train-encoder-lora requires --encoder-lora")
+        from app.hdepic_lora_action_anticipation.encoder_lora import set_encoder_lora_trainable
+
+        enc_lora_n = set_encoder_lora_trainable(base, trainable=True)
+        logger.info("Encoder LoRA trainable params=%d (%.3fM)", enc_lora_n, enc_lora_n / 1e6)
     if hasattr(base, "predictor"):
         base.predictor = None
 
@@ -145,7 +174,12 @@ def main():
     gp = int(base.grid_size**2)
     pruner = stm.TokenPruner(base.encoder, keep_count=args.keep_count, gp=gp)
     model = QwenStyleStreamModel(
-        base, decoder, pruner, prune_threshold=args.keep_count, decode_mode=args.train_decode_mode
+        base,
+        decoder,
+        pruner,
+        prune_threshold=args.keep_count,
+        decode_mode=args.train_decode_mode,
+        train_encoder=bool(args.train_encoder_lora),
     ).to(device)
 
     classifier = AttentiveClassifier(
@@ -165,20 +199,41 @@ def main():
         classifier, horizons_sec=horizons, comm_layers=2, comm_heads=4
     ).to(device)
 
-    params = [p for p in list(model.parameters()) + list(mtp_clf.parameters()) if p.requires_grad]
-    n_train = sum(p.numel() for p in params)
+    from app.hdepic_lora_action_anticipation.encoder_lora import trainable_encoder_lora_params
+
+    enc_lora_params = trainable_encoder_lora_params(model) if args.train_encoder_lora else []
+    enc_lora_ids = {id(p) for p in enc_lora_params}
+    other_params = [
+        p for p in list(model.parameters()) + list(mtp_clf.parameters())
+        if p.requires_grad and id(p) not in enc_lora_ids
+    ]
+    n_train = sum(p.numel() for p in enc_lora_params) + sum(p.numel() for p in other_params)
     report = {
         "decoder_m": decoder.param_count() / 1e6,
+        "encoder_lora_trainable_m": sum(p.numel() for p in enc_lora_params) / 1e6,
         "trainable_m": n_train / 1e6,
+        "train_encoder_lora": bool(args.train_encoder_lora),
         "num_future_tokens": args.num_future_tokens,
         "train_decode_mode": args.train_decode_mode,
         "val_decode_mode": args.val_decode_mode,
-        "note": "V-JEPA ViT-L + Qwen-style decoder-only AR (KV cache on val); same MTP/protocol",
+        "note": (
+            "V-JEPA ViT-L + Qwen-style decoder-only AR; "
+            + ("encoder LoRA finetuned" if args.train_encoder_lora else "encoder frozen")
+        ),
     }
     (args.out_dir / "param_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     logger.info("param_report %s", report)
 
-    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=1e-4)
+    enc_lr = float(args.encoder_lora_lr) if args.encoder_lora_lr is not None else 0.5 * float(args.lr)
+    param_groups = []
+    if other_params:
+        param_groups.append({"params": other_params, "lr": float(args.lr)})
+    if enc_lora_params:
+        param_groups.append({"params": enc_lora_params, "lr": enc_lr})
+    if not param_groups:
+        raise SystemExit("no trainable parameters")
+    params = other_params + enc_lora_params
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=1e-4)
     scaler = torch.cuda.amp.GradScaler(enabled=True)
 
     best = -1.0
@@ -188,12 +243,77 @@ def main():
     resume_phase = "train"
     resume_metric_state = None
     latest = args.out_dir / "latest.pt"
-    if latest.is_file():
-        ck = torch.load(latest, map_location="cpu", weights_only=False)
+    latest_tmp = args.out_dir / "latest.pt.tmp"
+    progress_path = args.out_dir / "resume_progress.json"
+
+    def _ckpt_progress_tuple(epoch: int, phase: str, step: int) -> tuple:
+        phase_rank = 1 if phase == "val" else 0
+        return (int(epoch), phase_rank, int(step))
+
+    def _read_pt_meta(path: Path) -> tuple | None:
+        """Read epoch/step/phase from a torch zip ckpt without loading tensors."""
+        import zipfile
+        import pickle
+
+        class _MetaUnpickler(pickle.Unpickler):
+            def persistent_load(self, _pid):
+                return None
+
+            def find_class(self, module, name):
+                if "torch" in module or name.endswith("Storage"):
+                    return lambda *a, **k: None
+                return super().find_class(module, name)
+
+        try:
+            with zipfile.ZipFile(path) as zf:
+                name = next(n for n in zf.namelist() if n.endswith("data.pkl"))
+                with zf.open(name) as fh:
+                    obj = _MetaUnpickler(fh).load()
+            if not isinstance(obj, dict):
+                return None
+            return (
+                int(obj.get("epoch", 0)),
+                str(obj.get("phase", "train")),
+                int(obj.get("step", 0)),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("meta read failed for %s: %s", path.name, exc)
+            return None
+
+    def _choose_ckpt_path() -> Path | None:
+        scored = []
+        for p in (latest, latest_tmp):
+            if not p.is_file() or p.stat().st_size < 1_000_000:
+                continue
+            meta = _read_pt_meta(p)
+            if meta is None:
+                # Fall back to mtime if meta unreadable but file looks complete.
+                scored.append(((-1, -1, int(p.stat().st_mtime)), p))
+            else:
+                scored.append((_ckpt_progress_tuple(*meta), p))
+        if not scored:
+            return None
+        scored.sort(key=lambda x: x[0])
+        return scored[-1][1]
+
+    ck_path = _choose_ckpt_path()
+    ck = None
+    if ck_path is not None:
+        try:
+            ck = torch.load(ck_path, map_location="cpu", weights_only=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("failed to load %s: %s", ck_path, exc)
+            if ck_path.resolve() != latest.resolve() and latest.is_file():
+                ck_path = latest
+                ck = torch.load(latest, map_location="cpu", weights_only=False)
+    if ck is not None:
         model.load_state_dict(ck["model"], strict=False)
         mtp_clf.load_state_dict(ck["mtp_classifier"], strict=False)
         if ck.get("optimizer") is not None:
-            optimizer.load_state_dict(ck["optimizer"])
+            try:
+                optimizer.load_state_dict(ck["optimizer"])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("optimizer restore failed: %s", exc)
         if ck.get("scaler") is not None:
             try:
                 scaler.load_state_dict(ck["scaler"])
@@ -208,27 +328,79 @@ def main():
             resume_metric_state = ck.get("metric_state")
         else:
             start_epoch = int(ck.get("epoch", 0)) + 1
-        logger.info("Resumed epoch=%d step=%d phase=%s best=%.4f", start_epoch, start_step, resume_phase, best)
+        logger.info(
+            "Resumed from %s epoch=%d step=%d phase=%s best=%.4f",
+            ck_path.name, start_epoch, start_step, resume_phase, best,
+        )
+        if ck_path.resolve() == latest_tmp.resolve():
+            try:
+                os.replace(latest_tmp, latest)
+                logger.info("Promoted latest.pt.tmp -> latest.pt")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("promote tmp failed: %s", exc)
+
+    # Lightweight cursor: val does not update weights, so mid-val resume only
+    # needs step + metric_state (avoids 2GB ckpt races / step=0 rewrites).
+    if progress_path.is_file():
+        try:
+            prog = json.loads(progress_path.read_text())
+            pe, pp, ps = int(prog.get("epoch", 0)), str(prog.get("phase", "train")), int(prog.get("step", 0))
+            if _ckpt_progress_tuple(pe, pp, ps) > _ckpt_progress_tuple(start_epoch, resume_phase, start_step):
+                start_epoch, resume_phase, start_step = pe, pp, ps
+                resume_metric_state = prog.get("metric_state")
+                logger.info(
+                    "Applied resume_progress.json epoch=%d step=%d phase=%s",
+                    start_epoch, start_step, resume_phase,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("resume_progress.json unreadable: %s", exc)
 
     stop_flag = {"stop": False}
-    _ckpt_ctx = {"epoch": start_epoch, "step": start_step, "phase": resume_phase}
+    _ckpt_ctx = {
+        "epoch": start_epoch,
+        "step": start_step,
+        "phase": resume_phase,
+        "metric_state": resume_metric_state,
+        "saving": False,
+    }
+
+    def _write_progress(step: int, phase: str, metric_state=None):
+        payload = {
+            "epoch": int(_ckpt_ctx["epoch"]),
+            "step": int(step),
+            "phase": str(phase),
+            "metric_state": metric_state,
+            "best": float(best),
+        }
+        tmp = progress_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload))
+        os.replace(tmp, progress_path)
 
     def _periodic_save(step, phase, metric_state=None):
-        _ckpt_ctx.update(step=int(step), phase=str(phase))
-        stm.save_checkpoint(
-            latest, epoch=_ckpt_ctx["epoch"], step=step, model=model, mtp_clf=mtp_clf,
-            optimizer=optimizer, scaler=scaler, best=best, horizons=horizons,
-            verb_map=verb_map, noun_map=noun_map, action_map=action_map,
-            history=history, phase=phase, metric_state=metric_state,
-        )
+        if _ckpt_ctx.get("saving"):
+            return
+        _ckpt_ctx.update(step=int(step), phase=str(phase), metric_state=metric_state, saving=True)
+        try:
+            _write_progress(step, phase, metric_state)
+            # During val, weights are frozen — skip multi-GB torch.save storms.
+            # Train still needs full checkpoints; val relies on resume_progress.json
+            # plus the last full ckpt (weights unchanged in val).
+            if str(phase) == "val":
+                return
+            stm.save_checkpoint(
+                latest, epoch=_ckpt_ctx["epoch"], step=int(step), model=model, mtp_clf=mtp_clf,
+                optimizer=optimizer, scaler=scaler, best=best, horizons=horizons,
+                verb_map=verb_map, noun_map=noun_map, action_map=action_map,
+                history=history, phase=str(phase), metric_state=metric_state,
+            )
+        finally:
+            _ckpt_ctx["saving"] = False
 
     def _on_signal(signum, _frame):
-        logger.warning("signal %s", signum)
+        logger.warning("signal %s — stop after current step (step=%s phase=%s)",
+                       signum, _ckpt_ctx.get("step"), _ckpt_ctx.get("phase"))
         stop_flag["stop"] = True
-        try:
-            _periodic_save(max(0, int(_ckpt_ctx["step"])), str(_ckpt_ctx["phase"]))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("emergency save failed: %s", exc)
+        # Flush light progress immediately; full torch.save happens in stopped_early.
 
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
@@ -334,20 +506,35 @@ def main():
 
             loss_meter += float(loss.detach().item()) if torch.isfinite(loss.detach()) else 0.0
             n_steps += 1
+            phase = "train" if train else "val"
+            ms = {
+                "totals": dict(totals),
+                "counts": dict(counts),
+                "loss_meter": loss_meter,
+                "n_steps": n_steps,
+            }
+            # Keep live resume cursor even when we are not writing disk yet.
+            _ckpt_ctx.update(step=it + 1, phase=phase, metric_state=ms)
             if it % 20 == 0:
                 logger.info(
                     "%s itr=%d/%d loss=%.4f mode=%s primary@2s≈%.1f",
-                    "train" if train else "val",
+                    phase,
                     it,
                     len(loader),
                     loss_meter / max(1, n_steps),
                     model.decode_mode,
                     100.0 * totals["primary_action_top5"] / max(1, counts["primary_action_top5"]),
                 )
-            if train and args.save_every > 0 and (it + 1) % args.save_every == 0 and save_fn is not None:
-                ms = {"totals": dict(totals), "counts": dict(counts), "loss_meter": loss_meter, "n_steps": n_steps}
-                save_fn(step=it + 1, phase="train" if train else "val", metric_state=ms)
-                logger.info("Periodic ckpt step=%d", it + 1)
+                # Cheap mid-val cursor every log tick (weights unchanged in val).
+                if not train:
+                    try:
+                        _write_progress(it + 1, phase, ms)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("progress write failed: %s", exc)
+            # Full/light periodic save (train: weights; val: progress json).
+            if args.save_every > 0 and (it + 1) % args.save_every == 0 and save_fn is not None:
+                save_fn(step=it + 1, phase=phase, metric_state=ms)
+                logger.info("Periodic ckpt phase=%s step=%d", phase, it + 1)
 
         metrics = {k: totals[k] / max(1, counts[k]) for k in totals}
         metrics["loss"] = loss_meter / max(1, n_steps)
@@ -392,17 +579,28 @@ def main():
             if tr.get("stopped_early"):
                 _periodic_save(int(tr["last_step"]), "train", tr.get("_metric_state"))
                 return
+            # Mark val phase without wiping a mid-val resume cursor on later epochs.
+            _ckpt_ctx.update(step=0, phase="val", metric_state=None)
             _periodic_save(0, "val", None)
 
-        _ckpt_ctx["phase"] = "val"
+        _ckpt_ctx.update(phase="val", step=int(val_start), metric_state=resume_metric_state if (skip_train and val_start > 0) else None)
         val_sampler.set_start_batch(val_start)
-        va = run_epoch(
-            val_loader,
-            train=False,
-            start_step=val_start,
-            metric_state=(resume_metric_state if (skip_train and val_start > 0) else None),
-            save_fn=_periodic_save,
-        )
+        try:
+            va = run_epoch(
+                val_loader,
+                train=False,
+                start_step=val_start,
+                metric_state=(resume_metric_state if (skip_train and val_start > 0) else None),
+                save_fn=_periodic_save,
+            )
+        except Exception:
+            # Persist mid-val progress before re-raising (OOM / CUDA / etc.).
+            _periodic_save(
+                int(_ckpt_ctx.get("step") or val_start),
+                "val",
+                _ckpt_ctx.get("metric_state"),
+            )
+            raise
         val_sampler.set_start_batch(0)
         if va.get("stopped_early"):
             _periodic_save(int(va["last_step"]), "val", va.get("_metric_state"))
@@ -428,6 +626,8 @@ def main():
             verb_map=verb_map, noun_map=noun_map, action_map=action_map,
             history=history, phase="train", metric_state=None,
         )
+        _ckpt_ctx.update(epoch=epoch + 1, step=0, phase="train", metric_state=None)
+        _write_progress(0, "train", None)
         if primary > best:
             best = primary
             stm.save_checkpoint(
