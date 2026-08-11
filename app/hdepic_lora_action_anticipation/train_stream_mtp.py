@@ -505,8 +505,14 @@ def run_epoch(
 
                 with torch.no_grad():
                     key = f"action_top5@{h:g}s"
-                    totals[key] += topk_acc(o["action"][valid_pos].float(), a_lab, k=5) * len(keep)
+                    acc = topk_acc(o["action"][valid_pos].float(), a_lab, k=5) * len(keep)
+                    totals[key] += acc
                     counts[key] += len(keep)
+                    # A2: per-context-length buckets (batch is context-homogeneous).
+                    ctx = float(batch["context_sec"][0])
+                    ctx_key = f"{key}|ctx{ctx:g}"
+                    totals[ctx_key] += acc
+                    counts[ctx_key] += len(keep)
 
             # primary metric
             h0 = horizons[primary_idx]
@@ -523,8 +529,13 @@ def run_epoch(
                 if keep:
                     valid_pos = valid.nonzero(as_tuple=False).view(-1)[keep]
                     o = outputs[float(h0)]
-                    totals["primary_action_top5"] += topk_acc(o["action"][valid_pos].float(), a_lab, k=5) * len(keep)
+                    acc = topk_acc(o["action"][valid_pos].float(), a_lab, k=5) * len(keep)
+                    totals["primary_action_top5"] += acc
                     counts["primary_action_top5"] += len(keep)
+                    ctx = float(batch["context_sec"][0])
+                    ctx_key = f"primary_action_top5|ctx{ctx:g}"
+                    totals[ctx_key] += acc
+                    counts[ctx_key] += len(keep)
 
         if train:
             if not torch.isfinite(head_loss.detach()):
@@ -568,6 +579,9 @@ def run_epoch(
             )
             logger.info("Periodic checkpoint at %s step=%d", phase, it + 1)
     metrics = {k: (totals[k] / max(1, counts[k])) for k in totals}
+    for k, c in counts.items():
+        if "|ctx" in str(k):
+            metrics[f"n|{k}"] = int(c)
     metrics["loss"] = loss_meter / max(1, n_steps)
     metrics["seconds"] = time.time() - t0
     metrics["last_step"] = int(last_it + 1)
@@ -605,6 +619,22 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--save-every", type=int, default=200, help="Save latest.pt every N train steps (0=off)")
     ap.add_argument("--val-only", action="store_true")
+    ap.add_argument(
+        "--init-from-ckpt",
+        type=Path,
+        default=None,
+        help="Load model+mtp_classifier weights (no optimizer). For val-only probes.",
+    )
+    ap.add_argument(
+        "--heads-from-scratch",
+        action="store_true",
+        help="With --init-from-ckpt, load backbone only; keep randomly init MTP heads (A1).",
+    )
+    ap.add_argument(
+        "--freeze-backbone",
+        action="store_true",
+        help="Freeze all non-MTP params; train CommunicatingMLPMTPClassifier only (A1).",
+    )
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -673,9 +703,44 @@ def main():
         classifier, horizons_sec=horizons, comm_layers=2, comm_heads=4
     ).to(device)
 
+    if args.init_from_ckpt is not None and Path(args.init_from_ckpt).is_file():
+        init_ck = torch.load(Path(args.init_from_ckpt), map_location="cpu", weights_only=False)
+        m_miss, m_unexp = model.load_state_dict(init_ck["model"], strict=False)
+        if args.heads_from_scratch:
+            logger.info(
+                "Init backbone from %s best=%s model(missing=%d unexpected=%d); MTP heads from scratch",
+                args.init_from_ckpt,
+                init_ck.get("best"),
+                len(m_miss),
+                len(m_unexp),
+            )
+        else:
+            h_miss, h_unexp = mtp_clf.load_state_dict(init_ck["mtp_classifier"], strict=False)
+            logger.info(
+                "Init from %s best=%s model(missing=%d unexpected=%d) mtp(missing=%d unexpected=%d)",
+                args.init_from_ckpt,
+                init_ck.get("best"),
+                len(m_miss),
+                len(m_unexp),
+                len(h_miss),
+                len(h_unexp),
+            )
+        del init_ck
+
+    if args.freeze_backbone:
+        n_bb = 0
+        for p in model.parameters():
+            if p.requires_grad:
+                n_bb += p.numel()
+            p.requires_grad = False
+        logger.info("Froze backbone (%d previously-trainable params); MTP heads only", n_bb)
+
     params = [p for p in list(model.parameters()) + list(mtp_clf.parameters()) if p.requires_grad]
+    if not params:
+        raise RuntimeError("No trainable parameters — check --freeze-backbone / LoRA load")
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=1e-4)
     scaler = torch.cuda.amp.GradScaler(enabled=True)
+    logger.info("Trainable params: %d", sum(p.numel() for p in params))
 
     best = -1.0
     history = []

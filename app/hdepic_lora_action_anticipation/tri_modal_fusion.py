@@ -201,9 +201,21 @@ class ModalityProjections(nn.Module):
 
 
 class ProjectedCrossAttentionUpdate(nn.Module):
-    """One cross-attention update: query modality attends to auxiliary K/V."""
+    """One cross-attention update: query modality attends to auxiliary K/V.
 
-    def __init__(self, embed_dim: int, attn_dim: int, num_heads: int, dropout: float = 0.0):
+    Optional post-attn FFN (Transformer-style residual MLP) with zero-init last
+    projection so the block starts near CA-only identity when FFN is enabled.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        attn_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        use_ffn: bool = False,
+        ffn_mult: int = 4,
+    ):
         super().__init__()
         if attn_dim % num_heads != 0:
             raise ValueError(f"attn_dim={attn_dim} must be divisible by num_heads={num_heads}")
@@ -215,6 +227,29 @@ class ProjectedCrossAttentionUpdate(nn.Module):
         )
         self.embed_dim = embed_dim
         self.attn_dim = attn_dim
+        self.use_ffn = bool(use_ffn)
+        self.ffn_mult = int(ffn_mult)
+        if self.use_ffn:
+            hidden = int(embed_dim * self.ffn_mult)
+            self.ffn_norm = nn.LayerNorm(embed_dim)
+            self.ffn = nn.Sequential(
+                nn.Linear(embed_dim, hidden),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden, embed_dim),
+                nn.Dropout(dropout),
+            )
+            # Identity start: CA residual path dominates until FFN learns.
+            nn.init.zeros_(self.ffn[-2].weight)
+            nn.init.zeros_(self.ffn[-2].bias)
+        else:
+            self.ffn_norm = None
+            self.ffn = None
+
+    def _apply_ffn(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.use_ffn or self.ffn is None or self.ffn_norm is None:
+            return x
+        return x + self.ffn(self.ffn_norm(x))
 
     def forward(
         self,
@@ -230,12 +265,54 @@ class ProjectedCrossAttentionUpdate(nn.Module):
         z_fused = out_proj(z_attn)
         if use_gated_residual:
             gate = torch.sigmoid(gate_mlp(torch.cat([z_query, z_attn], dim=-1)))
-            return z_query + gate * z_fused
-        return z_query + z_fused
+            x = z_query + gate * z_fused
+        else:
+            x = z_query + z_fused
+        return self._apply_ffn(x)
+
+    def inverted_writeback(
+        self,
+        z_video: torch.Tensor,
+        q_aux: torch.Tensor,
+        k_video: torch.Tensor,
+        v_video: torch.Tensor,
+        out_proj: nn.Linear,
+        gate_mlp: nn.Sequential,
+        use_gated_residual: bool,
+    ) -> torch.Tensor:
+        """Q=aux, KV=video; residual back to video via attn^T writeback.
+
+        Attn weights ``W`` are ``[B, N_a, N_v]``. Aux output ``U`` is ``[B, N_a, D]``.
+        Video delta is ``W^T U`` so each video token gets aux messages weighted by
+        how much each aux query attended to it.
+        """
+        z_attn, attn_w = self.attn(
+            q_aux, k_video, v_video, need_weights=True, average_attn_weights=True
+        )
+        # z_attn: [B, N_a, d_a]; attn_w: [B, N_a, N_v]
+        u_aux = out_proj(z_attn)
+        if attn_w is None:
+            raise RuntimeError("inverted_writeback requires attention weights from MultiheadAttention")
+        # [B, N_v, N_a] @ [B, N_a, D] -> [B, N_v, D]
+        delta = torch.bmm(attn_w.transpose(1, 2), u_aux)
+        if use_gated_residual:
+            gate = torch.sigmoid(gate_mlp(torch.cat([z_video, delta], dim=-1)))
+            x = z_video + gate * delta
+        else:
+            x = z_video + delta
+        return self._apply_ffn(x)
 
 
 class ProjectedTriModalCrossAttention(nn.Module):
-    """Projected tri-modal cross-attention with optional stacked layers."""
+    """Projected tri-modal cross-attention with optional stacked layers.
+
+    ``video_query_side``:
+      * ``video`` (default): Q=video, KV=concat(aux) — standard residual onto Z_v.
+      * ``aux``: Q=aux, KV=video, residual onto Z_v via attention-transpose writeback.
+        Peer gaze/IMU branch updates (if enabled) stay as Q=self, KV=others.
+
+    ``use_ffn``: after each CA residual, apply LN → Linear→GELU→Linear residual FFN.
+    """
 
     def __init__(
         self,
@@ -248,12 +325,21 @@ class ProjectedTriModalCrossAttention(nn.Module):
         use_gaze_branch: bool = True,
         use_imu_branch: bool = True,
         gate_bias_init: float = -4.0,
+        video_query_side: str = "video",
+        use_ffn: bool = False,
+        ffn_mult: int = 4,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.use_gaze_branch = bool(use_gaze_branch)
         self.use_imu_branch = bool(use_imu_branch)
         self.use_gated_residual = bool(use_gated_residual)
+        self.use_ffn = bool(use_ffn)
+        self.ffn_mult = int(ffn_mult)
+        side = str(video_query_side).lower().strip()
+        if side not in ("video", "aux"):
+            raise ValueError(f"video_query_side must be 'video' or 'aux', got {video_query_side!r}")
+        self.video_query_side = side
         self.video_proj = ModalityProjections(embed_dim, attn_dim, gate_bias_init=gate_bias_init)
         self.gaze_proj = (
             ModalityProjections(embed_dim, attn_dim, gate_bias_init=gate_bias_init) if self.use_gaze_branch else None
@@ -263,7 +349,14 @@ class ProjectedTriModalCrossAttention(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                ProjectedCrossAttentionUpdate(embed_dim, attn_dim, num_heads, dropout=dropout)
+                ProjectedCrossAttentionUpdate(
+                    embed_dim,
+                    attn_dim,
+                    num_heads,
+                    dropout=dropout,
+                    use_ffn=self.use_ffn,
+                    ffn_mult=self.ffn_mult,
+                )
                 for _ in range(int(num_layers))
             ]
         )
@@ -298,6 +391,32 @@ class ProjectedTriModalCrossAttention(nn.Module):
             v,
             self_proj.w_o,
             self_proj.gate,
+            self.use_gated_residual,
+        )
+
+    def _update_video_inverted(
+        self,
+        z_v: torch.Tensor,
+        aux_z: list[torch.Tensor],
+        aux_proj: list[ModalityProjections],
+        layer: ProjectedCrossAttentionUpdate,
+    ) -> torch.Tensor:
+        """Video residual with Q=aux, KV=video (attn^T writeback onto Z_v)."""
+        if not aux_z:
+            return z_v
+        _, k_v, v_v = self.video_proj.project_qkv(z_v)
+        q_parts = []
+        for z_aux, proj in zip(aux_z, aux_proj):
+            q_i, _, _ = proj.project_qkv(z_aux)
+            q_parts.append(q_i)
+        q_aux = torch.cat(q_parts, dim=1)
+        return layer.inverted_writeback(
+            z_v,
+            q_aux,
+            k_v,
+            v_v,
+            self.video_proj.w_o,
+            self.video_proj.gate,
             self.use_gated_residual,
         )
 
@@ -341,7 +460,10 @@ class ProjectedTriModalCrossAttention(nn.Module):
 
             video_aux = gaze_aux + imu_aux
             video_projs = gaze_projs + imu_projs
-            z_v = self._update_branch(z_v, video_aux, video_projs, self.video_proj, layer)
+            if self.video_query_side == "aux":
+                z_v = self._update_video_inverted(z_v, video_aux, video_projs, layer)
+            else:
+                z_v = self._update_branch(z_v, video_aux, video_projs, self.video_proj, layer)
 
         z_video_fused = z_v.view(bsz, t_slots, n_v, dim)
         assert z_video_fused.shape == z_video.shape, (

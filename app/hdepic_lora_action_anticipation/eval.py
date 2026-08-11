@@ -2533,6 +2533,9 @@ def _patch_init_module_for_tri_modal_fusion(base_eval, gaze_cfg: dict):
             use_gaze_branch=use_gaze,
             use_imu_branch=use_imu,
             gate_bias_init=float(fusion_cfg.get("gate_bias_init", -4.0)),
+            video_query_side=str(fusion_cfg.get("video_query_side", "video")),
+            use_ffn=bool(fusion_cfg.get("use_ffn", False)),
+            ffn_mult=int(fusion_cfg.get("ffn_mult", 4)),
         ).to(device)
         gaze_encoder = (
             GazeSpatialEncoder(embed_dim=embed_dim, grid_size=gaze_grid_size).to(device)
@@ -2630,6 +2633,9 @@ def _patch_init_module_for_concat_plus_cross_attn(base_eval, gaze_cfg: dict):
             use_gaze_branch=False,
             use_imu_branch=True,
             gate_bias_init=float(fusion_cfg.get("gate_bias_init", -4.0)),
+            video_query_side=str(fusion_cfg.get("video_query_side", "video")),
+            use_ffn=bool(fusion_cfg.get("use_ffn", False)),
+            ffn_mult=int(fusion_cfg.get("ffn_mult", 4)),
         ).to(device)
         imu_encoder = ImuTemporalEncoder(
             embed_dim=embed_dim,
