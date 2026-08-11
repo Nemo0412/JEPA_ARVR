@@ -1,0 +1,118 @@
+{
+  "device": "POCL CPU (login)",
+  "note": "Relative scaling for design; re-run on NVIDIA OpenCL for absolute GPU numbers.",
+  "receive": [
+    {
+      "kind": "receive",
+      "norm": 0.15373599999999998,
+      "qk": 0.89395,
+      "softmax": 0.6816359999999999,
+      "reduce": 0.169545,
+      "total": 1.898867,
+      "peak_logits_MiB": 0.03125,
+      "qk_bytes_proxy_GiB": 0.015625,
+      "N": 128,
+      "D": 128,
+      "chunk": 64
+    },
+    {
+      "kind": "receive",
+      "norm": 0.440488,
+      "qk": 3.016955,
+      "softmax": 2.5893729999999997,
+      "reduce": 0.46504599999999996,
+      "total": 6.511862,
+      "peak_logits_MiB": 0.0625,
+      "qk_bytes_proxy_GiB": 0.0625,
+      "N": 256,
+      "D": 128,
+      "chunk": 64
+    },
+    {
+      "kind": "receive",
+      "norm": 0.283371,
+      "qk": 10.571204999999999,
+      "softmax": 8.765568,
+      "reduce": 1.1014760000000001,
+      "total": 20.72162,
+      "peak_logits_MiB": 0.125,
+      "qk_bytes_proxy_GiB": 0.25,
+      "N": 512,
+      "D": 128,
+      "chunk": 64
+    },
+    {
+      "kind": "receive",
+      "norm": 0.36225199999999996,
+      "qk": 198.178361,
+      "softmax": 76.584346,
+      "reduce": 1.7965929999999999,
+      "total": 276.92155199999996,
+      "peak_logits_MiB": 0.25,
+      "qk_bytes_proxy_GiB": 1.0,
+      "N": 1024,
+      "D": 128,
+      "chunk": 64
+    },
+    {
+      "kind": "receive",
+      "norm": 0.252396,
+      "qk": 883.4808919999998,
+      "softmax": 123.18175199999997,
+      "reduce": 5.2669880000000004,
+      "total": 1012.1820279999997,
+      "peak_logits_MiB": 0.5,
+      "qk_bytes_proxy_GiB": 4.0,
+      "N": 2048,
+      "D": 128,
+      "chunk": 64
+    }
+  ],
+  "fusion": [
+    {
+      "kind": "fusion",
+      "sdpa_cross": 0.487907,
+      "gated_residual": 0.096409,
+      "total": 0.584316,
+      "Nv": 256,
+      "Nimu": 26,
+      "D": 128
+    },
+    {
+      "kind": "fusion",
+      "sdpa_cross": 1.1137329999999999,
+      "gated_residual": 0.08471999999999999,
+      "total": 1.1984529999999998,
+      "Nv": 512,
+      "Nimu": 26,
+      "D": 128
+    },
+    {
+      "kind": "fusion",
+      "sdpa_cross": 2.098675,
+      "gated_residual": 0.10824299999999999,
+      "total": 2.206918,
+      "Nv": 1024,
+      "Nimu": 26,
+      "D": 128
+    },
+    {
+      "kind": "fusion",
+      "sdpa_cross": 4.216792,
+      "gated_residual": 0.583058,
+      "total": 4.79985,
+      "Nv": 2048,
+      "Nimu": 26,
+      "D": 128
+    },
+    {
+      "kind": "fusion",
+      "sdpa_cross": 2.4542729999999997,
+      "gated_residual": 0.09143799999999999,
+      "total": 2.545711,
+      "Nv": 512,
+      "Nimu": 64,
+      "D": 128
+    }
+  ]
+}
