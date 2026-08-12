@@ -49,6 +49,7 @@ from app.hdepic_lora_action_anticipation.gaze import GazeTokenGate  # noqa: E402
 from app.hdepic_lora_action_anticipation.mtp import CommunicatingMLPMTPClassifier  # noqa: E402
 from app.hdepic_lora_action_anticipation.pose_map_builder import GazePoseInputMapBuilder  # noqa: E402
 from app.hdepic_lora_action_anticipation.tri_modal_fusion import (  # noqa: E402
+    GazeSpatialEncoder,
     ImuTemporalEncoder,
     ImuTrajectoryLoader,
     ProjectedTriModalCrossAttention,
@@ -65,7 +66,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 
 class StreamMTPConcatCADataset(base.StreamMTPDataset):
-    """Video decode + gaze/pose map + IMU for each stream tick.
+    """Video decode + aux maps (+ optional IMU) for each stream tick.
+
+    ``ca_aux``:
+      * ``imu`` (HD-EPIC default): 2ch gaze+pose map + IMU trajectories.
+      * ``gaze`` (Ego4D): 1ch gaze map only; no IMU / pose.
 
     Builders hold ``threading.Lock`` (unpicklable). Store only ``gaze_cfg`` and
     lazily construct per-process so DataLoader ``num_workers>0`` (spawn) works.
@@ -81,36 +86,49 @@ class StreamMTPConcatCADataset(base.StreamMTPDataset):
         img_size: int,
         gaze_cfg: dict,
         tick_cache_dir: Path | None = None,
+        ca_aux: str = "imu",
     ):
         super().__init__(csv_path, video_root, img_size)
         self.gaze_cfg = dict(gaze_cfg)
+        self.ca_aux = str(ca_aux).lower().strip()
+        if self.ca_aux not in ("imu", "gaze"):
+            raise ValueError(f"ca_aux must be 'imu' or 'gaze', got {ca_aux!r}")
         self.tick_cache_dir = Path(tick_cache_dir) if tick_cache_dir else None
         if self.tick_cache_dir is not None:
             self.tick_cache_dir.mkdir(parents=True, exist_ok=True)
         self._map_builder = None
         self._imu_loader = None
+        self._gaze_builder = None
 
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_map_builder"] = None
         state["_imu_loader"] = None
+        state["_gaze_builder"] = None
         return state
 
     def _ensure_aux_loaders(self):
+        if self.ca_aux == "gaze":
+            if self._gaze_builder is None:
+                from app.hdepic_lora_action_anticipation.binary_input_adapter import BinaryGazeMapBuilder
+
+                gate = GazeTokenGate({**self.gaze_cfg, "mode": "token_gate", "learnable_gate": False})
+                self._gaze_builder = BinaryGazeMapBuilder(self.gaze_cfg, gate=gate)
+            return
         if self._map_builder is None or self._imu_loader is None:
             gate = GazeTokenGate({**self.gaze_cfg, "mode": "token_gate", "learnable_gate": False})
             self._map_builder = GazePoseInputMapBuilder(self.gaze_cfg, gate=gate)
             self._imu_loader = ImuTrajectoryLoader(self.gaze_cfg, gate=gate)
 
     @staticmethod
-    def _cache_key(video_id: str, frame_idx: np.ndarray) -> str:
-        raw = f"{video_id}|{','.join(map(str, frame_idx.tolist()))}".encode("utf-8")
+    def _cache_key(video_id: str, frame_idx: np.ndarray, ca_aux: str) -> str:
+        raw = f"{ca_aux}|{video_id}|{','.join(map(str, frame_idx.tolist()))}".encode("utf-8")
         return hashlib.md5(raw).hexdigest()
 
     def _cache_path(self, video_id: str, frame_idx: np.ndarray) -> Path | None:
         if self.tick_cache_dir is None:
             return None
-        return self.tick_cache_dir / f"{self._cache_key(video_id, frame_idx)}.pt"
+        return self.tick_cache_dir / f"{self._cache_key(video_id, frame_idx, self.ca_aux)}.pt"
 
     def __getitem__(self, idx: int):
         r = self.rows[idx]
@@ -148,11 +166,22 @@ class StreamMTPConcatCADataset(base.StreamMTPDataset):
         t = int(sample["clip"].shape[1])
         h = int(sample["clip"].shape[2])
         w = int(sample["clip"].shape[3])
-        aux = self._map_builder.build_cpu([meta], t, h, w)[0]  # 2,T,H,W
-        imu = self._imu_loader.load_batch([meta], torch.device("cpu"))
-        sample["aux_map"] = aux
-        sample["imu"] = imu[0][0] if imu is not None else torch.zeros(t, 128, 6)
-        sample["imu_len"] = imu[1][0] if imu is not None else torch.ones(t, dtype=torch.long)
+
+        if self.ca_aux == "gaze":
+            # BinaryGazeMapBuilder → [1, T, H, W] (or [B,1,T,H,W] for list meta)
+            gaze = self._gaze_builder.build_cpu([meta], t, h, w)
+            if gaze.ndim == 5:
+                gaze = gaze[0]
+            sample["aux_map"] = gaze.float()  # [1,T,H,W]
+            sample["imu"] = torch.zeros(t, 1, 6)
+            sample["imu_len"] = torch.ones(t, dtype=torch.long)
+        else:
+            aux = self._map_builder.build_cpu([meta], t, h, w)[0]  # 2,T,H,W
+            imu = self._imu_loader.load_batch([meta], torch.device("cpu"))
+            sample["aux_map"] = aux
+            sample["imu"] = imu[0][0] if imu is not None else torch.zeros(t, 128, 6)
+            sample["imu_len"] = imu[1][0] if imu is not None else torch.ones(t, dtype=torch.long)
+
         sample["video_id"] = video_id
 
         if cache_path is not None:
@@ -161,7 +190,7 @@ class StreamMTPConcatCADataset(base.StreamMTPDataset):
                 torch.save(
                     {
                         "clip": sample["clip"],
-                        "aux_map": sample["aux_map"].half(),  # space: float16 maps
+                        "aux_map": sample["aux_map"].half(),
                         "imu": sample["imu"],
                         "imu_len": sample["imu_len"],
                     },
@@ -405,6 +434,7 @@ class PrunedConcatCAStreamModel(nn.Module):
     def forward(self, clips, anticipation_times, aux_map=None, imu_batch=None):
         tri = self.concat_ca.tri
         base_m = tri.base_model
+        ca_aux = getattr(self.concat_ca, "ca_aux", "imu")
         if aux_map is not None:
             clips = self.concat_ca.input_adapter(clips, aux_map)
         x_full = base_m.encoder(clips)
@@ -418,7 +448,11 @@ class PrunedConcatCAStreamModel(nn.Module):
         x_last = x_full[:, :, -embed_dim:] if use_hier else x_full
         x_accumulate = x_last.clone()
 
-        x_pred = tri._fuse_for_predictor(x_full, gaze_map=None, imu_batch=imu_batch)
+        if ca_aux == "gaze":
+            ca_gaze = aux_map[:, :1] if aux_map is not None else None
+            x_pred = tri._fuse_for_predictor(x_full, gaze_map=ca_gaze, imu_batch=None)
+        else:
+            x_pred = tri._fuse_for_predictor(x_full, gaze_map=None, imu_batch=imu_batch)
         if x_pred is None or not torch.isfinite(x_pred).all():
             return None
 
@@ -463,7 +497,13 @@ def build_concat_ca_model(
     video_query_side: str = "video",
     use_ffn: bool = False,
     ffn_mult: int = 4,
+    ca_aux: str = "imu",
+    adapter_in_channels: int | None = None,
 ):
+    ca_aux = str(ca_aux).lower().strip()
+    if ca_aux not in ("imu", "gaze"):
+        raise ValueError(f"ca_aux must be 'imu' or 'gaze', got {ca_aux!r}")
+
     base_model = base.build_model(device, max_frames, fps, img_size, checkpoint)
     for p in base_model.encoder.parameters():
         p.requires_grad = False
@@ -471,21 +511,29 @@ def build_concat_ca_model(
 
     embed_dim = int(base_model.embed_dim)
     grid_size = int(base_model.grid_size)
-    n_v, _n_g, n_i = compute_token_budgets(
-        grid_size * grid_size, gaze_grid_size=10, gaze_token_ratio=0.5, imu_token_ratio=0.1
+    gaze_grid_size = 10
+    n_v, n_g, n_i = compute_token_budgets(
+        grid_size * grid_size, gaze_grid_size=gaze_grid_size, gaze_token_ratio=0.5, imu_token_ratio=0.1
     )
+    # imu: RGB+gaze+pose → 5ch; gaze-only: RGB+gaze → 4ch
+    in_ch = int(adapter_in_channels) if adapter_in_channels is not None else (4 if ca_aux == "gaze" else 5)
     adapter = BinaryMapInputAdapter(
-        hidden_dim=8, scale=1.0, temporal_kernel=3, binary_center=0.0, residual_clamp=1.0, in_channels=5
+        hidden_dim=8, scale=1.0, temporal_kernel=3, binary_center=0.0, residual_clamp=1.0, in_channels=in_ch
     ).to(device)
-    _load_adapter_ckpt(adapter, adapter_ckpt)
+    if adapter_ckpt and Path(adapter_ckpt).is_file():
+        _load_adapter_ckpt(adapter, adapter_ckpt)
+    else:
+        logger.warning("No adapter ckpt at %s — training adapter from identity init", adapter_ckpt)
     for p in adapter.parameters():
         p.requires_grad = not freeze_adapter
 
+    use_gaze = ca_aux == "gaze"
+    use_imu = ca_aux == "imu"
     fusion_cfg = {
-        "use_gaze_branch": False,
-        "use_imu_branch": True,
+        "use_gaze_branch": use_gaze,
+        "use_imu_branch": use_imu,
         "keep_aux_tokens_in_predictor": True,
-        "gaze_grid_size": 10,
+        "gaze_grid_size": gaze_grid_size,
         "gaze_token_ratio": 0.5,
         "imu_token_ratio": 0.1,
         "imu_encoder_type": "gru",
@@ -508,8 +556,8 @@ def build_concat_ca_model(
         num_layers=int(fusion_num_layers),
         dropout=0.0,
         use_gated_residual=True,
-        use_gaze_branch=False,
-        use_imu_branch=True,
+        use_gaze_branch=use_gaze,
+        use_imu_branch=use_imu,
         gate_bias_init=-2.0,
         video_query_side=str(video_query_side),
         use_ffn=bool(use_ffn),
@@ -517,22 +565,38 @@ def build_concat_ca_model(
     ).to(device)
     if str(video_query_side).lower() == "aux":
         logger.info(
-            "video_query_side=aux: Q=IMU, KV=video, residual via attn^T writeback onto Z_v "
-            "(pretrained video←aux fusion weights are role-mismatched; prefer training fusion)"
+            "video_query_side=aux: Q=aux, KV=video, residual via attn^T writeback onto Z_v"
         )
     if use_ffn:
         logger.info("Fusion CA+FFN enabled (ffn_mult=%d, zero-init last Linear → identity start)", int(ffn_mult))
-    imu_encoder = ImuTemporalEncoder(
-        embed_dim=embed_dim,
-        input_dim=6,
-        hidden_dim=128,
-        num_imu_tokens=n_i,
-        encoder_type="gru",
-        num_layers=1,
-        dropout=0.1,
-    ).to(device)
+
+    imu_encoder = None
+    gaze_encoder = None
+    if use_imu:
+        imu_encoder = ImuTemporalEncoder(
+            embed_dim=embed_dim,
+            input_dim=6,
+            hidden_dim=128,
+            num_imu_tokens=n_i,
+            encoder_type="gru",
+            num_layers=1,
+            dropout=0.1,
+        ).to(device)
+    if use_gaze:
+        gaze_encoder = GazeSpatialEncoder(embed_dim=embed_dim, grid_size=gaze_grid_size).to(device)
+        logger.info(
+            "Ego4D/gaze CA: Q=video KV=gaze (n_gaze=%d); no IMU concat",
+            n_g,
+        )
+
     wrapped = ConcatPlusCrossAttnAdaptedModel(
-        base_model, input_adapter=adapter, fusion=fusion, imu_encoder=imu_encoder, fusion_cfg=fusion_cfg
+        base_model,
+        input_adapter=adapter,
+        fusion=fusion,
+        imu_encoder=imu_encoder,
+        gaze_encoder=gaze_encoder,
+        fusion_cfg=fusion_cfg,
+        ca_aux=ca_aux,
     )
     for p in wrapped.base_model.parameters():
         p.requires_grad = False
@@ -543,12 +607,18 @@ def build_concat_ca_model(
         set_predictor_lora_trainable(wrapped.base_model, trainable=True)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not re-enable predictor LoRA: %s", exc)
-    # Load fusion weights first, then freeze or leave trainable.
-    # Inverted Q/KV reuses projection roles differently than video←aux — keep
-    # IMU encoder warm-start, reinit fusion CA so residual is not frozen wrong.
+
     side = str(video_query_side).lower()
-    if Path(fusion_ckpt).is_file():
-        if side == "aux":
+    if fusion_ckpt and Path(fusion_ckpt).is_file():
+        if ca_aux == "gaze":
+            # IMU-trained fusion CA is role-mismatched for gaze KV — keep random
+            # gaze encoder + fusion init (adapter may still warm-start).
+            logger.info(
+                "ca_aux=gaze: skipping IMU fusion warm-start from %s "
+                "(gaze encoder + CA trained from scratch)",
+                fusion_ckpt,
+            )
+        elif side == "aux":
             payload = torch.load(fusion_ckpt, map_location="cpu", weights_only=False)
             if wrapped.imu_encoder is not None and "imu_encoder" in payload:
                 missing, unexpected = wrapped.imu_encoder.load_state_dict(
@@ -567,8 +637,10 @@ def build_concat_ca_model(
         else:
             load_tri_modal_fusion_checkpoint(wrapped, fusion_ckpt)
             logger.info("Loaded fusion from %s", fusion_ckpt)
+    elif fusion_ckpt:
+        logger.warning("fusion_ckpt missing (%s); fusion from scratch", fusion_ckpt)
+
     if train_gates_only:
-        # Freeze fusion/IMU, then re-enable only soft residual gates (B1).
         for module in (wrapped.fusion, wrapped.imu_encoder, wrapped.gaze_encoder):
             if module is None:
                 continue
@@ -580,12 +652,12 @@ def build_concat_ca_model(
                 if ".gate." in name or name.endswith(".gate.weight") or name.endswith(".gate.bias"):
                     p.requires_grad = True
                     n_gate += p.numel()
-        logger.info("train_gates_only: unlocked %d gate params; fusion/IMU otherwise frozen", n_gate)
+        logger.info("train_gates_only: unlocked %d gate params; fusion otherwise frozen", n_gate)
     else:
         for p in trainable_tri_modal_fusion_params(wrapped):
             p.requires_grad = not freeze_fusion
         if freeze_fusion:
-            logger.info("Froze fusion + IMU encoder params (use 43.92%% as fixed backbone)")
+            logger.info("Froze fusion + aux encoder params")
     if freeze_encoder_lora:
         try:
             from app.hdepic_lora_action_anticipation.encoder_lora import set_encoder_lora_trainable
@@ -601,7 +673,6 @@ def build_concat_ca_model(
         logger.info("Reset fusion gate bias to %.2f", float(reset_gate_bias))
 
     gp = int(grid_size**2)
-    # encoder_attn needs last-block importance hook; postfuse_recency scores fused tokens.
     pruner = None
     if prune_mode == "encoder_attn":
         pruner = base.TokenPruner(wrapped.base_model.encoder, keep_count=keep_count, gp=gp)
@@ -613,41 +684,23 @@ def build_concat_ca_model(
         prune_mode=prune_mode,
         recency_strength=recency_strength,
         recent_keep_sec=recent_keep_sec,
-        tubelet_sec=2.0 / float(max(1, fps)),  # tubelet_size=2 frames
+        tubelet_sec=2.0 / float(max(1, fps)),
         cap_total_to_keep=cap_total_to_keep,
         max_aux_tokens=max_aux_tokens,
     ).to(device)
     logger.info(
-        "ConcatCA stream model: adapter_train=%d fusion_train=%d pred_lora keep=%d "
-        "freeze_fusion=%s prune_mode=%s recency=%.2f recent_keep=%.2fs "
-        "cap_total_to_keep=%s max_aux_tokens=%d",
-        sum(p.numel() for p in adapter.parameters() if p.requires_grad),
-        sum(p.numel() for p in trainable_tri_modal_fusion_params(wrapped) if p.requires_grad),
-        keep_count,
-        freeze_fusion,
-        prune_mode,
-        recency_strength,
-        recent_keep_sec,
-        cap_total_to_keep,
-        max_aux_tokens,
-    )
-    n_pred = sum(p.numel() for p in wrapped.base_model.parameters() if p.requires_grad)
-    logger.info(
-        "Built concat+CA stream MTP: n_video_spatial=%d n_imu=%d keep=%d adapter_train=%d "
-        "fusion_train=%d pred_lora_train=%d freeze_fusion=%s prune_mode=%s recency=%.2f "
-        "recent_keep=%.2fs cap_total=%s max_aux=%d",
+        "ConcatCA stream: ca_aux=%s adapter_ch=%d n_v=%d n_g=%d n_i=%d keep=%d "
+        "adapter_train=%d fusion_train=%d freeze_fusion=%s prune_mode=%s",
+        ca_aux,
+        in_ch,
         n_v,
-        n_i,
+        n_g if use_gaze else 0,
+        n_i if use_imu else 0,
         keep_count,
         sum(p.numel() for p in adapter.parameters() if p.requires_grad),
         sum(p.numel() for p in trainable_tri_modal_fusion_params(wrapped) if p.requires_grad),
-        n_pred,
         freeze_fusion,
         prune_mode,
-        recency_strength,
-        recent_keep_sec,
-        cap_total_to_keep,
-        max_aux_tokens,
     )
     return model
 
@@ -861,13 +914,41 @@ def main():
     ap.add_argument("--encoder-lora", type=Path, required=True)
     ap.add_argument("--predictor-lora", type=Path, required=True)
     ap.add_argument("--adapter-ckpt", type=Path, required=True)
-    ap.add_argument("--fusion-ckpt", type=Path, required=True)
+    ap.add_argument(
+        "--fusion-ckpt",
+        type=Path,
+        default="",
+        help="Optional. For ca_aux=imu, warm-start IMU fusion; for ca_aux=gaze, ignored (from scratch).",
+    )
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--gaze-root", type=str, required=True)
     ap.add_argument("--gaze-extract-root", type=str, required=True)
-    ap.add_argument("--gaze-sync-root", type=str, required=True)
-    ap.add_argument("--pose-slam-root", type=str, required=True)
-    ap.add_argument("--pose-mapping-json", type=str, required=True)
+    ap.add_argument("--gaze-sync-root", type=str, default="", help="Optional sync root (HD-EPIC).")
+    ap.add_argument(
+        "--pose-slam-root",
+        type=str,
+        default="",
+        help="Required for ca_aux=imu; unused for ca_aux=gaze (Ego4D).",
+    )
+    ap.add_argument(
+        "--pose-mapping-json",
+        type=str,
+        default="",
+        help="Required for ca_aux=imu; unused for ca_aux=gaze (Ego4D).",
+    )
+    ap.add_argument(
+        "--ca-aux",
+        type=str,
+        default="imu",
+        choices=("imu", "gaze"),
+        help="Late CA KV modality: imu=HD-EPIC (default); gaze=Ego4D (KV=gaze, no IMU concat).",
+    )
+    ap.add_argument(
+        "--adapter-in-channels",
+        type=int,
+        default=0,
+        help="BinaryMapInputAdapter in_channels (0=auto: 5 for imu, 4 for gaze).",
+    )
     ap.add_argument("--horizons-sec", type=str, default="2,4,6")
     ap.add_argument("--loss-weights", type=str, default="1.0,0.7,0.5")
     ap.add_argument("--primary-horizon-sec", type=float, default=2.0)
@@ -999,6 +1080,16 @@ def main():
     weights = [float(x) for x in args.loss_weights.split(",")]
     primary_h = float(args.primary_horizon_sec)
     primary_idx = horizons.index(primary_h) if primary_h in horizons else 0
+    ca_aux = str(args.ca_aux).lower().strip()
+
+    if ca_aux == "imu":
+        for name, val in (
+            ("--gaze-sync-root", args.gaze_sync_root),
+            ("--pose-slam-root", args.pose_slam_root),
+            ("--pose-mapping-json", args.pose_mapping_json),
+        ):
+            if not val:
+                raise SystemExit(f"{name} is required when --ca-aux=imu")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     done_flag = args.out_dir / "TRAINING_DONE"
@@ -1009,11 +1100,16 @@ def main():
     gaze_cfg = default_gaze_cfg(
         args.gaze_root,
         args.gaze_extract_root,
-        args.gaze_sync_root,
-        args.pose_slam_root,
-        args.pose_mapping_json,
+        args.gaze_sync_root or args.gaze_root,
+        args.pose_slam_root or args.gaze_root,
+        args.pose_mapping_json or "",
         args.img_size,
     )
+    if ca_aux == "gaze":
+        # Disable pose/IMU side for Ego4D-style gaze-only runs.
+        gaze_cfg["pose"] = {**dict(gaze_cfg.get("pose") or {}), "enabled": False}
+        gaze_cfg.setdefault("pose_map", {})["force_zero_pose"] = True
+        logger.info("ca_aux=gaze: Ego4D-style — late CA KV=gaze only (no IMU concat)")
 
     verb_map, noun_map, action_map = base.load_action_maps(args.train_csv)
     logger.info("vocab verbs=%d nouns=%d actions=%d", len(verb_map), len(noun_map), len(action_map))
@@ -1024,10 +1120,20 @@ def main():
         logger.info("Stream-tick cache: %s", tick_cache)
 
     train_ds = StreamMTPConcatCADataset(
-        args.train_csv, args.video_root, args.img_size, gaze_cfg, tick_cache_dir=tick_cache
+        args.train_csv,
+        args.video_root,
+        args.img_size,
+        gaze_cfg,
+        tick_cache_dir=tick_cache,
+        ca_aux=ca_aux,
     )
     val_ds = StreamMTPConcatCADataset(
-        args.val_csv, args.video_root, args.img_size, gaze_cfg, tick_cache_dir=tick_cache
+        args.val_csv,
+        args.video_root,
+        args.img_size,
+        gaze_cfg,
+        tick_cache_dir=tick_cache,
+        ca_aux=ca_aux,
     )
 
     bs_by_frames: dict[int, int] = {}
@@ -1070,12 +1176,12 @@ def main():
         str(args.encoder_lora),
         str(args.predictor_lora),
         str(args.adapter_ckpt),
-        str(args.fusion_ckpt),
+        str(args.fusion_ckpt) if args.fusion_ckpt else "",
         args.keep_count,
         freeze_adapter=bool(args.freeze_adapter),
         freeze_fusion=bool(args.freeze_fusion),
         train_gates_only=bool(args.train_gates_only),
-        reset_gate_bias=None,  # keep learned gate from 43.92%
+        reset_gate_bias=None,  # keep learned gate from 43.92% when imu warm-start
         prune_mode=str(args.prune_mode),
         recency_strength=float(args.recency_strength),
         recent_keep_sec=float(args.recent_keep_sec),
@@ -1084,6 +1190,8 @@ def main():
         video_query_side=str(args.video_query_side),
         use_ffn=bool(args.use_ffn),
         ffn_mult=int(args.ffn_mult),
+        ca_aux=ca_aux,
+        adapter_in_channels=(int(args.adapter_in_channels) if int(args.adapter_in_channels) > 0 else None),
     )
     base_enc = model.concat_ca.base_model
     classifier = AttentiveClassifier(
