@@ -1,0 +1,176 @@
+{
+  "stream_profile": {
+    "csv": "/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/stream_half_split/HD_EPIC_val_stream_mtp.csv",
+    "videos_profiled": 27,
+    "pairs": 4423,
+    "config": {
+      "gp": 256,
+      "keep": 4096,
+      "tokens_per_model_frame_est": 128,
+      "recent_keep_sec": 2.0,
+      "tubelet_sec": 0.5
+    },
+    "temporal_cache_opportunity": {
+      "frame_level_hit_rate": {
+        "mean": 0.3523146054713996,
+        "std": 0.02100325640636203,
+        "n": 4423,
+        "p50": 0.35
+      },
+      "tubelet_bucket_hit_rate": {
+        "mean": 0.8069165738261772,
+        "std": 0.010405907046285006,
+        "n": 4423,
+        "p50": 0.8095238095238095
+      },
+      "new_frame_fraction": {
+        "mean": 0.6476853945286005,
+        "std": 0.021003256406362032,
+        "n": 4423,
+        "p50": 0.65
+      },
+      "dropped_frame_fraction_prev": {
+        "mean": 0.6447094732082298,
+        "std": 0.040184013342940215,
+        "n": 4423,
+        "p50": 0.65
+      },
+      "by_phase_frame_hit": {
+        "grow": {
+          "mean": 0.476388888888889,
+          "std": 0.09168770802277224,
+          "n": 81,
+          "p50": 0.5
+        },
+        "slide": {
+          "mean": 0.3500000000000001,
+          "std": 1.1102230246251565e-16,
+          "n": 4342,
+          "p50": 0.35
+        }
+      },
+      "encoder_flop_save_upper_bound": {
+        "if_temporal_encoder_cache_mean_save": 0.3523146054713996,
+        "note": "Upper bound if encoder activations for overlapping frames are reusable bit-exact."
+      }
+    },
+    "prune_stability_jaccard_abs_keys": {
+      "recency_only": {
+        "mean": 0.5951164368075966,
+        "std": 0.03575520002069669,
+        "n": 4423,
+        "p50": 0.6
+      },
+      "recency_plus_hard_recent": {
+        "mean": 0.5951164368075966,
+        "std": 0.03575520002069669,
+        "n": 4423,
+        "p50": 0.6
+      },
+      "postfuse_like_plus_hard": {
+        "mean": 0.21277021992685613,
+        "std": 0.061666792341365705,
+        "n": 4423,
+        "p50": 0.20879445182234027
+      },
+      "random": {
+        "mean": 0.22204485675531693,
+        "std": 0.024038629459173223,
+        "n": 4423,
+        "p50": 0.21959207979752865
+      },
+      "hard_reserve_fraction_of_K": {
+        "mean": 0.2545505617977528,
+        "std": 0.05824271401333766,
+        "n": 4450,
+        "p50": 0.25
+      }
+    },
+    "context_distribution": {
+      "unique_context_sec": [
+        4.0,
+        6.0,
+        8.0,
+        10.0
+      ],
+      "mean_n_model_frames_proxy": {
+        "mean": 79.41752808988764,
+        "std": 4.626699088060315,
+        "n": 4450,
+        "p50": 80.0
+      }
+    },
+    "per_video_head": [
+      {
+        "video_id": "P01_20240202-110250",
+        "n_ticks": 95,
+        "mean_frame_hit": 0.3540336879432625,
+        "mean_tubelet_hit": 0.8078000430941609
+      },
+      {
+        "video_id": "P01_20240202-161354",
+        "n_ticks": 77,
+        "mean_frame_hit": 0.3549890350877194,
+        "mean_tubelet_hit": 0.8073917826239807
+      },
+      {
+        "video_id": "P01_20240202-161948",
+        "n_ticks": 188,
+        "mean_frame_hit": 0.35202762923351166,
+        "mean_tubelet_hit": 0.8086573173078365
+      },
+      {
+        "video_id": "P01_20240202-171220",
+        "n_ticks": 124,
+        "mean_frame_hit": 0.3530826558265583,
+        "mean_tubelet_hit": 0.7985094850948511
+      },
+      {
+        "video_id": "P01_20240202-175627",
+        "n_ticks": 46,
+        "mean_frame_hit": 0.3584259259259259,
+        "mean_tubelet_hit": 0.8059230529818766
+      },
+      {
+        "video_id": "P01_20240202-195538",
+        "n_ticks": 130,
+        "mean_frame_hit": 0.35293927648578816,
+        "mean_tubelet_hit": 0.8082677316603444
+      },
+      {
+        "video_id": "P01_20240203-093333",
+        "n_ticks": 31,
+        "mean_frame_hit": 0.3626388888888888,
+        "mean_tubelet_hit": 0.8041226747109103
+      },
+      {
+        "video_id": "P01_20240203-121517",
+        "n_ticks": 114,
+        "mean_frame_hit": 0.3533554572271386,
+        "mean_tubelet_hit": 0.8080898799274647
+      },
+      {
+        "video_id": "P01_20240203-123350",
+        "n_ticks": 434,
+        "mean_frame_hit": 0.3508756735950731,
+        "mean_tubelet_hit": 0.8091495969501676
+      },
+      {
+        "video_id": "P01_20240203-130505",
+        "n_ticks": 203,
+        "mean_frame_hit": 0.35187706270627067,
+        "mean_tubelet_hit": 0.8087216607892206
+      }
+    ]
+  },
+  "tick_disk_cache": {
+    "exists": true,
+    "path": "/scratch/ll5914/datasets/HD-EPIC/caches/stream_mtp_concat_ca_ticks_256",
+    "n_cache_files": 8992,
+    "avg_file_bytes_sample200": 36522083.2,
+    "csv_rows_checked": 4450,
+    "exact_key_hit_rate_csv_subset": 1.0,
+    "consecutive_ticks_identical_key_rate": 0.0,
+    "interpretation": "Exact frame-list tick cache helps *epoch replay* (re-hit same tick), NOT temporal incremental encode across consecutive ticks (keys change every tick \u2192 consecutive identity ~0)."
+  }
+}
