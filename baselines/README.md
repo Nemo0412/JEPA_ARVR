@@ -201,7 +201,9 @@ Primary metric: **val action Top-5 @ +2s** (unless noted). Paths under `/scratch
 - Enc-LoRA FT: `submit_qwen_style_enc_lora_ft.slurm` → `p01_stream_qwen_style_enc_lora_ft_2_4_6/` (ViT-L frozen, LoRA trainable @1e-5)
 
 #### 7) RU-LSTM / vit_tiny (capacity baselines)
-- RU-LSTM (`rulstm_hdepic_p01_stream/`): action@2s **6.58 / 19.28** (t1/t5)
+- RU-LSTM TSN (`rulstm_hdepic_p01_stream/`): action@2s **6.58 / 19.28** (t1/t5)
+- Param-matched on **same TSN feats**: v2 wide LSTM **17.71** (worse); v3 baseline+zero residual **19.28** floor (no gain) — capacity ≠ accuracy when features are the bottleneck. See [`rulstm_hdepic/ALIGNMENT_VITL.md`](rulstm_hdepic/ALIGNMENT_VITL.md)
+- Stronger features (in flight): `submit_rulstm_vjepa_vitl_feat.slurm` → ViT-L (+enc LoRA) feats + original ~18M RU-LSTM
 - vit_tiny (`p01_stream_mtp_tiny18m_2_4_6/`): best reliable **5.91 / 18.77** @ep6 (does not beat RU on action@2s)
 
 ### Horizon table (best checkpoint each, action Top-5 %)
@@ -222,6 +224,8 @@ Primary metric: **val action Top-5 @ +2s** (unless noted). Paths under `/scratch
 
 ```bash
 sbatch baselines/rulstm_hdepic/submit_rulstm_p01_stream.slurm
+sbatch baselines/rulstm_hdepic/submit_rulstm_vitl_aligned_v3_residual.slurm
+sbatch baselines/rulstm_hdepic/submit_rulstm_vjepa_vitl_feat.slurm
 sbatch baselines/aga_hdepic/submit_aga_p01_stream.slurm
 sbatch baselines/jepa_tiny_18m/submit_stream_tiny_18m.slurm
 sbatch baselines/qwen_vl_stream/submit_qwen_stream.slurm

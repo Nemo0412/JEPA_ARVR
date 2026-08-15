@@ -176,6 +176,107 @@ class StreamingRULSTM(nn.Module):
         return out
 
 
+def _zero_output_layers(model: StreamingRULSTM) -> None:
+    """Make a residual branch produce exactly zero logits at initialization."""
+    for head in (model.verb_clf, model.noun_clf, model.action_clf):
+        linear = next(layer for layer in reversed(head) if isinstance(layer, nn.Linear))
+        nn.init.zeros_(linear.weight)
+        nn.init.zeros_(linear.bias)
+
+
+class BaselineResidualRULSTM(nn.Module):
+    """A large RU-LSTM that exactly preserves a pretrained small RU-LSTM.
+
+    The frozen baseline supplies the initial logits. A parameter-matched branch
+    learns additive logit corrections and starts at exactly zero, so epoch 0 is
+    functionally identical to the baseline rather than an approximate
+    top-left weight transplant.
+    """
+
+    def __init__(self, baseline: StreamingRULSTM, residual: StreamingRULSTM):
+        super().__init__()
+        self.baseline = baseline
+        self.residual = residual
+        for parameter in self.baseline.parameters():
+            parameter.requires_grad_(False)
+        self.baseline.eval()
+        _zero_output_layers(self.residual)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # The frozen branch must retain the exact checkpoint behavior, including
+        # disabled dropout, while the residual branch is trained.
+        self.baseline.eval()
+        return self
+
+    def count_parameters(self) -> dict:
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return {
+            "total": int(total),
+            "trainable": int(trainable),
+            "total_m": total / 1e6,
+            "trainable_m": trainable / 1e6,
+        }
+
+    def forward(self, feats: torch.Tensor, lengths: torch.Tensor):
+        with torch.no_grad():
+            base_out = self.baseline(feats, lengths)
+        residual_out = self.residual(feats, lengths)
+        return {
+            horizon: {
+                task: base_out[horizon][task] + residual_out[horizon][task]
+                for task in ("verb", "noun", "action")
+            }
+            for horizon in self.baseline.horizons_sec
+        }
+
+
+def load_preserved_baseline(
+    checkpoint_path: Path,
+    *,
+    num_verb: int,
+    num_noun: int,
+    num_action: int,
+    feat_in: int,
+    alpha: float,
+    horizons_sec: tuple[float, ...],
+) -> StreamingRULSTM:
+    """Reconstruct and strictly load the original RU-LSTM checkpoint."""
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)["model"]
+    if any(key.startswith("baseline.") for key in state):
+        raise ValueError("--preserve-baseline-from must point to a normal RU-LSTM checkpoint")
+
+    hidden = int(state["unrolling_lstm.weight_hh_l0"].shape[1])
+    layer_ids = {
+        int(key.rsplit("_l", 1)[1].split(".", 1)[0])
+        for key in state
+        if key.startswith("unrolling_lstm.weight_ih_l")
+    }
+    depth = max(layer_ids) + 1
+    input_proj = any(key.startswith("input_proj.") for key in state)
+    mlp_head = "verb_clf.4.weight" in state
+    use_layernorm = "feat_norm.weight" in state
+
+    baseline = StreamingRULSTM(
+        num_verb=num_verb,
+        num_noun=num_noun,
+        num_action=num_action,
+        feat_in=feat_in,
+        hidden=hidden,
+        depth=depth,
+        dropout=0.8,
+        alpha=alpha,
+        horizons_sec=horizons_sec,
+        input_proj=input_proj,
+        mlp_head=mlp_head,
+        trunk_layers=0,
+        use_layernorm=use_layernorm,
+    )
+    baseline.load_state_dict(state, strict=True)
+    return baseline
+
+
 def build_vocab(csvs: list[Path]):
     verbs, nouns, actions = set(), set(), set()
     for p in csvs:
@@ -446,8 +547,16 @@ def main():
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--early-stop-patience", type=int, default=0, help="0=disabled")
     ap.add_argument("--init-from", type=Path, default=None, help="Warm-start overlapping weights")
+    ap.add_argument(
+        "--preserve-baseline-from",
+        type=Path,
+        default=None,
+        help="Frozen baseline checkpoint; train a zero-init additive residual RU-LSTM",
+    )
     ap.add_argument("--val-only", action="store_true")
     args = ap.parse_args()
+    if args.init_from is not None and args.preserve_baseline_from is not None:
+        ap.error("--init-from and --preserve-baseline-from are mutually exclusive")
 
     horizons = tuple(float(x) for x in args.horizons_sec.split(",") if x.strip())
     weights = [float(x) for x in args.loss_weights.split(",") if x.strip()]
@@ -469,6 +578,9 @@ def main():
         "mlp_head": bool(args.mlp_head),
         "trunk_layers": int(args.trunk_layers),
         "use_layernorm": not bool(args.no_layernorm),
+        "preserve_baseline_from": (
+            str(args.preserve_baseline_from) if args.preserve_baseline_from else None
+        ),
     }
     print(
         f"vocab: verbs={len(verb_map)} nouns={len(noun_map)} actions={len(action_map)}",
@@ -493,13 +605,32 @@ def main():
     )
 
     feat_in = int(train_ds[0]["feats"].shape[-1])
-    model = StreamingRULSTM(
+    residual = StreamingRULSTM(
         num_verb=len(verb_map), num_noun=len(noun_map), num_action=len(action_map),
         feat_in=feat_in, hidden=args.hidden, depth=args.depth, dropout=args.dropout,
         alpha=args.alpha, horizons_sec=horizons, input_proj=bool(args.input_proj),
         mlp_head=bool(args.mlp_head), trunk_layers=int(args.trunk_layers),
         use_layernorm=not bool(args.no_layernorm),
-    ).to(device)
+    )
+    if args.preserve_baseline_from is not None:
+        if not args.preserve_baseline_from.is_file():
+            raise FileNotFoundError(args.preserve_baseline_from)
+        baseline = load_preserved_baseline(
+            args.preserve_baseline_from,
+            num_verb=len(verb_map),
+            num_noun=len(noun_map),
+            num_action=len(action_map),
+            feat_in=feat_in,
+            alpha=args.alpha,
+            horizons_sec=horizons,
+        )
+        model = BaselineResidualRULSTM(baseline, residual).to(device)
+        print(
+            f"exact baseline-preserving init from {args.preserve_baseline_from}",
+            flush=True,
+        )
+    else:
+        model = residual.to(device)
 
     if args.init_from is not None and args.init_from.is_file():
         donor = torch.load(args.init_from, map_location="cpu", weights_only=False)["model"]
@@ -549,11 +680,17 @@ def main():
         (args.out_dir / "val_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
         return
 
+    trainable_parameters = [p for p in model.parameters() if p.requires_grad]
     if args.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        optimizer = torch.optim.AdamW(
+            trainable_parameters, lr=args.lr, weight_decay=args.weight_decay
+        )
     else:
         optimizer = torch.optim.SGD(
-            model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay,
+            trainable_parameters,
+            lr=args.lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
         )
 
     warmup = max(0, int(args.warmup_epochs))
@@ -574,6 +711,29 @@ def main():
     best = -1.0
     bad = 0
     history = []
+    if args.preserve_baseline_from is not None:
+        initial = run_epoch(
+            model, val_loader, device, horizons, weights, train=False, **epoch_kwargs
+        )
+        best = initial.get("action_top5@2s", 0.0)
+        history.append({"epoch": 0, "train": None, "val": initial})
+        initial_state = {
+            "model": model.state_dict(),
+            "epoch": 0,
+            "vocab": vocab,
+            "val": initial,
+        }
+        torch.save(initial_state, ckpt_best)
+        torch.save(initial_state, ckpt_last)
+        (args.out_dir / "history.json").write_text(
+            json.dumps(history, indent=2), encoding="utf-8"
+        )
+        print(
+            "\n=== epoch 0 exact preserved baseline ===\nVAL\n"
+            + format_metrics(initial, horizons)
+            + f"\n  saved baseline floor (action_top5@2s={best:.2f})",
+            flush=True,
+        )
     for epoch in range(1, args.epochs + 1):
         tr = run_epoch(
             model, train_loader, device, horizons, weights, optimizer, train=True,

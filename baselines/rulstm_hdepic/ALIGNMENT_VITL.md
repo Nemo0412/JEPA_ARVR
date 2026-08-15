@@ -49,6 +49,30 @@ sbatch /home/ll5914/Jepa_baseline/rulstm_hdepic/submit_rulstm_vitl_aligned_v2.sl
 
 Outputs: `/scratch/ll5914/experiments/rulstm_hdepic_p01_stream_vitl_aligned_v2/`
 
+## v3 baseline-preserving residual recipe
+
+The v2 top-left weight transplant did not preserve the original RU-LSTM
+function: its first validation result fell far below the 18M checkpoint. The
+v3 architecture fixes this by using:
+
+- a frozen, exactly loaded original RU-LSTM branch (~18.1M);
+- a trainable `hidden=3816, depth=1` residual RU-LSTM branch (~285.6M);
+- additive residual logits whose final layers are initialized to zero.
+
+Total capacity is ~303.7M. At epoch 0 the model is exactly the original
+RU-LSTM on validation data. Epoch 0 is saved as the checkpoint floor, and a
+later checkpoint replaces it only when action Top-5 @2s improves. This
+guarantees that the reported selected checkpoint cannot be worse than the
+original due to destructive initialization; it does not manufacture or cap an
+improvement.
+
+```bash
+sbatch /home/ll5914/Jepa_baseline/rulstm_hdepic/submit_rulstm_vitl_aligned_v3_residual.slurm
+```
+
+Outputs:
+`/scratch/ll5914/experiments/rulstm_hdepic_p01_stream_vitl_aligned_v3_residual/`
+
 ## FLOPs are NOT aligned (measured @ 10s context tick)
 
 Params ≈ matched, but compute is dominated by the **pixel ViT-L encoder**:
