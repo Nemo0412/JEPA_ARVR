@@ -312,6 +312,7 @@ class PrunedConcatCAStreamModel(nn.Module):
         tubelet_sec: float = 0.25,
         cap_total_to_keep: bool = False,
         max_aux_tokens: int = 0,
+        aux_tokens_per_slot: int = 1,
     ):
         super().__init__()
         self.concat_ca = concat_ca
@@ -325,8 +326,9 @@ class PrunedConcatCAStreamModel(nn.Module):
         self.tubelet_sec = float(tubelet_sec)
         # When True, video budget = keep - n_aux so total ≤ keep (matches video-only ≤4096).
         self.cap_total_to_keep = bool(cap_total_to_keep)
-        # If >0, keep only the last max_aux_tokens of the IMU prefix (recent aux).
+        # If >0, keep only the last max_aux_tokens of the auxiliary prefix.
         self.max_aux_tokens = int(max_aux_tokens)
+        self.aux_tokens_per_slot = max(1, int(aux_tokens_per_slot))
         self.embed_dim = concat_ca.embed_dim
         if self.prune_mode not in ("encoder_attn", "postfuse_recency"):
             raise ValueError(f"Unknown prune_mode={self.prune_mode!r}")
@@ -375,14 +377,24 @@ class PrunedConcatCAStreamModel(nn.Module):
         return imp
 
     def _trim_aux_prefix(self, x_pred: torch.Tensor, n_aux: int) -> tuple[torch.Tensor, int]:
-        """Optionally keep only the most recent IMU aux tokens (left-truncated)."""
-        if self.max_aux_tokens <= 0 or n_aux <= self.max_aux_tokens:
+        """Keep a bounded, recent, whole-slot auxiliary prefix.
+
+        ``cap_total_to_keep`` reserves at least one video spatial slot. This is
+        required for gaze-only Ego4D: gaze contributes 100 tokens per temporal
+        slot, so an unbounded 10 s prefix can nearly fill the predictor alone.
+        """
+        limit = n_aux
+        if self.max_aux_tokens > 0:
+            limit = min(limit, self.max_aux_tokens)
+        if self.cap_total_to_keep:
+            limit = min(limit, max(0, self.keep - self.gp))
+        if n_aux <= limit:
             return x_pred, n_aux
-        keep_n = min(n_aux, self.max_aux_tokens)
-        # Align to spatial gp for consistent tubelet blocks when possible.
-        gp = max(1, self.gp)
-        if keep_n >= gp:
-            keep_n = (keep_n // gp) * gp or keep_n
+        keep_n = max(0, limit)
+        # Preserve complete temporal slots for either gaze (e.g. 100/slot) or
+        # IMU (e.g. 26/slot); video gp=256 is not the correct aux alignment.
+        if keep_n >= self.aux_tokens_per_slot:
+            keep_n = (keep_n // self.aux_tokens_per_slot) * self.aux_tokens_per_slot
         aux = x_pred[:, n_aux - keep_n : n_aux]
         video = x_pred[:, n_aux:]
         return torch.cat([aux, video], dim=1), keep_n
@@ -393,7 +405,7 @@ class PrunedConcatCAStreamModel(nn.Module):
         video_budget = self.keep
         if self.cap_total_to_keep and n_aux > 0:
             # Match video-only total context length (predictor saw ≤keep on video MTP).
-            video_budget = max(self.gp, self.keep - n_aux)
+            video_budget = max(0, self.keep - n_aux)
         if N <= video_budget:
             return x_pred
         gp = self.gp if self.pruner is None else self.pruner.gp
@@ -468,6 +480,11 @@ class PrunedConcatCAStreamModel(nn.Module):
         video_budget = self.keep - n_aux if (self.cap_total_to_keep and n_aux > 0) else self.keep
         if video_n > max(0, video_budget):
             x_pred = self._prune_video_suffix(x_pred, n_aux)
+        if self.cap_total_to_keep and x_pred.size(1) > self.keep:
+            raise RuntimeError(
+                f"Predictor token cap violated: total={x_pred.size(1)} > keep={self.keep} "
+                f"(aux={n_aux}, video={x_pred.size(1) - n_aux}, ca_aux={ca_aux})"
+            )
 
         return tri._forward_single_step(base_m, x_pred, x_accumulate, anticipation_times)
 
@@ -687,6 +704,7 @@ def build_concat_ca_model(
         tubelet_sec=2.0 / float(max(1, fps)),
         cap_total_to_keep=cap_total_to_keep,
         max_aux_tokens=max_aux_tokens,
+        aux_tokens_per_slot=n_g if use_gaze else n_i,
     ).to(device)
     logger.info(
         "ConcatCA stream: ca_aux=%s adapter_ch=%d n_v=%d n_g=%d n_i=%d keep=%d "
@@ -1056,7 +1074,7 @@ def main():
         "--max-aux-tokens",
         type=int,
         default=0,
-        help="If >0, keep only the last N IMU aux prefix tokens before pruning video (0=all).",
+        help="If >0, keep only the last N gaze/IMU prefix tokens before pruning video (0=auto/all).",
     )
     ap.add_argument(
         "--video-query-side",
@@ -1081,6 +1099,25 @@ def main():
     primary_h = float(args.primary_horizon_sec)
     primary_idx = horizons.index(primary_h) if primary_h in horizons else 0
     ca_aux = str(args.ca_aux).lower().strip()
+
+    if ca_aux == "gaze":
+        # Safety default for Ego4D gaze-only CA. At the default 10 s context,
+        # 40 tubelet slots × 100 gaze tokens = 4000 auxiliary tokens; keeping
+        # those plus 4096 video tokens can exceed the predictor position range.
+        if not args.cap_total_to_keep:
+            logger.warning(
+                "ca_aux=gaze requires a bounded predictor context; enabling "
+                "--cap-total-to-keep automatically"
+            )
+            args.cap_total_to_keep = True
+        if args.max_aux_tokens <= 0:
+            gaze_tokens_per_slot = 10 * 10
+            recent_aux_slots = max(1, int(round(4.0 * args.fps / 2.0)))
+            args.max_aux_tokens = gaze_tokens_per_slot * recent_aux_slots
+            logger.info(
+                "ca_aux=gaze: auto max_aux_tokens=%d (most recent 4 s)",
+                args.max_aux_tokens,
+            )
 
     if ca_aux == "imu":
         for name, val in (

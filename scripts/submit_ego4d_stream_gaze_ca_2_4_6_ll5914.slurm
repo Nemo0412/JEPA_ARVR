@@ -46,6 +46,11 @@ PREDICTOR_LORA="${PREDICTOR_LORA:-${VIDEO_BEST_DIR}/predictor_lora_best.pt}"
 # Gaze-only adapter (4ch). Prefer an Ego4D/EGTEA gaze adapter if present; else identity init.
 ADAPTER_CKPT="${ADAPTER_CKPT:-}"
 FUSION_CKPT="${FUSION_CKPT:-}"  # ignored for ca_aux=gaze (trained from scratch)
+ADAPTER_CKPT_ARG="${ADAPTER_CKPT}"
+if [[ -z "${ADAPTER_CKPT_ARG}" || ! -f "${ADAPTER_CKPT_ARG}" ]]; then
+  # Must be nonexistent: /dev/null is a file and would be passed to torch.load.
+  ADAPTER_CKPT_ARG="/tmp/ego4d_no_adapter_checkpoint.pt"
+fi
 
 OUT_DIR="${OUT_DIR:-/scratch/ll5914/experiments/ego4d_stream_gaze_ca_2_4_6}"
 DONE_FLAG="${OUT_DIR}/TRAINING_DONE"
@@ -103,7 +108,7 @@ ARGS=(
   --checkpoint "${CHECKPOINT}"
   --encoder-lora "${ENCODER_LORA}"
   --predictor-lora "${PREDICTOR_LORA}"
-  --adapter-ckpt "${ADAPTER_CKPT:-/dev/null}"
+  --adapter-ckpt "${ADAPTER_CKPT_ARG}"
   --out-dir "${OUT_DIR}"
   --gaze-root "${GAZE_ROOT}"
   --gaze-extract-root "${GAZE_EXTRACT_ROOT}"
@@ -116,6 +121,11 @@ ARGS=(
   --fps 8
   --img-size 256
   --keep-count 4096
+  # Gaze contributes 100 tokens/tubelet slot. Keep the most recent 16 slots
+  # (4 s at 8 fps, tubelet=2) and reserve the rest of the 4096-token predictor
+  # budget for video. Without this, 10 s gives 4000 gaze + 4096 video tokens.
+  --cap-total-to-keep
+  --max-aux-tokens 1600
   --prune-mode postfuse_recency
   --batch-size 1
   --num-workers 4
@@ -125,13 +135,6 @@ ARGS=(
   --adapter-lr-mult 0.25
   --save-every 200
 )
-
-if [[ -n "${ADAPTER_CKPT}" && -f "${ADAPTER_CKPT}" ]]; then
-  :
-else
-  # Placeholder path → build_concat_ca_model identity-inits adapter.
-  ARGS=( "${ARGS[@]/ --adapter-ckpt "/tmp/no_adapter.pt" )
-fi
 
 if [[ "${VAL_ONLY}" == "1" ]]; then
   [[ -f "${OUT_DIR}/best.pt" ]] && ARGS+=(--init-from-ckpt "${OUT_DIR}/best.pt")

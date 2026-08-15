@@ -15,6 +15,9 @@ from app.hdepic_lora_action_anticipation.binary_input_adapter import BinaryMapIn
 from app.hdepic_lora_action_anticipation.concat_plus_cross_attn import (  # noqa: E402
     ConcatPlusCrossAttnAdaptedModel,
 )
+from app.hdepic_lora_action_anticipation.train_stream_mtp_concat_ca import (  # noqa: E402
+    PrunedConcatCAStreamModel,
+)
 from app.hdepic_lora_action_anticipation.tri_modal_fusion import (  # noqa: E402
     GazeSpatialEncoder,
     ProjectedTriModalCrossAttention,
@@ -112,9 +115,32 @@ def main():
     assert model.imu_encoder is None
     assert model.gaze_encoder is not None
     assert model.fusion.use_gaze_branch and not model.fusion.use_imu_branch
+
+    # Regression: a 10 s Ego4D window has 40 slots × 100 gaze tokens = 4000
+    # aux tokens. Ensure gaze (not just IMU) is capped before the predictor.
+    bounded = PrunedConcatCAStreamModel(
+        model,
+        pruner=None,
+        keep=4096,
+        gp=256,
+        prune_mode="postfuse_recency",
+        recent_keep_sec=100.0,  # avoid score computation in this shape-only smoke
+        tubelet_sec=0.25,
+        cap_total_to_keep=True,
+        max_aux_tokens=1600,
+        aux_tokens_per_slot=n_g,
+    )
+    n_aux_full, n_video_full = 40 * n_g, 40 * n_v
+    token_ids = torch.arange(n_aux_full + n_video_full).view(1, -1, 1).float()
+    trimmed, n_aux = bounded._trim_aux_prefix(token_ids, n_aux_full)
+    assert n_aux == 1600 and n_aux % n_g == 0
+    assert int(trimmed[0, 0, 0]) == n_aux_full - n_aux, "must retain most recent gaze tokens"
+    predictor_input = bounded._prune_video_suffix(trimmed, n_aux)
+    assert predictor_input.size(1) <= 4096
+    assert predictor_input.size(1) - n_aux >= 256, "must reserve at least one video slot"
     print(
         f"PASS gaze-only CA: out={tuple(out.shape)} n_v_spatial={n_v} n_gaze={n_g} "
-        f"ca_aux={model.ca_aux}"
+        f"ca_aux={model.ca_aux} bounded_predictor_tokens={predictor_input.size(1)}"
     )
 
 
