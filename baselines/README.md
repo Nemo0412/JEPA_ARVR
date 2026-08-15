@@ -46,7 +46,7 @@ Long context is handled by **sliding window + token prune / frame subsample**, n
 | 5a | **Encoder-heavy** | Pretrained ViT-L, **last 2 blocks** trainable | **None** (pool encoder tokens) | prune ≤4096 | No | ~25M enc blocks + MTP | `p01_stream_encoder_heavy_2_4_6` |
 | 5b | **Decoder-heavy** | Frozen ViT-L (**no** enc LoRA) | Same cross-attn decoder as Exp A | prune ≤4096 | No | ~29M decoder + MTP | `p01_stream_decoder_heavy_2_4_6` |
 | 6 | **Qwen2-VL-2B probe** | Qwen ViT (~675M) | Qwen **LLM decoder** (~1.5B) + LoRA | **~8 frames** subsample | (HF gen path; probe uses full forward) | LoRA~9M + heads | `p01_stream_qwen2vl2b_2_4_6` |
-| — | RU-LSTM / vit_tiny | (separate capacity baselines) | LSTM / tiny JEPA | feature / tiny tokens | — | ~18–20M | see Progress |
+| — | RU-LSTM / AGA / vit_tiny | TSN-RGB or tiny JEPA | LSTM / AGA unroll / tiny JEPA | feature / 1s step / tiny tokens | — | ~18–24M | see Progress |
 
 ### Module graphs (params)
 
@@ -134,6 +134,8 @@ flowchart TB
 |------|------|
 | [`rulstm/`](rulstm/) | Upstream [RU-LSTM](https://github.com/fpv-iplab/rulstm) (vendor) |
 | [`rulstm_hdepic/`](rulstm_hdepic/) | Streaming RU-LSTM on HD-EPIC P01 |
+| [`AGA/`](AGA/) | Upstream [AGA](https://github.com/CorcovadoMing/AGA) (vendor) |
+| [`aga_hdepic/`](aga_hdepic/) | Streaming AGA on HD-EPIC P01 (+2/+4/+6s) |
 | [`jepa_tiny_18m/`](jepa_tiny_18m/) | From-scratch V-JEPA `vit_tiny` ≈18–20M vs RU-LSTM |
 | [`qwen_vl_stream/`](qwen_vl_stream/) | Qwen2-VL-2B LoRA probe (official smallest Qwen-VL) |
 | [`jepa_causal_decoder/`](jepa_causal_decoder/) | **Exp A:** causal decoder on frozen ViT-L latents (vs JEPA predictor); see README for predictor vs CA-decoder (KV-cache note) |
@@ -220,6 +222,7 @@ Primary metric: **val action Top-5 @ +2s** (unless noted). Paths under `/scratch
 
 ```bash
 sbatch baselines/rulstm_hdepic/submit_rulstm_p01_stream.slurm
+sbatch baselines/aga_hdepic/submit_aga_p01_stream.slurm
 sbatch baselines/jepa_tiny_18m/submit_stream_tiny_18m.slurm
 sbatch baselines/qwen_vl_stream/submit_qwen_stream.slurm
 sbatch baselines/jepa_causal_decoder/submit_causal_decoder_stream.slurm
@@ -234,6 +237,6 @@ Absolute paths in `.slurm` / scripts point at NYU Torch scratch; edit for other 
 
 ## GitHub notes
 
-- Nested vendor `.git` dirs under `rulstm/` and `vlesa/` are **not** pushed
+- Nested vendor `.git` dirs under `rulstm/`, `vlesa/`, and `AGA/` are **not** pushed
   (copied as plain trees). Prefer submodules later if needed.
 - Checkpoints / experiment dumps are gitignored; results live on scratch.

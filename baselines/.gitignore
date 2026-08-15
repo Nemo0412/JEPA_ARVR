@@ -10,6 +10,7 @@ venv/
 # Vendored nested repos
 rulstm/.git/
 vlesa/.git/
+AGA/.git/
 
 # Checkpoints / heavy artifacts
 *.pt
