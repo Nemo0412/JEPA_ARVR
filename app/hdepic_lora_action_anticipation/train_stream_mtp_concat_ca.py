@@ -923,6 +923,28 @@ def default_gaze_cfg(
     }
 
 
+def require_egtea_gaze_coverage(path: Path) -> dict[str, list[dict]]:
+    """Validate the one approved EGTEA OOB fallback manifest."""
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    fallback = dict(payload.get("center_fallback") or {})
+    approved_rows = {
+        str(session): list(rows) for session, rows in dict(fallback.get("sessions") or {}).items()
+    }
+    if (
+        fallback.get("policy") != "user_approved_existing_egtea_fixed_clip_center_0.5"
+        or fallback.get("xy_norm") != [0.5, 0.5]
+        or fallback.get("split") != "val"
+        or int(fallback.get("rows", -1)) != 171
+        or sum(len(rows) for rows in approved_rows.values()) != 171
+    ):
+        raise RuntimeError(f"Invalid B13 approved center-fallback manifest: {path}")
+    for split, expected_oob in (("train", 0), ("val", 171)):
+        if int(payload.get("splits", {}).get(split, {}).get("rows_gaze_timeline_oob", -1)) != expected_oob:
+            raise RuntimeError(f"EGTEA gaze coverage gate failed for {split}: {path}")
+    logger.warning("B13 EGTEA gaze gate: approved center fallback rows=171")
+    return approved_rows
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--train-csv", type=Path, required=True)
@@ -941,6 +963,14 @@ def main():
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--gaze-root", type=str, required=True)
     ap.add_argument("--gaze-extract-root", type=str, required=True)
+    ap.add_argument("--gaze-format", choices=("aria", "egtea"), default="aria")
+    ap.add_argument("--egtea-gaze-dir", type=str, default="")
+    ap.add_argument(
+        "--gaze-coverage-json",
+        type=Path,
+        default=None,
+        help="Required for --gaze-format=egtea; frozen B13 coverage manifest.",
+    )
     ap.add_argument("--gaze-sync-root", type=str, default="", help="Optional sync root (HD-EPIC).")
     ap.add_argument(
         "--pose-slam-root",
@@ -1147,6 +1177,19 @@ def main():
         gaze_cfg["pose"] = {**dict(gaze_cfg.get("pose") or {}), "enabled": False}
         gaze_cfg.setdefault("pose_map", {})["force_zero_pose"] = True
         logger.info("ca_aux=gaze: Ego4D-style — late CA KV=gaze only (no IMU concat)")
+    if args.gaze_format == "egtea":
+        if ca_aux != "gaze" or not args.egtea_gaze_dir or args.gaze_coverage_json is None:
+            raise SystemExit(
+                "EGTEA gaze requires --ca-aux gaze, --egtea-gaze-dir, and --gaze-coverage-json"
+            )
+        approved_rows = require_egtea_gaze_coverage(args.gaze_coverage_json)
+        gaze_cfg.update(
+            {
+                "gaze_format": "egtea",
+                "egtea_gaze_dir": args.egtea_gaze_dir,
+                "egtea_center_fallback_rows": approved_rows,
+            }
+        )
 
     verb_map, noun_map, action_map = base.load_action_maps(args.train_csv)
     logger.info("vocab verbs=%d nouns=%d actions=%d", len(verb_map), len(noun_map), len(action_map))

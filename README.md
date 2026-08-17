@@ -1,5 +1,9 @@
 # JEPA_ARVR
 
+> **EGTEA streaming handoff:** agents working on the shared EGTEA
+> Vanilla/+gaze/RU-LSTM experiments must read
+> [`docs/EGTEA_AGENT_HANDOFF.md`](docs/EGTEA_AGENT_HANDOFF.md) first.
+
 V-JEPA2 action anticipation experiments on **EGTEA** and **HD-EPIC (P01)**, with optional gaze / SLAM-pose inputs and encoder/predictor LoRA fine-tuning.
 
 Upstream backbone lives in the `vjepa2` submodule / external V-JEPA2 tree. Project-local training entrypoint:

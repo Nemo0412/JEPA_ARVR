@@ -1,0 +1,1260 @@
+{
+  "center_fallback": {
+    "policy": "user_approved_existing_egtea_fixed_clip_center_0.5",
+    "rows": 171,
+    "sessions": {
+      "OP01-R06-GreekSalad": [
+        {
+          "context_sec": 10,
+          "last_frame": 16963,
+          "line": 1104,
+          "start_frame": 16724,
+          "tick_frame": 16964
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 17011,
+          "line": 1105,
+          "start_frame": 16772,
+          "tick_frame": 17012
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 17059,
+          "line": 1106,
+          "start_frame": 16820,
+          "tick_frame": 17060
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 17107,
+          "line": 1107,
+          "start_frame": 16868,
+          "tick_frame": 17108
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 17155,
+          "line": 1108,
+          "start_frame": 16916,
+          "tick_frame": 17156
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 17203,
+          "line": 1109,
+          "start_frame": 16964,
+          "tick_frame": 17204
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 17251,
+          "line": 1110,
+          "start_frame": 17012,
+          "tick_frame": 17252
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 17299,
+          "line": 1111,
+          "start_frame": 17060,
+          "tick_frame": 17300
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 17347,
+          "line": 1112,
+          "start_frame": 17108,
+          "tick_frame": 17348
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 17395,
+          "line": 1113,
+          "start_frame": 17156,
+          "tick_frame": 17396
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 17443,
+          "line": 1114,
+          "start_frame": 17204,
+          "tick_frame": 17444
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 17491,
+          "line": 1115,
+          "start_frame": 17252,
+          "tick_frame": 17492
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 17539,
+          "line": 1116,
+          "start_frame": 17300,
+          "tick_frame": 17540
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 17587,
+          "line": 1117,
+          "start_frame": 17348,
+          "tick_frame": 17588
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 17635,
+          "line": 1118,
+          "start_frame": 17396,
+          "tick_frame": 17636
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 17683,
+          "line": 1119,
+          "start_frame": 17444,
+          "tick_frame": 17684
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 17731,
+          "line": 1120,
+          "start_frame": 17492,
+          "tick_frame": 17732
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 17779,
+          "line": 1121,
+          "start_frame": 17540,
+          "tick_frame": 17780
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 17827,
+          "line": 1122,
+          "start_frame": 17588,
+          "tick_frame": 17828
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 17875,
+          "line": 1123,
+          "start_frame": 17636,
+          "tick_frame": 17876
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 17923,
+          "line": 1124,
+          "start_frame": 17684,
+          "tick_frame": 17924
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 17971,
+          "line": 1125,
+          "start_frame": 17732,
+          "tick_frame": 17972
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18019,
+          "line": 1126,
+          "start_frame": 17780,
+          "tick_frame": 18020
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18067,
+          "line": 1127,
+          "start_frame": 17828,
+          "tick_frame": 18068
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18115,
+          "line": 1128,
+          "start_frame": 17876,
+          "tick_frame": 18116
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18163,
+          "line": 1129,
+          "start_frame": 17924,
+          "tick_frame": 18164
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18211,
+          "line": 1130,
+          "start_frame": 17972,
+          "tick_frame": 18212
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18259,
+          "line": 1131,
+          "start_frame": 18020,
+          "tick_frame": 18260
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18307,
+          "line": 1132,
+          "start_frame": 18068,
+          "tick_frame": 18308
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18355,
+          "line": 1133,
+          "start_frame": 18116,
+          "tick_frame": 18356
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18403,
+          "line": 1134,
+          "start_frame": 18164,
+          "tick_frame": 18404
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18451,
+          "line": 1135,
+          "start_frame": 18212,
+          "tick_frame": 18452
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18499,
+          "line": 1136,
+          "start_frame": 18260,
+          "tick_frame": 18500
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18547,
+          "line": 1137,
+          "start_frame": 18308,
+          "tick_frame": 18548
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18595,
+          "line": 1138,
+          "start_frame": 18356,
+          "tick_frame": 18596
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18643,
+          "line": 1139,
+          "start_frame": 18404,
+          "tick_frame": 18644
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18691,
+          "line": 1140,
+          "start_frame": 18452,
+          "tick_frame": 18692
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18739,
+          "line": 1141,
+          "start_frame": 18500,
+          "tick_frame": 18740
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18787,
+          "line": 1142,
+          "start_frame": 18548,
+          "tick_frame": 18788
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18835,
+          "line": 1143,
+          "start_frame": 18596,
+          "tick_frame": 18836
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18883,
+          "line": 1144,
+          "start_frame": 18644,
+          "tick_frame": 18884
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18931,
+          "line": 1145,
+          "start_frame": 18692,
+          "tick_frame": 18932
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18979,
+          "line": 1146,
+          "start_frame": 18740,
+          "tick_frame": 18980
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19027,
+          "line": 1147,
+          "start_frame": 18788,
+          "tick_frame": 19028
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19075,
+          "line": 1148,
+          "start_frame": 18836,
+          "tick_frame": 19076
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19123,
+          "line": 1149,
+          "start_frame": 18884,
+          "tick_frame": 19124
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19171,
+          "line": 1150,
+          "start_frame": 18932,
+          "tick_frame": 19172
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19219,
+          "line": 1151,
+          "start_frame": 18980,
+          "tick_frame": 19220
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19267,
+          "line": 1152,
+          "start_frame": 19028,
+          "tick_frame": 19268
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19315,
+          "line": 1153,
+          "start_frame": 19076,
+          "tick_frame": 19316
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19363,
+          "line": 1154,
+          "start_frame": 19124,
+          "tick_frame": 19364
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19411,
+          "line": 1155,
+          "start_frame": 19172,
+          "tick_frame": 19412
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19459,
+          "line": 1156,
+          "start_frame": 19220,
+          "tick_frame": 19460
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19507,
+          "line": 1157,
+          "start_frame": 19268,
+          "tick_frame": 19508
+        }
+      ],
+      "OP03-R01-PastaSalad": [
+        {
+          "context_sec": 10,
+          "last_frame": 18392,
+          "line": 2420,
+          "start_frame": 18153,
+          "tick_frame": 18393
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18440,
+          "line": 2421,
+          "start_frame": 18201,
+          "tick_frame": 18441
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18488,
+          "line": 2422,
+          "start_frame": 18249,
+          "tick_frame": 18489
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18536,
+          "line": 2423,
+          "start_frame": 18297,
+          "tick_frame": 18537
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18584,
+          "line": 2424,
+          "start_frame": 18345,
+          "tick_frame": 18585
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18632,
+          "line": 2425,
+          "start_frame": 18393,
+          "tick_frame": 18633
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18680,
+          "line": 2426,
+          "start_frame": 18441,
+          "tick_frame": 18681
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18728,
+          "line": 2427,
+          "start_frame": 18489,
+          "tick_frame": 18729
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18776,
+          "line": 2428,
+          "start_frame": 18537,
+          "tick_frame": 18777
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18824,
+          "line": 2429,
+          "start_frame": 18585,
+          "tick_frame": 18825
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18872,
+          "line": 2430,
+          "start_frame": 18633,
+          "tick_frame": 18873
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18920,
+          "line": 2431,
+          "start_frame": 18681,
+          "tick_frame": 18921
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 18968,
+          "line": 2432,
+          "start_frame": 18729,
+          "tick_frame": 18969
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19016,
+          "line": 2433,
+          "start_frame": 18777,
+          "tick_frame": 19017
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19064,
+          "line": 2434,
+          "start_frame": 18825,
+          "tick_frame": 19065
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19112,
+          "line": 2435,
+          "start_frame": 18873,
+          "tick_frame": 19113
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19160,
+          "line": 2436,
+          "start_frame": 18921,
+          "tick_frame": 19161
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19208,
+          "line": 2437,
+          "start_frame": 18969,
+          "tick_frame": 19209
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19256,
+          "line": 2438,
+          "start_frame": 19017,
+          "tick_frame": 19257
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19304,
+          "line": 2439,
+          "start_frame": 19065,
+          "tick_frame": 19305
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19352,
+          "line": 2440,
+          "start_frame": 19113,
+          "tick_frame": 19353
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19400,
+          "line": 2441,
+          "start_frame": 19161,
+          "tick_frame": 19401
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19448,
+          "line": 2442,
+          "start_frame": 19209,
+          "tick_frame": 19449
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19496,
+          "line": 2443,
+          "start_frame": 19257,
+          "tick_frame": 19497
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19544,
+          "line": 2444,
+          "start_frame": 19305,
+          "tick_frame": 19545
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19592,
+          "line": 2445,
+          "start_frame": 19353,
+          "tick_frame": 19593
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19640,
+          "line": 2446,
+          "start_frame": 19401,
+          "tick_frame": 19641
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19688,
+          "line": 2447,
+          "start_frame": 19449,
+          "tick_frame": 19689
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19736,
+          "line": 2448,
+          "start_frame": 19497,
+          "tick_frame": 19737
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19784,
+          "line": 2449,
+          "start_frame": 19545,
+          "tick_frame": 19785
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19832,
+          "line": 2450,
+          "start_frame": 19593,
+          "tick_frame": 19833
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19880,
+          "line": 2451,
+          "start_frame": 19641,
+          "tick_frame": 19881
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19928,
+          "line": 2452,
+          "start_frame": 19689,
+          "tick_frame": 19929
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 19976,
+          "line": 2453,
+          "start_frame": 19737,
+          "tick_frame": 19977
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 20024,
+          "line": 2454,
+          "start_frame": 19785,
+          "tick_frame": 20025
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 20072,
+          "line": 2455,
+          "start_frame": 19833,
+          "tick_frame": 20073
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 20120,
+          "line": 2456,
+          "start_frame": 19881,
+          "tick_frame": 20121
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 20168,
+          "line": 2457,
+          "start_frame": 19929,
+          "tick_frame": 20169
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 20216,
+          "line": 2458,
+          "start_frame": 19977,
+          "tick_frame": 20217
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 20264,
+          "line": 2459,
+          "start_frame": 20025,
+          "tick_frame": 20265
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 20312,
+          "line": 2460,
+          "start_frame": 20073,
+          "tick_frame": 20313
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 20360,
+          "line": 2461,
+          "start_frame": 20121,
+          "tick_frame": 20361
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 20408,
+          "line": 2462,
+          "start_frame": 20169,
+          "tick_frame": 20409
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 20456,
+          "line": 2463,
+          "start_frame": 20217,
+          "tick_frame": 20457
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 20504,
+          "line": 2464,
+          "start_frame": 20265,
+          "tick_frame": 20505
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 20552,
+          "line": 2465,
+          "start_frame": 20313,
+          "tick_frame": 20553
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 20600,
+          "line": 2466,
+          "start_frame": 20361,
+          "tick_frame": 20601
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 20648,
+          "line": 2467,
+          "start_frame": 20409,
+          "tick_frame": 20649
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 20696,
+          "line": 2468,
+          "start_frame": 20457,
+          "tick_frame": 20697
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 20744,
+          "line": 2469,
+          "start_frame": 20505,
+          "tick_frame": 20745
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 20792,
+          "line": 2470,
+          "start_frame": 20553,
+          "tick_frame": 20793
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 20840,
+          "line": 2471,
+          "start_frame": 20601,
+          "tick_frame": 20841
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 20888,
+          "line": 2472,
+          "start_frame": 20649,
+          "tick_frame": 20889
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 20936,
+          "line": 2473,
+          "start_frame": 20697,
+          "tick_frame": 20937
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 20984,
+          "line": 2474,
+          "start_frame": 20745,
+          "tick_frame": 20985
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 21032,
+          "line": 2475,
+          "start_frame": 20793,
+          "tick_frame": 21033
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 21080,
+          "line": 2476,
+          "start_frame": 20841,
+          "tick_frame": 21081
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 21128,
+          "line": 2477,
+          "start_frame": 20889,
+          "tick_frame": 21129
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 21176,
+          "line": 2478,
+          "start_frame": 20937,
+          "tick_frame": 21177
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 21224,
+          "line": 2479,
+          "start_frame": 20985,
+          "tick_frame": 21225
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 21272,
+          "line": 2480,
+          "start_frame": 21033,
+          "tick_frame": 21273
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 21320,
+          "line": 2481,
+          "start_frame": 21081,
+          "tick_frame": 21321
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 21368,
+          "line": 2482,
+          "start_frame": 21129,
+          "tick_frame": 21369
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 21416,
+          "line": 2483,
+          "start_frame": 21177,
+          "tick_frame": 21417
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 21464,
+          "line": 2484,
+          "start_frame": 21225,
+          "tick_frame": 21465
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 21512,
+          "line": 2485,
+          "start_frame": 21273,
+          "tick_frame": 21513
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 21560,
+          "line": 2486,
+          "start_frame": 21321,
+          "tick_frame": 21561
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 21608,
+          "line": 2487,
+          "start_frame": 21369,
+          "tick_frame": 21609
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 21656,
+          "line": 2488,
+          "start_frame": 21417,
+          "tick_frame": 21657
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 21704,
+          "line": 2489,
+          "start_frame": 21465,
+          "tick_frame": 21705
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 21752,
+          "line": 2490,
+          "start_frame": 21513,
+          "tick_frame": 21753
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 21800,
+          "line": 2491,
+          "start_frame": 21561,
+          "tick_frame": 21801
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 21848,
+          "line": 2492,
+          "start_frame": 21609,
+          "tick_frame": 21849
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 21896,
+          "line": 2493,
+          "start_frame": 21657,
+          "tick_frame": 21897
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 21944,
+          "line": 2494,
+          "start_frame": 21705,
+          "tick_frame": 21945
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 21992,
+          "line": 2495,
+          "start_frame": 21753,
+          "tick_frame": 21993
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 22040,
+          "line": 2496,
+          "start_frame": 21801,
+          "tick_frame": 22041
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 22088,
+          "line": 2497,
+          "start_frame": 21849,
+          "tick_frame": 22089
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 22136,
+          "line": 2498,
+          "start_frame": 21897,
+          "tick_frame": 22137
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 22184,
+          "line": 2499,
+          "start_frame": 21945,
+          "tick_frame": 22185
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 22232,
+          "line": 2500,
+          "start_frame": 21993,
+          "tick_frame": 22233
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 22280,
+          "line": 2501,
+          "start_frame": 22041,
+          "tick_frame": 22281
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 22328,
+          "line": 2502,
+          "start_frame": 22089,
+          "tick_frame": 22329
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 22376,
+          "line": 2503,
+          "start_frame": 22137,
+          "tick_frame": 22377
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 22424,
+          "line": 2504,
+          "start_frame": 22185,
+          "tick_frame": 22425
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 22472,
+          "line": 2505,
+          "start_frame": 22233,
+          "tick_frame": 22473
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 22520,
+          "line": 2506,
+          "start_frame": 22281,
+          "tick_frame": 22521
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 22568,
+          "line": 2507,
+          "start_frame": 22329,
+          "tick_frame": 22569
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 22616,
+          "line": 2508,
+          "start_frame": 22377,
+          "tick_frame": 22617
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 22664,
+          "line": 2509,
+          "start_frame": 22425,
+          "tick_frame": 22665
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 22712,
+          "line": 2510,
+          "start_frame": 22473,
+          "tick_frame": 22713
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 22760,
+          "line": 2511,
+          "start_frame": 22521,
+          "tick_frame": 22761
+        }
+      ],
+      "OP03-R07-Pizza": [
+        {
+          "context_sec": 10,
+          "last_frame": 15439,
+          "line": 3396,
+          "start_frame": 15200,
+          "tick_frame": 15440
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 15487,
+          "line": 3397,
+          "start_frame": 15248,
+          "tick_frame": 15488
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 15535,
+          "line": 3398,
+          "start_frame": 15296,
+          "tick_frame": 15536
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 15583,
+          "line": 3399,
+          "start_frame": 15344,
+          "tick_frame": 15584
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 15631,
+          "line": 3400,
+          "start_frame": 15392,
+          "tick_frame": 15632
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 15679,
+          "line": 3401,
+          "start_frame": 15440,
+          "tick_frame": 15680
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 15727,
+          "line": 3402,
+          "start_frame": 15488,
+          "tick_frame": 15728
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 15775,
+          "line": 3403,
+          "start_frame": 15536,
+          "tick_frame": 15776
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 15823,
+          "line": 3404,
+          "start_frame": 15584,
+          "tick_frame": 15824
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 15871,
+          "line": 3405,
+          "start_frame": 15632,
+          "tick_frame": 15872
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 15919,
+          "line": 3406,
+          "start_frame": 15680,
+          "tick_frame": 15920
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 15967,
+          "line": 3407,
+          "start_frame": 15728,
+          "tick_frame": 15968
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 16015,
+          "line": 3408,
+          "start_frame": 15776,
+          "tick_frame": 16016
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 16063,
+          "line": 3409,
+          "start_frame": 15824,
+          "tick_frame": 16064
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 16111,
+          "line": 3410,
+          "start_frame": 15872,
+          "tick_frame": 16112
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 16159,
+          "line": 3411,
+          "start_frame": 15920,
+          "tick_frame": 16160
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 16207,
+          "line": 3412,
+          "start_frame": 15968,
+          "tick_frame": 16208
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 16255,
+          "line": 3413,
+          "start_frame": 16016,
+          "tick_frame": 16256
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 16303,
+          "line": 3414,
+          "start_frame": 16064,
+          "tick_frame": 16304
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 16351,
+          "line": 3415,
+          "start_frame": 16112,
+          "tick_frame": 16352
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 16399,
+          "line": 3416,
+          "start_frame": 16160,
+          "tick_frame": 16400
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 16447,
+          "line": 3417,
+          "start_frame": 16208,
+          "tick_frame": 16448
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 16495,
+          "line": 3418,
+          "start_frame": 16256,
+          "tick_frame": 16496
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 16543,
+          "line": 3419,
+          "start_frame": 16304,
+          "tick_frame": 16544
+        },
+        {
+          "context_sec": 10,
+          "last_frame": 16591,
+          "line": 3420,
+          "start_frame": 16352,
+          "tick_frame": 16592
+        }
+      ]
+    },
+    "split": "val",
+    "xy_norm": [
+      0.5,
+      0.5
+    ]
+  },
+  "context_sec": [
+    4,
+    6,
+    8,
+    10
+  ],
+  "gaze_causality": {
+    "allowed_interval": "[start_frame, tick_frame)",
+    "future_gaze_read": false
+  },
+  "horizons_sec": [
+    2,
+    4,
+    6
+  ],
+  "model_fps": 8,
+  "protocol": "egtea_split1_temporal_half_streaming_mtp",
+  "schema_version": 1,
+  "splits": {
+    "train": {
+      "context_rows": {
+        "10": 24998,
+        "4": 86,
+        "6": 86,
+        "8": 86
+      },
+      "csv": "EGTEA_train_stream_mtp.csv",
+      "md5": "dcdc98c9993ae028dbb4a2877deff09a",
+      "rows": 25256,
+      "rows_gaze_timeline_oob": 0
+    },
+    "val": {
+      "context_rows": {
+        "10": 22483,
+        "4": 86,
+        "6": 86,
+        "8": 86
+      },
+      "csv": "EGTEA_val_stream_mtp.csv",
+      "md5": "cb04d6eddc2e65910899fde8b3c08659",
+      "rows": 22741,
+      "rows_gaze_timeline_oob": 171
+    }
+  }
+}

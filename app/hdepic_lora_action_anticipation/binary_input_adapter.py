@@ -265,6 +265,9 @@ class BinaryGazeMapBuilder:
             with self._xy_lock:
                 self._xy_cache[cache_key] = None
             return None
+        # Dataset adapter only: permit a synthetic center position exclusively
+        # for the frozen EGTEA OOB allowlist, before unchanged upstream lookup.
+        self.gate.validate_egtea_frame_indices(video_id, frame_indices)
         xy = self.gate._query_crop_xy(record, frame_indices, vfps, h0, w0)  # noqa: SLF001
         with self._xy_lock:
             self._xy_cache[cache_key] = None if xy is None else np.asarray(xy)

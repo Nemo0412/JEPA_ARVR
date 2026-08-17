@@ -1,0 +1,494 @@
+{
+  "protocol": "temporal_half_split_streaming_mtp_ll_exact",
+  "reference_repo_commit": "08528f64e724954fd567653c1178e4e3c51bf441",
+  "annotation_source": "data/egtea/vjepa_annotations/v1/split1",
+  "session_video_source": "<EGTEA_ROOT>/session_videos",
+  "stream_video_root": "<EGTEA_ROOT>/stream_session_videos",
+  "source_rows": {
+    "train": 7468,
+    "val": 831,
+    "test": 2022
+  },
+  "pooled_deduplicated_actions": 10321,
+  "dedup_key": [
+    "participant_id",
+    "start_frame",
+    "stop_frame",
+    "verb_class",
+    "noun_class"
+  ],
+  "tick_sec": 2.0,
+  "min_context_sec": 4.0,
+  "max_context_sec": 10.0,
+  "context_schedule": [
+    4.0,
+    6.0,
+    8.0,
+    10.0
+  ],
+  "horizons_sec": [
+    2.0,
+    4.0,
+    6.0
+  ],
+  "model_fps": 8.0,
+  "sessions": 86,
+  "n_train": 25256,
+  "n_val": 22741,
+  "n_test": 22741,
+  "context_counts_train": {
+    "4.0": 86,
+    "6.0": 86,
+    "8.0": 86,
+    "10.0": 24998
+  },
+  "context_counts_val": {
+    "4.0": 86,
+    "6.0": 86,
+    "8.0": 86,
+    "10.0": 22483
+  },
+  "train_future_labels_crossing_midpoint": {
+    "2s": 86,
+    "4s": 172,
+    "6s": 258
+  },
+  "md5": {
+    "train": "dcdc98c9993ae028dbb4a2877deff09a",
+    "val": "cb04d6eddc2e65910899fde8b3c08659",
+    "test": "cb04d6eddc2e65910899fde8b3c08659"
+  },
+  "video_metadata": {
+    "OP01-R01-PastaSalad": {
+      "frames": 35924,
+      "fps": 24.0,
+      "rows": 727
+    },
+    "OP01-R02-TurkeySandwich": {
+      "frames": 12136,
+      "fps": 24.0,
+      "rows": 232
+    },
+    "OP01-R03-BaconAndEggs": {
+      "frames": 25678,
+      "fps": 24.0,
+      "rows": 515
+    },
+    "OP01-R04-ContinentalBreakfast": {
+      "frames": 11778,
+      "fps": 24.0,
+      "rows": 229
+    },
+    "OP01-R05-Cheeseburger": {
+      "frames": 16059,
+      "fps": 24.0,
+      "rows": 311
+    },
+    "OP01-R06-GreekSalad": {
+      "frames": 20393,
+      "fps": 24.0,
+      "rows": 404
+    },
+    "OP01-R07-Pizza": {
+      "frames": 29641,
+      "fps": 24.0,
+      "rows": 600
+    },
+    "OP02-R01-PastaSalad": {
+      "frames": 13011,
+      "fps": 24.0,
+      "rows": 256
+    },
+    "OP02-R02-TurkeySandwich": {
+      "frames": 9176,
+      "fps": 24.0,
+      "rows": 167
+    },
+    "OP02-R03-BaconAndEggs": {
+      "frames": 19824,
+      "fps": 24.0,
+      "rows": 393
+    },
+    "OP02-R04-ContinentalBreakfast": {
+      "frames": 11245,
+      "fps": 24.0,
+      "rows": 220
+    },
+    "OP02-R05-Cheeseburger": {
+      "frames": 10711,
+      "fps": 24.0,
+      "rows": 211
+    },
+    "OP02-R06-GreekSalad": {
+      "frames": 11194,
+      "fps": 24.0,
+      "rows": 212
+    },
+    "OP02-R07-Pizza": {
+      "frames": 16619,
+      "fps": 24.0,
+      "rows": 322
+    },
+    "OP03-R01-PastaSalad": {
+      "frames": 23731,
+      "fps": 24.0,
+      "rows": 472
+    },
+    "OP03-R02-TurkeySandwich": {
+      "frames": 10284,
+      "fps": 24.0,
+      "rows": 194
+    },
+    "OP03-R03-BaconAndEggs": {
+      "frames": 20120,
+      "fps": 24.0,
+      "rows": 404
+    },
+    "OP03-R04-ContinentalBreakfast": {
+      "frames": 10662,
+      "fps": 24.0,
+      "rows": 204
+    },
+    "OP03-R05-Cheeseburger": {
+      "frames": 20251,
+      "fps": 24.0,
+      "rows": 399
+    },
+    "OP03-R06-GreekSalad": {
+      "frames": 19379,
+      "fps": 24.0,
+      "rows": 383
+    },
+    "OP03-R07-Pizza": {
+      "frames": 17920,
+      "fps": 24.0,
+      "rows": 343
+    },
+    "OP04-R01-PastaSalad": {
+      "frames": 21733,
+      "fps": 24.0,
+      "rows": 432
+    },
+    "OP04-R02-TurkeySandwich": {
+      "frames": 7831,
+      "fps": 24.0,
+      "rows": 136
+    },
+    "OP04-R03-BaconAndEggs": {
+      "frames": 20528,
+      "fps": 24.0,
+      "rows": 408
+    },
+    "OP04-R04-ContinentalBreakfast": {
+      "frames": 13020,
+      "fps": 24.0,
+      "rows": 251
+    },
+    "OP04-R05-Cheeseburger": {
+      "frames": 11262,
+      "fps": 24.0,
+      "rows": 216
+    },
+    "OP04-R06-GreekSalad": {
+      "frames": 8719,
+      "fps": 24.0,
+      "rows": 161
+    },
+    "OP04-R07-Pizza": {
+      "frames": 15160,
+      "fps": 24.0,
+      "rows": 288
+    },
+    "OP05-R03-BaconAndEggs": {
+      "frames": 17212,
+      "fps": 24.0,
+      "rows": 337
+    },
+    "OP05-R04-ContinentalBreakfast": {
+      "frames": 11373,
+      "fps": 24.0,
+      "rows": 222
+    },
+    "OP05-R07-Pizza": {
+      "frames": 9707,
+      "fps": 24.0,
+      "rows": 181
+    },
+    "OP06-R02-TurkeySandwich": {
+      "frames": 12034,
+      "fps": 24.0,
+      "rows": 227
+    },
+    "OP06-R03-BaconAndEggs": {
+      "frames": 18609,
+      "fps": 24.0,
+      "rows": 366
+    },
+    "OP06-R04-ContinentalBreakfast": {
+      "frames": 10449,
+      "fps": 24.0,
+      "rows": 195
+    },
+    "OP06-R05-Cheeseburger": {
+      "frames": 16310,
+      "fps": 24.0,
+      "rows": 322
+    },
+    "OP06-R06-GreekSalad": {
+      "frames": 11612,
+      "fps": 24.0,
+      "rows": 225
+    },
+    "OP06-R07-Pizza": {
+      "frames": 15755,
+      "fps": 24.0,
+      "rows": 306
+    },
+    "P01-R01-PastaSalad": {
+      "frames": 33607,
+      "fps": 24.0,
+      "rows": 668
+    },
+    "P01-R02-TurkeySandwich": {
+      "frames": 26594,
+      "fps": 24.0,
+      "rows": 529
+    },
+    "P02-R01-PastaSalad": {
+      "frames": 43094,
+      "fps": 24.0,
+      "rows": 869
+    },
+    "P02-R03-BaconAndEggs": {
+      "frames": 43793,
+      "fps": 24.0,
+      "rows": 872
+    },
+    "P02-R04-ContinentalBreakfast": {
+      "frames": 32215,
+      "fps": 24.0,
+      "rows": 640
+    },
+    "P02-R05-Cheeseburger": {
+      "frames": 27311,
+      "fps": 24.0,
+      "rows": 501
+    },
+    "P02-R06-GreekSalad": {
+      "frames": 15784,
+      "fps": 24.0,
+      "rows": 306
+    },
+    "P03-R01-PastaSalad": {
+      "frames": 59793,
+      "fps": 24.0,
+      "rows": 1220
+    },
+    "P04-R01-PastaSalad": {
+      "frames": 52597,
+      "fps": 24.0,
+      "rows": 1056
+    },
+    "P04-R05-Cheeseburger": {
+      "frames": 25738,
+      "fps": 24.0,
+      "rows": 497
+    },
+    "P04-R06-GreekSalad": {
+      "frames": 32713,
+      "fps": 24.0,
+      "rows": 635
+    },
+    "P05-R01-PastaSalad": {
+      "frames": 41468,
+      "fps": 24.0,
+      "rows": 819
+    },
+    "P05-R02-TurkeySandwich": {
+      "frames": 20992,
+      "fps": 24.0,
+      "rows": 413
+    },
+    "P06-R01-PastaSalad": {
+      "frames": 34506,
+      "fps": 24.0,
+      "rows": 670
+    },
+    "P06-R02-TurkeySandwich": {
+      "frames": 13965,
+      "fps": 24.0,
+      "rows": 265
+    },
+    "P07-R01-PastaSalad": {
+      "frames": 59734,
+      "fps": 24.0,
+      "rows": 1208
+    },
+    "P08-R01-PastaSalad": {
+      "frames": 52704,
+      "fps": 24.0,
+      "rows": 1063
+    },
+    "P09-R01-PastaSalad": {
+      "frames": 48087,
+      "fps": 24.0,
+      "rows": 941
+    },
+    "P09-R02-TurkeySandwich": {
+      "frames": 16801,
+      "fps": 24.0,
+      "rows": 315
+    },
+    "P10-R01-PastaSalad": {
+      "frames": 46980,
+      "fps": 24.0,
+      "rows": 941
+    },
+    "P10-R02-TurkeySandwich": {
+      "frames": 11591,
+      "fps": 24.0,
+      "rows": 209
+    },
+    "P10-R05-Cheeseburger": {
+      "frames": 25530,
+      "fps": 24.0,
+      "rows": 488
+    },
+    "P10-R06-GreekSalad": {
+      "frames": 20944,
+      "fps": 24.0,
+      "rows": 396
+    },
+    "P11-R01-PastaSalad": {
+      "frames": 56788,
+      "fps": 24.0,
+      "rows": 1150
+    },
+    "P11-R02-TurkeySandwich": {
+      "frames": 17522,
+      "fps": 24.0,
+      "rows": 335
+    },
+    "P12-R01-PastaSalad": {
+      "frames": 44307,
+      "fps": 24.0,
+      "rows": 893
+    },
+    "P12-R02-TurkeySandwich": {
+      "frames": 14276,
+      "fps": 24.0,
+      "rows": 269
+    },
+    "P13-R01-PastaSalad": {
+      "frames": 75745,
+      "fps": 24.0,
+      "rows": 1550
+    },
+    "P14-R01-PastaSalad": {
+      "frames": 50435,
+      "fps": 24.0,
+      "rows": 1020
+    },
+    "P14-R02-TurkeySandwich": {
+      "frames": 21043,
+      "fps": 24.0,
+      "rows": 408
+    },
+    "P15-R01-PastaSalad": {
+      "frames": 41957,
+      "fps": 24.0,
+      "rows": 838
+    },
+    "P16-R03-BaconAndEggs": {
+      "frames": 55956,
+      "fps": 24.0,
+      "rows": 1130
+    },
+    "P17-R03-BaconAndEggs": {
+      "frames": 41442,
+      "fps": 24.0,
+      "rows": 764
+    },
+    "P17-R04-ContinentalBreakfast": {
+      "frames": 27992,
+      "fps": 24.0,
+      "rows": 538
+    },
+    "P18-R03-BaconAndEggs": {
+      "frames": 44017,
+      "fps": 24.0,
+      "rows": 722
+    },
+    "P18-R04-ContinentalBreakfast": {
+      "frames": 23657,
+      "fps": 24.0,
+      "rows": 436
+    },
+    "P19-R03-BaconAndEggs": {
+      "frames": 39939,
+      "fps": 24.0,
+      "rows": 805
+    },
+    "P19-R04-ContinentalBreakfast": {
+      "frames": 19192,
+      "fps": 24.0,
+      "rows": 376
+    },
+    "P20-R03-BaconAndEggs": {
+      "frames": 32170,
+      "fps": 24.0,
+      "rows": 632
+    },
+    "P20-R04-ContinentalBreakfast": {
+      "frames": 24436,
+      "fps": 24.0,
+      "rows": 470
+    },
+    "P21-R03-BaconAndEggs": {
+      "frames": 38721,
+      "fps": 24.0,
+      "rows": 772
+    },
+    "P21-R04-ContinentalBreakfast": {
+      "frames": 41417,
+      "fps": 24.0,
+      "rows": 833
+    },
+    "P21-R05-Cheeseburger": {
+      "frames": 23488,
+      "fps": 24.0,
+      "rows": 456
+    },
+    "P21-R06-GreekSalad": {
+      "frames": 35206,
+      "fps": 24.0,
+      "rows": 686
+    },
+    "P22-R03-BaconAndEggs": {
+      "frames": 79377,
+      "fps": 24.0,
+      "rows": 1626
+    },
+    "P23-R03-BaconAndEggs": {
+      "frames": 60366,
+      "fps": 24.0,
+      "rows": 1224
+    },
+    "P24-R03-BaconAndEggs": {
+      "frames": 52831,
+      "fps": 24.0,
+      "rows": 1060
+    },
+    "P25-R06-GreekSalad": {
+      "frames": 57535,
+      "fps": 24.0,
+      "rows": 1160
+    },
+    "P26-R05-Cheeseburger": {
+      "frames": 43860,
+      "fps": 24.0,
+      "rows": 852
+    }
+  },
+  "note": "Exact ll5914 protocol: first half train; second half val/test; val copied to test; 4->6->8->10s then sliding 10s; +2/+4/+6s labels; covering action else next start; train future labels are allowed to cross midpoint."
+}

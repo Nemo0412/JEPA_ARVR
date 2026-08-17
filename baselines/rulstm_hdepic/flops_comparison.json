@@ -1,0 +1,224 @@
+{
+  "protocol": {
+    "rulstm_feat_fps": 4.0,
+    "jepa_fps": 8,
+    "jepa_img": 256,
+    "horizons_sec": [
+      2,
+      4,
+      6
+    ],
+    "keep_count": 4096,
+    "note": "Per-tick batch=1. RU-LSTM temporal uses TSN features; full RU pipeline = TSN(all ctx frames)+temporal. JEPA = ViT-L encoder on pixels (+ predictor on pruned tokens)."
+  },
+  "rulstm_temporal": {
+    "original": [
+      {
+        "context_sec": 4.0,
+        "T_feat": 16,
+        "params_m": 18.125071,
+        "flops": 7956480,
+        "gflops": 0.00795648
+      },
+      {
+        "context_sec": 6.0,
+        "T_feat": 24,
+        "params_m": 18.125071,
+        "flops": 7956480,
+        "gflops": 0.00795648
+      },
+      {
+        "context_sec": 8.0,
+        "T_feat": 32,
+        "params_m": 18.125071,
+        "flops": 7956480,
+        "gflops": 0.00795648
+      },
+      {
+        "context_sec": 10.0,
+        "T_feat": 40,
+        "params_m": 18.125071,
+        "flops": 7956480,
+        "gflops": 0.00795648
+      }
+    ],
+    "v1": [
+      {
+        "context_sec": 4.0,
+        "T_feat": 16,
+        "params_m": 285.914383,
+        "flops": 158519296,
+        "gflops": 0.158519296
+      },
+      {
+        "context_sec": 6.0,
+        "T_feat": 24,
+        "params_m": 285.914383,
+        "flops": 192073728,
+        "gflops": 0.192073728
+      },
+      {
+        "context_sec": 8.0,
+        "T_feat": 32,
+        "params_m": 285.914383,
+        "flops": 225628160,
+        "gflops": 0.22562816
+      },
+      {
+        "context_sec": 10.0,
+        "T_feat": 40,
+        "params_m": 285.914383,
+        "flops": 259182592,
+        "gflops": 0.259182592
+      }
+    ],
+    "v2": [
+      {
+        "context_sec": 4.0,
+        "T_feat": 16,
+        "params_m": 328.359183,
+        "flops": 468033536,
+        "gflops": 0.468033536
+      },
+      {
+        "context_sec": 6.0,
+        "T_feat": 24,
+        "params_m": 328.359183,
+        "flops": 535142400,
+        "gflops": 0.5351424
+      },
+      {
+        "context_sec": 8.0,
+        "T_feat": 32,
+        "params_m": 328.359183,
+        "flops": 602251264,
+        "gflops": 0.602251264
+      },
+      {
+        "context_sec": 10.0,
+        "T_feat": 40,
+        "params_m": 328.359183,
+        "flops": 669360128,
+        "gflops": 0.669360128
+      }
+    ]
+  },
+  "tsn": {
+    "per_frame_flops": 9309110272,
+    "per_frame_gflops": 9.309110272,
+    "by_context": [
+      {
+        "context_sec": 4.0,
+        "n_frames": 16,
+        "flops": 148945764352,
+        "gflops": 148.945764352,
+        "incremental_2s_gflops": 74.472882176
+      },
+      {
+        "context_sec": 6.0,
+        "n_frames": 24,
+        "flops": 223418646528,
+        "gflops": 223.418646528,
+        "incremental_2s_gflops": 74.472882176
+      },
+      {
+        "context_sec": 8.0,
+        "n_frames": 32,
+        "flops": 297891528704,
+        "gflops": 297.891528704,
+        "incremental_2s_gflops": 74.472882176
+      },
+      {
+        "context_sec": 10.0,
+        "n_frames": 40,
+        "flops": 372364410880,
+        "gflops": 372.36441088,
+        "incremental_2s_gflops": 74.472882176
+      }
+    ]
+  },
+  "vjepa_vitl_encoder": [
+    {
+      "T_frames": 32,
+      "n_tokens": 4096,
+      "params_m": 304.0,
+      "flops": 4130638659584,
+      "gflops": 4130.638659584,
+      "method": "analytical_vit_matmul_x2",
+      "context_sec": 4.0,
+      "predictor": {
+        "n_tokens": 4352,
+        "n_ctx_kept": 4096,
+        "flops": 534118662144,
+        "gflops": 534.118662144,
+        "method": "analytical_vit_predictor"
+      },
+      "encoder_plus_predictor_gflops": 4664.7573217280005
+    },
+    {
+      "T_frames": 48,
+      "n_tokens": 6144,
+      "params_m": 304.0,
+      "flops": 7432908570624,
+      "gflops": 7432.908570624,
+      "method": "analytical_vit_matmul_x2",
+      "context_sec": 6.0,
+      "predictor": {
+        "n_tokens": 4352,
+        "n_ctx_kept": 4096,
+        "flops": 534118662144,
+        "gflops": 534.118662144,
+        "method": "analytical_vit_predictor"
+      },
+      "encoder_plus_predictor_gflops": 7967.027232768
+    },
+    {
+      "T_frames": 64,
+      "n_tokens": 8192,
+      "params_m": 304.0,
+      "flops": 11559812202496,
+      "gflops": 11559.812202496,
+      "method": "analytical_vit_matmul_x2",
+      "context_sec": 8.0,
+      "predictor": {
+        "n_tokens": 4352,
+        "n_ctx_kept": 4096,
+        "flops": 534118662144,
+        "gflops": 534.118662144,
+        "method": "analytical_vit_predictor"
+      },
+      "encoder_plus_predictor_gflops": 12093.930864639999
+    },
+    {
+      "T_frames": 80,
+      "n_tokens": 10240,
+      "params_m": 304.0,
+      "flops": 16511349555200,
+      "gflops": 16511.3495552,
+      "method": "analytical_vit_matmul_x2",
+      "context_sec": 10.0,
+      "predictor": {
+        "n_tokens": 4352,
+        "n_ctx_kept": 4096,
+        "flops": 534118662144,
+        "gflops": 534.118662144,
+        "method": "analytical_vit_predictor"
+      },
+      "encoder_plus_predictor_gflops": 17045.468217343998
+    }
+  ],
+  "comparison_at_10s": {
+    "rulstm_original_temporal_gflops": 0.00795648,
+    "rulstm_v2_temporal_gflops": 0.669360128,
+    "tsn_10s_gflops": 372.36441088,
+    "rulstm_original_full_gflops": 372.37236736,
+    "rulstm_v2_full_gflops": 373.033771008,
+    "vjepa_encoder_gflops": 16511.3495552,
+    "vjepa_predictor_gflops": 534.118662144,
+    "vjepa_full_gflops": 17045.468217343998,
+    "ratio_vitl_enc_over_v2_temporal": 24667.36344833494,
+    "ratio_jepa_full_over_v2_full": 45.69416911311884,
+    "ratio_jepa_full_over_orig_full": 45.77533058693606,
+    "ratio_v2_temporal_over_orig_temporal": 84.12767052767053
+  }
+}

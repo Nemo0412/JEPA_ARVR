@@ -907,6 +907,19 @@ class GazeTokenGate(nn.Module):
         self.use_motion = bool(cfg.get("use_motion", True))
         self.motion_weight = float(cfg.get("motion_weight", 0.15))
         self.cache: dict[str, GazeRecord | None] = {}
+        # EGTEA uses BeGaze session text, unlike the Aria archive read below.
+        # This is a reader selection only; token gate/rasterization are upstream.
+        self.gaze_format = str(cfg.get("gaze_format", "aria")).lower()
+        self._egtea_source = None
+        if self.gaze_format == "egtea":
+            from app.hdepic_lora_action_anticipation.egtea_gaze import EgteaGazeSource
+
+            gaze_dir = cfg.get("egtea_gaze_dir") or (self.gaze_root and str(self.gaze_root))
+            if gaze_dir is None:
+                raise ValueError("gaze_format='egtea' requires 'egtea_gaze_dir' (or 'gaze_root')")
+            self._egtea_source = EgteaGazeSource(
+                gaze_dir, GazeRecord, approved_center_rows=cfg.get("egtea_center_fallback_rows")
+            )
 
     def current_gamma(self) -> torch.Tensor:
         if self.learnable_gate:
@@ -936,6 +949,20 @@ class GazeTokenGate(nn.Module):
     def _load_record(self, video_id: str) -> GazeRecord | None:
         if video_id in self.cache:
             return self.cache[video_id]
+        if self._egtea_source is not None:
+            clip_name = _clean_video_id(video_id)
+            try:
+                # Stream-MTP video_id is a session; fixed clips retain -F bounds.
+                record = (
+                    self._egtea_source.record_for_session(clip_name)
+                    if "-F" not in clip_name
+                    else self._egtea_source.record_for_clip(clip_name)
+                )
+            except Exception:
+                logger.warning("EGTEA gaze record failed for %s", video_id, exc_info=True)
+                record = None
+            self.cache[video_id] = record
+            return record
         clean_id = _clean_video_id(video_id)
         roots: list[tuple[Path, bool]] = []
         if self.extract_root is not None:
@@ -1072,6 +1099,14 @@ class GazeTokenGate(nn.Module):
             return None
         xy = record.xy_norm[pick]
         return np.stack([xy[:, 0] * (self.crop_size - 1), xy[:, 1] * (self.crop_size - 1)], axis=1)
+
+    def validate_egtea_frame_indices(self, video_id: str, frame_indices) -> None:
+        """Enforce the dataset's frozen center-fallback allowlist, if enabled."""
+        if self._egtea_source is None:
+            return
+        session = _clean_video_id(str(video_id))
+        if "-F" not in session:
+            self._egtea_source.assert_session_frame_indices(session, frame_indices)
 
     def _heatmap(self, xy_px, device):
         T = len(xy_px)
