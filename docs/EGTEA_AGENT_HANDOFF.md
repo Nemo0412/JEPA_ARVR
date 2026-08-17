@@ -39,13 +39,16 @@ exports, checkpoints, and feature tensors are not committed.
 | Fixed-clip source CSV builder | `scripts/egtea/build_egtea_csvs_v2.py` |
 | Temporal-half stream builder | `scripts/egtea/make_egtea_stream_half_split.py` |
 | Stream video-tree builder | `scripts/egtea/make_egtea_stream_video_tree.py` |
+| Nested stream video/session gate | `scripts/egtea/verify_stream_video_tree.sh` |
 | Frozen split identity gate | `scripts/egtea/verify_stream_split.sh` |
 | BeGaze coverage auditor | `scripts/egtea/audit_egtea_stream_gaze_coverage.py` |
 | EGTEA gaze reader | `app/hdepic_lora_action_anticipation/egtea_gaze.py` |
 | Gaze/MTP reference launcher | `scripts/egtea/submit_stream_gaze_ca_mtp.slurm` |
 | Video-only single-horizon reference | `scripts/egtea/submit_stream_video_single_horizon.slurm` |
+| Frozen-triplet -> selected-horizon label adapter | `scripts/egtea/prepare_vanilla_single_horizon_csv.py` |
 | RU-LSTM V-JEPA feature route | `scripts/egtea/submit_rulstm_vjepa_features.slurm` |
 | RU-LSTM TSN small/Large v2 | `scripts/egtea/submit_rulstm_{small_tsn,large_v2}.slurm` |
+| RU-LSTM feature-pair/session gate | `scripts/egtea/verify_rulstm_feature_bundle.sh` |
 | Frozen model-facing split | `data/egtea/vjepa_annotations/stream_half_split/split1/` |
 
 ## Frozen EGTEA temporal-half split
@@ -66,6 +69,41 @@ scripts/egtea/verify_stream_split.sh
 
 before every new port.  The source CSVs and official split-1 label files needed
 to regenerate the split are committed under `data/egtea/`.
+
+### End-to-end regeneration on ll's machine
+
+Use a clean output root; do not point the fixed-clip builder at the tracked
+branch data directory.  The Python environment must provide NumPy, pandas,
+PyTorch and Decord, and the repository root must be importable:
+
+```bash
+export PROJECT_ROOT=/path/to/JEPA_ARVR
+export PYTHON=/scratch/ll5914/conda_envs/SVD/bin/python
+export PYTHONPATH="$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export EGTEA_ROOT=/scratch/ll5914/datasets/EGTEA
+export REGEN_ROOT=/tmp/egtea_regen
+
+mkdir -p "$REGEN_ROOT/action_annotation"
+cp "$PROJECT_ROOT"/data/egtea/action_annotation/{action_idx.txt,verb_idx.txt,noun_idx.txt,train_split1.txt,test_split1.txt} \
+  "$REGEN_ROOT/action_annotation/"
+
+"$PYTHON" "$PROJECT_ROOT/scripts/egtea/build_egtea_csvs_v2.py" \
+  --data-root "$REGEN_ROOT" --split 1 --val-frac 0.1 \
+  --no-symlinks --overwrite
+
+"$PYTHON" "$PROJECT_ROOT/scripts/egtea/make_egtea_stream_half_split.py" \
+  --source "$REGEN_ROOT/vjepa_annotations/v1/split1" \
+  --video-root "$EGTEA_ROOT/session_videos" \
+  --out "$REGEN_ROOT/vjepa_annotations/stream_half_split/split1" \
+  --tick-sec 2 --min-context-sec 4 --max-context-sec 10 \
+  --context-schedule 4,6,8,10 --horizons-sec 2,4,6 --model-fps 8
+
+for split in train val test; do
+  cmp \
+    "$REGEN_ROOT/vjepa_annotations/stream_half_split/split1/EGTEA_${split}_stream_mtp.csv" \
+    "$PROJECT_ROOT/data/egtea/vjepa_annotations/stream_half_split/split1/EGTEA_${split}_stream_mtp.csv"
+done
+```
 
 ### Construction logic
 
@@ -135,14 +173,23 @@ Training has zero gaze-timeline OOB rows.  Validation has exactly 171:
 - `OP03-R01-PastaSalad`: 92
 - `OP03-R07-Pizza`: 25
 
-Only the exact `(session,start_frame,last_frame)` rows in the manifest may use
-the user-approved center fallback `(0.5,0.5)`.  Any new OOB row is fatal.  Do
-not delete these validation rows or silently center-fill other missing data.
+Only the exact `(session,start_frame,last_frame)` rows in the manifest may pass
+the EGTEA **timeline-OOB gate** and use the user-approved center fallback
+`(0.5,0.5)` for their unavailable tail.  Any new OOB row is fatal.  Do not
+delete these validation rows.
+
+This gate is distinct from ll's existing per-sample coordinate sanitizer:
+inside the available BeGaze timeline, non-finite or `(0,0)` coordinates are
+also mapped to center by `_clean_xy`.  That behavior is inherited from ll's
+gaze implementation, not introduced by the EGTEA split adapter.  A missing or
+unparseable gaze file must be caught by the full coverage audit below before a
+formal launch; do not rely on the model loader's empty-record fallback.
 
 Rebuild the manifest, if needed, with:
 
 ```bash
-python scripts/egtea/audit_egtea_stream_gaze_coverage.py \
+export PYTHONPATH="$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+"$PYTHON" scripts/egtea/audit_egtea_stream_gaze_coverage.py \
   --annotation-dir data/egtea/vjepa_annotations/stream_half_split/split1 \
   --gaze-root <GAZE_ROOT> \
   --output /tmp/frozen_gaze_coverage.json
@@ -193,9 +240,31 @@ replace only:
 - checkpoint sidecars with the intended EGTEA counterparts;
 - output directories and scheduler/environment paths.
 
-`submit_stream_video_single_horizon.slurm` records our older data wiring for
-one separately trained `+2`, `+4`, or `+6` model.  It is not authority for the
-definition of ll's newer six-run matrix.
+`submit_stream_video_single_horizon.slurm` runs one separately trained `+2`,
+`+4`, or `+6` model.  The frozen CSV stores labels in `[+2,+4,+6]` columns,
+while ll's one-horizon trainer reads label position zero.  The launcher
+therefore first calls `prepare_vanilla_single_horizon_csv.py`, which preserves
+all 25,256/22,741 rows and all non-label fields but projects the chosen source
+column to the single label position.  Do not bypass this adapter for +4/+6.
+It is still not authority for the definition of ll's newer six-run matrix.
+
+Runnable video-only commands are:
+
+```bash
+export PROJECT_ROOT=/path/to/JEPA_ARVR
+export PYTHON=/scratch/ll5914/conda_envs/SVD/bin/python
+export VJEPA_ROOT=/path/to/vjepa2
+export EGTEA_ROOT=/scratch/ll5914/datasets/EGTEA
+export CHECKPOINT=/path/to/vitl.pt
+export ENCODER_LORA=/path/to/video/encoder_lora_best.pt
+export PREDICTOR_LORA=/path/to/video/predictor_lora_best.pt
+
+for HORIZON in 2 4 6; do
+  export HORIZON
+  export OUT_DIR="/scratch/ll5914/experiments/egtea_vanilla_video_h${HORIZON}"
+  sbatch "$PROJECT_ROOT/scripts/egtea/submit_stream_video_single_horizon.slurm"
+done
+```
 
 ## Checkpoint roles for the current EGTEA mapping
 
@@ -234,6 +303,12 @@ Yifan already has 86 `.npy` plus 86 `.json` files under
 `data/egtea/rulstm_stream_features/vjepa_vitl_split1`; transfer them separately
 or regenerate them with the supplied launcher.
 
+All RU launchers call `verify_rulstm_feature_bundle.sh`: the `.npy` and `.json`
+stems must each match the exact 86-session union in the frozen train/val CSVs.
+This prevents a count-only pass with missing or stale session features.  Asset
+provenance (extractor checkpoint, tensor shape, fps and bundle hashes) must
+still be supplied with the transferred bundle; it is not encoded in Git.
+
 ### TSN small and Large v2
 
 Both use the exact feature type under Yifan's
@@ -263,7 +338,7 @@ ambiguous assets to be set explicitly.  At minimum set:
 
 ```bash
 export PROJECT_ROOT=/path/to/JEPA_ARVR
-export VJEPA_ROOT=/path/to/vjepa2
+export VJEPA_ROOT=/path/to/vjepa2  # required: this branch's vjepa2/ may be empty
 export EGTEA_ROOT=/scratch/ll5914/datasets/EGTEA
 export GAZE_ROOT=<directory-with-session-txt-files>       # gaze runs
 export ENCODER_LORA=<correct-EGTEA-sidecar>
@@ -288,6 +363,8 @@ checkpoint role without recording it as a protocol deviation.
 7. Every output directory records branch commit, full argv, CSV MD5s, and
    checkpoint hashes.
 8. No job resumes from a checkpoint produced by another method or horizon.
+9. For independent Vanilla, `selected_horizon_csv/manifest.json` records the
+   requested horizon and source column 0/1/2 before the trainer starts.
 
 If a preflight fails, fix the data port or path.  Do not compensate by changing
 ll's model implementation.

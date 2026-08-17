@@ -23,9 +23,7 @@ OUT_DIR="${OUT_DIR:-/scratch/ll5914/experiments/egtea_rulstm_small_tsn}"
 TRAINER="${PROJECT_ROOT}/baselines/rulstm_hdepic/train_stream_rulstm.py"
 
 "${PROJECT_ROOT}/scripts/egtea/verify_stream_split.sh"
-[[ "$(find "${FEAT_DIR}" -maxdepth 1 -name '*.npy' -type f | wc -l)" == "86" ]] || {
-  echo "ERROR: expected 86 TSN feature files under ${FEAT_DIR}" >&2; exit 2;
-}
+"${PROJECT_ROOT}/scripts/egtea/verify_rulstm_feature_bundle.sh" "${FEAT_DIR}" "${ANN_DIR}"
 mkdir -p "${OUT_DIR}" /scratch/ll5914/logs
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
 

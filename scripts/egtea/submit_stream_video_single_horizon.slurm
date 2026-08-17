@@ -26,20 +26,27 @@ ENCODER_LORA="${ENCODER_LORA:?Set the EGTEA video encoder-LoRA sidecar}"
 PREDICTOR_LORA="${PREDICTOR_LORA:?Set the EGTEA video predictor-LoRA sidecar}"
 HORIZON="${HORIZON:?Set HORIZON to 2, 4, or 6}"
 OUT_DIR="${OUT_DIR:-/scratch/ll5914/experiments/egtea_vanilla_video_h${HORIZON}}"
+DATA_DIR="${DATA_DIR:-${OUT_DIR}/selected_horizon_csv}"
 
 case "${HORIZON}" in 2|4|6) ;; *) echo "HORIZON must be 2, 4, or 6" >&2; exit 2 ;; esac
 "${PROJECT_ROOT}/scripts/egtea/verify_stream_split.sh"
 for path in "${CHECKPOINT}" "${ENCODER_LORA}" "${PREDICTOR_LORA}"; do
   [[ -f "${path}" ]] || { echo "ERROR: missing ${path}" >&2; exit 2; }
 done
-mkdir -p "${OUT_DIR}" /scratch/ll5914/logs
+"${PROJECT_ROOT}/scripts/egtea/verify_stream_video_tree.sh" "${VIDEO_ROOT}" "${ANN_DIR}"
+mkdir -p "${OUT_DIR}" "${DATA_DIR}" /scratch/ll5914/logs
 export VJEPA_ROOT PYTHONPATH="${PROJECT_ROOT}:${VJEPA_ROOT}:${PYTHONPATH:-}"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 
 cd "${PROJECT_ROOT}"
-exec "${PYTHON}" -m app.hdepic_lora_action_anticipation.train_stream_video \
+"${PYTHON}" scripts/egtea/prepare_vanilla_single_horizon_csv.py \
   --train-csv "${ANN_DIR}/EGTEA_train_stream_mtp.csv" \
   --val-csv "${ANN_DIR}/EGTEA_val_stream_mtp.csv" \
+  --out-dir "${DATA_DIR}" --horizon "${HORIZON}" --mode full
+
+exec "${PYTHON}" -m app.hdepic_lora_action_anticipation.train_stream_video \
+  --train-csv "${DATA_DIR}/train.csv" \
+  --val-csv "${DATA_DIR}/val.csv" \
   --video-root "${VIDEO_ROOT}" \
   --checkpoint "${CHECKPOINT}" \
   --encoder-lora "${ENCODER_LORA}" \

@@ -40,8 +40,7 @@ export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
   --checkpoint "${CHECKPOINT}" --encoder-lora "${ENCODER_LORA}" \
   --fps 8 --img-size 256 --chunk-frames 16 --batch-chunks 4
 
-[[ "$(find "${FEAT_DIR}" -maxdepth 1 -name '*.npy' -type f | wc -l)" == "86" ]]
-[[ "$(find "${FEAT_DIR}" -maxdepth 1 -name '*.json' -type f | wc -l)" == "86" ]]
+"${PROJECT_ROOT}/scripts/egtea/verify_rulstm_feature_bundle.sh" "${FEAT_DIR}" "${ANN_DIR}"
 
 exec "${PYTHON}" -u "${ROOT}/train_stream_rulstm.py" \
   --train-csv "${ANN_DIR}/EGTEA_train_stream_mtp.csv" \
