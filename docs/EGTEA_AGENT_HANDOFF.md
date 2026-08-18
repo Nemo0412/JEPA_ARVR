@@ -20,9 +20,10 @@ exports, checkpoints, and feature tensors are not committed.
      app/hdepic_lora_action_anticipation/{binary_input_adapter.py,gaze.py,train_stream_mtp_concat_ca.py,egtea_gaze.py}
    ```
 
-3. `baselines/rulstm_hdepic/` is copied byte-for-byte from ll's
-   `baseline@6ce4290d2c907ccef96e35e227ae797a266934c1`.  Dataset wrappers live in
-   `scripts/egtea/`; do not edit the copied trainer to port EGTEA.
+3. `baselines/rulstm_hdepic/` is copied from ll's baseline branch. The AGA
+   vendor tree and streaming trainer are copied exactly from ll's upstream
+   commit `f17f7e8`. Dataset wrappers live in `scripts/egtea/`; do not edit the
+   copied trainers to port EGTEA.
 4. The six-run Vanilla V-JEPA matrix remains defined by ll's current code.  This
    branch supplies its EGTEA split and path/reader wiring; it does not guess or
    redefine the six method configurations.
@@ -46,9 +47,11 @@ exports, checkpoints, and feature tensors are not committed.
 | Gaze/MTP reference launcher | `scripts/egtea/submit_stream_gaze_ca_mtp.slurm` |
 | Video-only single-horizon reference | `scripts/egtea/submit_stream_video_single_horizon.slurm` |
 | Frozen-triplet -> selected-horizon label adapter | `scripts/egtea/prepare_vanilla_single_horizon_csv.py` |
-| RU-LSTM V-JEPA feature route | `scripts/egtea/submit_rulstm_vjepa_features.slurm` |
-| RU-LSTM TSN small/Large v2 | `scripts/egtea/submit_rulstm_{small_tsn,large_v2}.slurm` |
+| RU-LSTM TSN small | `scripts/egtea/submit_rulstm_small_tsn.slurm` |
 | RU-LSTM feature-pair/session gate | `scripts/egtea/verify_rulstm_feature_bundle.sh` |
+| Exact AGA vendor/model code | `baselines/AGA/` |
+| Exact streaming AGA trainer | `baselines/aga_hdepic/train_stream_aga.py` |
+| EGTEA AGA launcher | `scripts/egtea/submit_aga_stream.slurm` |
 | Frozen model-facing split | `data/egtea/vjepa_annotations/stream_half_split/split1/` |
 
 ## Frozen EGTEA temporal-half split
@@ -131,6 +134,42 @@ vocabulary is 19 verbs, 51 nouns, and 106 action pairs.
 
 The split was independently regenerated in Yifan's workspace by Slurm job
 `15876527` and matched all three frozen CSVs byte-for-byte.
+
+## Baseline status and results
+
+### AGA
+
+AGA is runnable from this branch without reimplementing the model. The model
+and trainer are ll's exact `f17f7e8` sources; the EGTEA launcher changes only
+dataset paths and applies the frozen EGTEA split/feature gates.
+
+```bash
+export PROJECT_ROOT=/path/to/JEPA_ARVR
+export PYTHON=/scratch/ll5914/conda_envs/SVD/bin/python
+export EGTEA_ROOT=/scratch/ll5914/datasets/EGTEA
+export FEAT_DIR=/path/to/86-session/rgb_ll_tsn_4fps
+export OUT_DIR=/scratch/ll5914/experiments/egtea_aga_stream
+sbatch "$PROJECT_ROOT/scripts/egtea/submit_aga_stream.slurm"
+```
+
+Yifan's formal job `15784510` completed all 50 epochs and full validation
+(`N=22,741`). Best epoch 2 native Action Top-5 was:
+
+| @+2s | @+4s | @+6s |
+|---:|---:|---:|
+| `36.260499%` | `34.310307%` | `32.854802%` |
+
+The local model count is `20.437080M` total/trainable parameters, including
+`20.285458M` in the AGA module. The master table's `~480MB` is an externally
+reported pipeline-size convention and must not be silently replaced by this
+temporal-module parameter count.
+
+### RU-LSTM Large
+
+Local RU-LSTM Large and V-JEPA-feature attempts are abandoned and intentionally
+have no launcher in this branch. Use ll's reported EGTEA table values
+`37.41/34.55/33.10%` at `+2/+4/+6s`; do not attribute them to a local
+checkpoint or rerun recipe. The ordinary small TSN RU-LSTM route remains.
 
 ## Required data layouts
 
