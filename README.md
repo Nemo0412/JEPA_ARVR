@@ -346,11 +346,37 @@ Gaze+pose: `binary_input_adapter_gaze_pose_matrix` (RGB + gaze map + SLAM `pose_
 
 ---
 
+## Encoder L23 20-video prune profiling
+
+Last-layer (L23) attention on **20 unique HD-EPIC val videos** (first 20 `video_id` in clip_split val CSV; 32 frames @ 8 fps; video joint LoRA). Score per head:
+
+`imp[h,j] = Σ_q softmax(QKᵀ/√d)[q,j]` → reshape `[T=16, 16, 16]`.
+
+```bash
+sbatch scripts/submit_encoder_L23_multiclip.slurm   # N_SAMPLE=20
+python scripts/plot_L23_explainer_figures.py --n-sample 20
+```
+
+Out: `experiments/fastgen_head_heatmaps/encoder_L23_multiclip/`
+
+| Figure | Script | How it is made |
+|---|---|---|
+| `L23_mean_spatial_16heads.png` | `analyze_encoder_last_layer_multiclip.py` | Per-head spatial map, **mean over 20 videos** (4×4 grid) |
+| `L23_cross_video_corr.png` | same | Per-head mean pairwise spatial correlation across the 20 clips |
+| `explain_1_stable_vs_content.png` | `plot_L23_explainer_figures.py` | h3 (stable) vs h8 (content): 3 example clips + **20-video mean** |
+| `explain_2_recency_bias.png` | same | Temporal key-mass avg over 20 videos; recency bar per head |
+| `explain_3_border_vs_center.png` | same | Border vs center mass, **20-video avg** per head |
+
+Stable heads `{0,1,3,4,6,9,11,12}` (border/corner, high cross-video corr); content `{8,10,14}` (center, video-dependent). KV mask from these groups: `app/hdepic_lora_action_anticipation/l23_pattern_kv_prune.py`.
+
+---
+
 ## Quick pointers
 
 - Submit scripts: `scripts/submit_egtea_*.slurm`, `scripts/submit_p01_*.slurm`
 - Clip-split builder: `scripts/make_hdepic_clip_split.py`
 - Older HPC run index: `docs/RECENT_RUNS.md`
 - HD-EPIC CSV adapter notes: `scripts/README_hdepic_action_anticipation.md`
+- 20-video L23 prune figures: `scripts/analyze_encoder_last_layer_multiclip.py`, `scripts/plot_L23_explainer_figures.py`
 
 Experiment artifacts (checkpoints, logs) live under `/scratch/.../experiments/` on the cluster and are **not** committed here.
