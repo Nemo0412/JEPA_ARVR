@@ -1,0 +1,319 @@
+task: egtea-stream-mtp-pruning
+task_document: docs/evaluation_protocols/EGTEA_STREAM_MTP_PRUNING.md
+protocols:
+  lossaware3840-gaze-spatial-native-v1:
+    status: superseded
+    superseded_by: lossaware3840-gaze-spatial-native-v2
+    dataset_loader: app/hdepic_lora_action_anticipation/eval_stream_mtp_gaze_spatial_prune.py
+    split_builder: data/egtea/vjepa_annotations/stream_half_split/split1
+    train_entrypoint: unavailable
+    internal_validation: app/hdepic_lora_action_anticipation/eval_stream_mtp_gaze_spatial_prune.py
+    official_evaluation: app/hdepic_lora_action_anticipation/eval_stream_mtp_gaze_spatial_prune.py
+    metric_implementation: app/hdepic_lora_action_anticipation/eval_stream_mtp_gaze_spatial_prune.py
+    launchers:
+      - scripts/egtea/run_b17_gaze_spatial_prune_eval.slurm
+    required_gates:
+      - exact K=3840 final token count
+      - per-slot quotas match the declared loss-aware histogram
+      - true_full predictor positions equal selected original indices
+      - gaze reads only exact observed frame indices before tick_frame
+      - only Fixation/Saccade parser types 1/2 count as valid gaze
+      - invalid gaze uses local attention fallback without center imputation
+      - all paired variants use identical rows and frozen parent
+      - paired confidence intervals resample video/session clusters
+  lossaware3840-gaze-spatial-native-v2:
+    status: active
+    dataset_loader: app/hdepic_lora_action_anticipation/eval_stream_mtp_gaze_spatial_prune.py
+    split_builder: data/egtea/vjepa_annotations/stream_half_split/split1
+    train_entrypoint: unavailable
+    internal_validation: app/hdepic_lora_action_anticipation/eval_stream_mtp_gaze_spatial_prune.py
+    official_evaluation: app/hdepic_lora_action_anticipation/eval_stream_mtp_gaze_spatial_prune.py
+    metric_implementation: app/hdepic_lora_action_anticipation/eval_stream_mtp_gaze_spatial_prune.py
+    launchers:
+      - scripts/egtea/run_b17_gaze_spatial_prune_eval.slurm
+    required_gates:
+      - exact K=3840 final token count
+      - per-slot quotas match the declared loss-aware histogram
+      - calib reproduces the exact 10s mask and uses layer-20 continuous tie-breaks
+      - true_full predictor positions equal selected original indices
+      - gaze reads only exact observed frame indices before tick_frame
+      - only Fixation/Saccade parser types 1/2 count as valid gaze
+      - invalid gaze uses local attention fallback without center imputation
+      - all paired variants use identical rows and frozen parent
+      - paired confidence intervals resample video/session clusters
+      - every registered input matches its fixed SHA-256
+  gaze-quality-disagreement-posthoc-v1:
+    status: active
+    dataset_loader: scripts/analyze_b17_gaze_quality_disagreement.py
+    split_builder: data/egtea/vjepa_annotations/stream_half_split/split1
+    train_entrypoint: unavailable
+    internal_validation: scripts/analyze_b17_gaze_quality_disagreement.py
+    official_evaluation: unavailable
+    metric_implementation: scripts/analyze_b17_gaze_quality_disagreement.py
+    launchers:
+      - scripts/egtea/run_b17_gaze_quality_analysis.slurm
+    required_gates:
+      - paired NPZ and validation CSV match fixed SHA-256 values
+      - +2s row keys bijectively match all 22741 validation rows
+      - exact observed gaze frames precede tick_frame
+      - only Fixation/Saccade parser types 1/2 count as valid gaze
+      - quality strata use fixed geometry-based thresholds
+      - confidence intervals resample video/session clusters
+      - output is labeled post-hoc descriptive and cannot promote a method
+  lossaware3840-random-spatial-native-v1:
+    status: active
+    dataset_loader: app/hdepic_lora_action_anticipation/eval_stream_mtp_gaze_spatial_prune.py
+    split_builder: data/egtea/vjepa_annotations/stream_half_split/split1
+    train_entrypoint: unavailable
+    internal_validation: app/hdepic_lora_action_anticipation/eval_stream_mtp_gaze_spatial_prune.py
+    official_evaluation: app/hdepic_lora_action_anticipation/eval_stream_mtp_gaze_spatial_prune.py
+    metric_implementation: app/hdepic_lora_action_anticipation/eval_stream_mtp_gaze_spatial_prune.py
+    launchers:
+      - scripts/egtea/run_b17_random_spatial_prune_eval.slurm
+    required_gates:
+      - exact K=3840 final token count
+      - per-slot quotas match the loss-aware-derived temporal profile
+      - each row and partial slot samples uniformly without replacement using fixed seed 17
+      - random choices are keyed by video_id tick_frame and slot and are batch-order invariant
+      - random selection consumes no RGB attention gaze or calibration spatial score
+      - true_full predictor positions equal selected original indices
+      - all validation rows and frozen input SHA-256 values match v2
+  temporal-allocator-uniform-spatial-k3840-v1:
+    status: canonical
+    dataset_loader: app/hdepic_lora_action_anticipation/eval_stream_mtp_temporal_prune.py
+    split_builder: data/egtea/vjepa_annotations/stream_half_split/split1
+    train_entrypoint: unavailable
+    internal_validation: app/hdepic_lora_action_anticipation/eval_stream_mtp_temporal_prune.py
+    official_evaluation: app/hdepic_lora_action_anticipation/eval_stream_mtp_temporal_prune.py
+    metric_implementation: app/hdepic_lora_action_anticipation/eval_stream_mtp_fixed_budget_prune.py
+    launchers:
+      - scripts/egtea/run_b17_temporal_allocator_eval.slurm
+    required_gates:
+      - exact K=3840 final token count for every row and arm
+      - deterministic farthest-point uniform spatial selection is identical across arms
+      - lossaware uses the registered relative-recency quota profile
+      - temporal_uniform distributes K as evenly as capacity permits
+      - each temporal_random arm permutes the lossaware quota multiset per stable row key
+      - temporal random seeds are fixed to 17 29 and 43
+      - temporal_attention_sum uses only final-block received-attention mass from observed tokens
+      - temporal_recent keeps the newest 15 complete 0.25-second slots exactly
+      - true_full predictor positions equal selected original indices
+      - all paired arms use identical validation rows and frozen inputs
+      - smoke is exactly 2048 fixed-key rows and full forbids any subset
+      - all validation rows and six shared model/data input SHA-256 values match v2
+  task-protected-jepa-oracle-gate-l16-v1:
+    status: provisional
+    route_status: stopped-inconclusive-target-gate-mismatch
+    dataset_loader: app/hdepic_lora_action_anticipation/eval_stream_mtp_fixed_budget_prune.py::IndexedStreamMTPDataset
+    split_builder: scripts/build_b17_tpjepa_oracle_manifest.py
+    target_exporter: app/hdepic_lora_action_anticipation/export_task_protected_jepa_targets.py
+    calibration_target_auditor: scripts/analyze_b17_tpjepa_calibration_targets.py
+    oracle_evaluator: app/hdepic_lora_action_anticipation/evaluate_task_protected_jepa_oracle.py
+    train_entrypoint: not-applicable
+    internal_validation: unavailable
+    official_evaluation: not-applicable
+    metric_implementation: app/hdepic_lora_action_anticipation/evaluate_task_protected_jepa_oracle.py
+    launchers:
+      - scripts/egtea/build_b17_tpjepa_oracle_manifest_cpu.slurm
+      - scripts/egtea/test_b17_task_protected_jepa_cpu.slurm
+      - scripts/egtea/run_b17_tpjepa_target_smoke.slurm
+      - scripts/egtea/run_b17_tpjepa_target_shard.slurm
+      - scripts/egtea/analyze_b17_tpjepa_calibration_targets_cpu.slurm
+    input_sha256:
+      train_csv: 6d604dded2f8ba875caace4d9266b87616bcfddb40c522f443a316786cdd2844
+      calibration_manifest_csv: e09fa32c7351f4ffe0c387b70c708e76c0cec125b9df0959e0d58abb2111b18b
+      heldout_manifest_csv: 937f1e140fc0eeb3942804cebdece5ecef43e39202d92be18f3a5d59fcdc9d42
+      oracle_manifest_json: 867d3de749fb4c07fef2ec535b0e78a67572b45d144d4bfb3822228186710f5b
+      vjepa_vitl_checkpoint: 5346856ec9df69487fe72a25bf2632aaa8112df33fb67708e3f7374edc1f7012
+      stream_mtp_parent_best: 7b12fdd545c4330198a3a149e02c40566735d86c427e7631acdaa1ea57c02949
+      encoder_lora_best: dd60d54737db584bd0897922784c0e2909a7c98e90ed05bbaa55b3ccb4c3a4eb
+      predictor_lora_best: 1e70d73a311dd290df4e6137e4b0adfcc6dc8fbdd63b0d905463e59a1705895c
+    target_schema:
+      version: 2
+      primary_utility: weighted verb+noun+action deletion-loss delta
+      stability_views:
+        - weighted action-only deletion-loss delta
+        - weighted action true-class margin drop
+    calibration_target_stability_gate:
+      expected_rows: 512
+      expected_noncore_groups_per_row: 144
+      nondegenerate_row_fraction_min: 0.99
+      task_action_loss_spearman_median_min: 0.50
+      task_action_margin_spearman_median_min: 0.30
+      task_action_loss_sign_agreement_min: 0.60
+      protection_quotas: [16, 24]
+      action_loss_protection_overlap_median_min: 0.50
+      action_margin_protection_overlap_median_min: 0.35
+    required_gates:
+      - exact immutable 64-video calibration and 22-video held-out manifests
+      - exact 512 calibration and 2048 held-out 10-second row manifests
+      - frozen parent and all sidecars match registered SHA-256 values
+      - no-delete and L16 token-attention parity pass
+      - coarse groups are exactly one slot by 8x8 patches
+      - newest four slots are always protected
+      - all arms keep exact K4096 or K3072 without partial groups
+      - removed groups and target latents cannot leak into JEPA context inputs
+      - task utility is actual weighted multi-horizon deletion loss
+      - schema-v2 action-only loss delta and action-margin drop are emitted for every deletion
+      - calibration target-stability thresholds pass before held-out target export
+      - JEPA residual is masked latent reconstruction error
+      - task and JEPA scores are applied lexicographically and never summed
+      - calibration choices freeze before one-shot held-out evaluation
+      - paired confidence intervals resample video/session clusters
+  task-protected-jepa-online-l16-v1:
+    status: provisional
+    route_status: blocked-by-inconclusive-v1-oracle-gate
+    dataset_loader: unavailable
+    split_builder: data/egtea/vjepa_annotations/stream_half_split/split1
+    train_entrypoint: unavailable
+    internal_validation: unavailable
+    official_evaluation: unavailable
+    metric_implementation: unavailable
+    launchers: []
+    required_gates:
+      - oracle and formal one-slot by 4x4 bridge gates passed
+      - scorer consumes only observed per-instance L16 features and positions
+      - recent core task protection JEPA ranking and exact K execute in that order
+      - encoder survivors keep original positions through blocks 17 to 23
+      - predictor position semantics match the registered L16 attention anchor
+      - scorer selected-set gate passes on held-out train before co-adaptation
+      - parent-logit and normalized future-latent distillation are enabled
+      - all hyperparameters and stopping rules freeze before validation
+      - latency includes scorer pooling indexing encoder predictor and heads
+      - all validation rows and frozen input SHA-256 values match the task contract
+  attention-jepa-disagreement-swap-oracle-l16-v2:
+    status: provisional
+    route_status: completed-gate-failed-end-jepa-scoring
+    dataset_loader: app/hdepic_lora_action_anticipation/eval_stream_mtp_fixed_budget_prune.py::IndexedStreamMTPDataset
+    split_builder: scripts/build_b17_tpjepa_oracle_manifest.py
+    target_exporter: not-applicable
+    train_entrypoint: not-applicable
+    internal_validation: scripts/analyze_b17_tpjepa_swap_oracle.py
+    official_evaluation: not-applicable
+    metric_implementation: scripts/analyze_b17_tpjepa_swap_oracle.py
+    oracle_evaluator: app/hdepic_lora_action_anticipation/evaluate_attention_jepa_swap_oracle.py
+    launchers:
+      - scripts/egtea/test_b17_task_protected_jepa_cpu.slurm
+      - scripts/egtea/run_b17_tpjepa_swap_oracle.slurm
+      - scripts/egtea/analyze_b17_tpjepa_swap_oracle_cpu.slurm
+    input_sha256:
+      train_csv: 6d604dded2f8ba875caace4d9266b87616bcfddb40c522f443a316786cdd2844
+      heldout_manifest_csv: 937f1e140fc0eeb3942804cebdece5ecef43e39202d92be18f3a5d59fcdc9d42
+      vjepa_vitl_checkpoint: 5346856ec9df69487fe72a25bf2632aaa8112df33fb67708e3f7374edc1f7012
+      stream_mtp_parent_best: 7b12fdd545c4330198a3a149e02c40566735d86c427e7631acdaa1ea57c02949
+      encoder_lora_best: dd60d54737db584bd0897922784c0e2909a7c98e90ed05bbaa55b3ccb4c3a4eb
+      predictor_lora_best: 1e70d73a311dd290df4e6137e4b0adfcc6dc8fbdd63b0d905463e59a1705895c
+    population:
+      manifest_slice: [0, 128]
+      expected_rows: 128
+      expected_video_clusters: 22
+    swap_contract:
+      prune_layer: 16
+      group: one tubelet slot by 8x8 patches
+      tokens_per_group: 64
+      budgets: [4096, 3072]
+      candidates_per_source: 8
+      sources: [jepa_disagreement, anti_jepa, attention_boundary]
+      no_op_allowed: true
+      singleton_task_deletion_target: forbidden
+    decision_gate:
+      bootstrap_unit: video_id
+      bootstrap_samples: 20000
+      bootstrap_seed: 170217
+      min_relative_task_loss_reduction: 0.005
+      min_improved_row_fraction: 0.50
+      jepa_improvement_cluster_ci_lower_gt: 0.0
+      jepa_minus_each_control_cluster_ci_lower_gt: 0.0
+      overall_rule: at least one K passes all criteria and both K have positive point direction over both controls
+    required_gates:
+      - exact leading 128 rows of the untouched 2048-row held-out-train manifest
+      - all 22 held-out video clusters occur in the scientific population
+      - L16 native no-delete parity max_abs is at most 1e-5
+      - coarse groups are exactly one slot by 8x8 patches
+      - attention baseline contains exactly 64 groups at K4096 and 48 at K3072
+      - attention baseline receives no recent-core task-protection or JEPA modification
+      - JEPA target groups and latents cannot leak into predictor context
+      - task predictor-LoRA is disabled only for JEPA reconstruction residual
+      - singleton task-deletion loss is never computed
+      - every candidate is one kept-group removal plus one dropped-group addition
+      - each candidate source emits exactly eight stable rank-paired swaps
+      - every evaluated set preserves exact K and original post-L16 encoder positions
+      - true weighted multi-horizon task loss is measured only after complete swaps
+      - smoke can alter runtime strategy only and cannot enter the scientific audit
+      - no scorer training validation evaluation or co-adaptation is authorized by this protocol
+  predictor-compensated-completion-l16-e0-v1:
+    status: provisional
+    route_status: completed-teacher-gate-failed-jepa-forbidden
+    dataset_loader: app/hdepic_lora_action_anticipation/eval_stream_mtp_fixed_budget_prune.py::IndexedStreamMTPDataset
+    split_builder: scripts/build_b17_tpjepa_oracle_manifest.py
+    train_entrypoint: not-applicable
+    internal_validation: scripts/analyze_b17_predictor_completion_e0.py
+    official_evaluation: not-applicable
+    metric_implementation: app/hdepic_lora_action_anticipation/evaluate_predictor_compensated_completion_e0.py
+    completion_evaluator: app/hdepic_lora_action_anticipation/evaluate_predictor_compensated_completion_e0.py
+    launchers:
+      - scripts/egtea/test_b17_task_protected_jepa_cpu.slurm
+      - scripts/egtea/run_b17_predictor_completion_e0.slurm
+      - scripts/egtea/analyze_b17_predictor_completion_e0_cpu.slurm
+    input_sha256:
+      train_csv: 6d604dded2f8ba875caace4d9266b87616bcfddb40c522f443a316786cdd2844
+      heldout_manifest_csv: 937f1e140fc0eeb3942804cebdece5ecef43e39202d92be18f3a5d59fcdc9d42
+      e0_row_keys: 022f378f1a2104faad7974d48c745f41bb6175202445bbace5901400ff1369ee
+      vjepa_vitl_checkpoint: 5346856ec9df69487fe72a25bf2632aaa8112df33fb67708e3f7374edc1f7012
+      stream_mtp_parent_best: 7b12fdd545c4330198a3a149e02c40566735d86c427e7631acdaa1ea57c02949
+      encoder_lora_best: dd60d54737db584bd0897922784c0e2909a7c98e90ed05bbaa55b3ccb4c3a4eb
+      predictor_lora_best: 1e70d73a311dd290df4e6137e4b0adfcc6dc8fbdd63b0d905463e59a1705895c
+    population:
+      manifest_slice: [128, 256]
+      expected_rows: 128
+      expected_video_clusters: 22
+      selection_boundary: frozen before any E0 task outcome; never used for final validation selection
+    completion_contract:
+      prune_layer: 16
+      group: one tubelet slot by 8x8 patches
+      tokens_per_group: 64
+      reference_budget: 4096
+      retained_budget: 3072
+      bridge_tokens: 1024
+      reference: exact top-64 group-attention set
+      retained: exact top-48 prefix set of the same stable attention ranking
+      teacher_target: bridge-position block-23 latents from the K4096 reference route
+      recovery_interface: separate frozen predictor pass at original positions followed by the unchanged rebased future-prediction task path
+      predictor_lora_during_recovery: disabled
+      predictor_lora_during_future_prediction: enabled
+      teacher_stage_arms: [reference_k4096, retained_k3072, teacher_completion, mask_only_completion, zero_completion, mean_completion, same_slot_pool_completion]
+      jepa_stage_arms: [reference_k4096, retained_k3072, jepa_completion]
+    teacher_gate:
+      primary_metric: paired weighted verb+noun+action CE over horizons 2/4/6s with weights 1.0/0.7/0.5
+      bootstrap_unit: video_id
+      bootstrap_samples: 20000
+      bootstrap_seed: 170317
+      min_relative_task_loss_reduction: 0.005
+      improvement_cluster_ci_lower_gt: 0.0
+      min_improved_row_fraction: 0.50
+      failure_decision: close E0 without running frozen JEPA completion
+    jepa_and_cost_gate:
+      min_teacher_gap_recovery_fraction: 0.25
+      improvement_cluster_ci_lower_gt: 0.0
+      jepa_minus_each_placebo_cluster_ci_lower_gt: 0.0
+      post_l16_dense_mac_reduction_gt: 0.0
+      min_model_e2e_latency_reduction: 0.05
+      latency_population: first 4 frozen E0 rows
+      latency_repeats_per_row_arm: 5
+      overall_rule: representation and efficiency gates must both pass
+    required_gates:
+      - exact heldout-manifest rows 128 through 255 and all 22 video clusters
+      - no E0 row is used for final validation selection
+      - L16 native no-delete parity max_abs is at most 1e-5
+      - untouched K4096 reference split-and-merge parity is bit exact
+      - K3072 is the nested top-48 prefix set of the same stable ranking as K4096
+      - retained and bridge positions are disjoint and preserve exact original positions
+      - task-interface counts are exactly 4096 reference/completed 3072 retained and 1024 bridge
+      - teacher bridge latents come only from the K4096 block-23 reference route
+      - JEPA recovery accepts retained values plus target positions but no target values
+      - task predictor-LoRA is disabled during mask-only/JEPA recovery and restored for future prediction
+      - teacher and all four placebo arms run and audit before JEPA scientific authorization
+      - smoke outcomes cannot alter arms population metrics or thresholds
+      - paired confidence intervals resample video/session clusters
+      - dense MAC scope and model-only end-to-end CUDA-event latency scope remain separately labeled
+      - no validation learned codec L8 or history-scaling run is authorized by E0
