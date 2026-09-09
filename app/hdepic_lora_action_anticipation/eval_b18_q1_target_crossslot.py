@@ -6,6 +6,7 @@ softmax and removes context-query -> same-time-slot context-key contributions.
 Target queries/keys are never confused with the latest observed context slot.
 """
 from __future__ import annotations
+from app.hdepic_lora_action_anticipation.share_paths import VJEPA_ROOT as SHARE_VJEPA_ROOT
 
 import argparse
 import json
@@ -221,7 +222,7 @@ def main():
                     code_root / "app/hdepic_lora_action_anticipation/eval_stream_mtp_multi_strategy.py",
                     code_root / "app/hdepic_lora_action_anticipation/eval_stream_mtp_kvcache_prune.py",
                     code_root / "scripts/egtea/run_b18_q1_target_crossslot.slurm",
-                    code_root / "vjepa2/src/models/utils/modules.py", code_root / "vjepa2/src/models/predictor.py"]
+                    SHARE_VJEPA_ROOT / "src/models/utils/modules.py", SHARE_VJEPA_ROOT / "src/models/predictor.py"]
     metadata = {"evaluation_protocol": PROTOCOL, "sample_manifest_protocol": P.PROTOCOL,
         "run_tag": args.tag, "job_id": os.environ.get("SLURM_JOB_ID"), "metric_scope": "native",
         "eval_path": "EGTEA split1 ctx16 fixed paired4000; native communicating MTP; target-query history selection",

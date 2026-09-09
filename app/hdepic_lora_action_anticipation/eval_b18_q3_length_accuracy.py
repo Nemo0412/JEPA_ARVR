@@ -5,6 +5,7 @@ Prepare/cache and evaluation run only within Slurm/container. Frozen Q1 rows,
 independent training-calibrated masks; no validation-conditioned selection.
 """
 from __future__ import annotations
+from app.hdepic_lora_action_anticipation.share_paths import DATA_ROOT as SHARE_DATA_ROOT, VJEPA_ROOT as SHARE_VJEPA_ROOT
 
 import argparse
 import csv
@@ -25,7 +26,7 @@ from app.hdepic_lora_action_anticipation import train_stream_mtp as T
 from app.hdepic_lora_action_anticipation.eval_stream_mtp_multi_strategy import predict_from_encoded
 
 PROTOCOL = "b18-predictor-prune/egtea-q3-fixed4s-length-accuracy-v1"
-ROOT = Path("/scratch/yh6416/VJEPA2-EXP")
+ROOT = Path(str(SHARE_DATA_ROOT))
 OUTROOT = ROOT / "outputs/attn_corner_sink/q3_length_accuracy"
 ANN = ROOT / "data/egtea/vjepa_annotations/stream_16s_split/split1"
 Q1MANIFEST = ROOT / "outputs/attn_corner_sink/q1_evidence_audit_20260905/paired4000_manifest.csv"
@@ -258,8 +259,8 @@ def evaluate(args):
         class_counts=[len(v) for v in maps],
         source_sha256={str(Path(p)): sha(p) for p in [__file__, P.__file__, T.__file__,
                      Path(__file__).with_name("eval_stream_mtp_multi_strategy.py"),
-                     Path(__file__).resolve().parents[2] / "vjepa2/src/models/utils/modules.py",
-                     Path(__file__).resolve().parents[2] / "vjepa2/src/models/predictor.py"]},
+                     SHARE_VJEPA_ROOT / "src/models/utils/modules.py",
+                     SHARE_VJEPA_ROOT / "src/models/predictor.py"]},
         gpu=dict(name=torch.cuda.get_device_name(), memory=torch.cuda.get_device_properties(0).total_memory,
                  torch=torch.__version__, cuda=torch.version.cuda),
         target_positions=dict(context=list(range(KEEP)), anticipation_steps=8, first_target=6144,

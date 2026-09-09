@@ -6,6 +6,7 @@ post-softmax source sums explain current validation scores, not the training
 calibration map. All main swap predictions use original token coordinates.
 """
 from __future__ import annotations
+from app.hdepic_lora_action_anticipation.share_paths import VJEPA_ROOT as SHARE_VJEPA_ROOT
 
 import argparse
 import hashlib
@@ -215,7 +216,7 @@ def main():
     source_paths = [Path(__file__), Path(P.__file__), Path(R.__file__), Path(R.Q.__file__), Path(P.T.__file__),
         root / "app/hdepic_lora_action_anticipation/eval_stream_mtp_multi_strategy.py",
         root / "app/hdepic_lora_action_anticipation/eval_stream_mtp_kvcache_prune.py",
-        Path(imported_modules.__file__), root / "vjepa2/src/models/predictor.py", root / "scripts/egtea/run_b18_q1_score_swaps.slurm"]
+        Path(imported_modules.__file__), SHARE_VJEPA_ROOT / "src/models/predictor.py", root / "scripts/egtea/run_b18_q1_score_swaps.slurm"]
     metadata = {"evaluation_protocol": PROTOCOL, "sample_manifest_protocol": P.PROTOCOL,
         "run_tag": args.tag, "job_id": os.environ.get("SLURM_JOB_ID"), "metric_scope": "native",
         "eval_path": "EGTEA fixed4000; original-coordinate same-slot score swaps; native communicating MTP",

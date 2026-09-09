@@ -14,6 +14,7 @@
 #     predictor RoPE EXTRAPOLATES past its trained 32-slot depth -> OOD, by design here).
 # Real V-JEPA 2.0 finetuned. Slurm only.
 from __future__ import annotations
+from app.hdepic_lora_action_anticipation.share_paths import DATA_ROOT as SHARE_DATA_ROOT, VJEPA_ROOT as SHARE_VJEPA_ROOT
 
 import argparse, json, os, sys
 from pathlib import Path
@@ -21,7 +22,7 @@ import numpy as np, torch
 from decord import VideoReader, cpu
 
 CODE_ROOT = os.environ.get("PROJECT_ROOT", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-for p in (os.path.join(CODE_ROOT, "vjepa2"), CODE_ROOT):
+for p in (str(SHARE_VJEPA_ROOT), CODE_ROOT):
     if p not in sys.path:
         sys.path.insert(0, p)
 

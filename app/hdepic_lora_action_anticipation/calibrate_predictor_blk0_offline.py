@@ -11,13 +11,14 @@
 # map. Saved as .npy + JSON metadata; consumed at eval by the `pred_offline_{high,low}` strategy.
 # Slurm only.
 from __future__ import annotations
+from app.hdepic_lora_action_anticipation.share_paths import DATA_ROOT as SHARE_DATA_ROOT, VJEPA_ROOT as SHARE_VJEPA_ROOT
 
 import argparse, hashlib, json, os, sys
 from pathlib import Path
 import numpy as np, torch
 
 CODE_ROOT = os.environ.get("PROJECT_ROOT", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-for p in (os.path.join(CODE_ROOT, "vjepa2"), CODE_ROOT):
+for p in (str(SHARE_VJEPA_ROOT), CODE_ROOT):
     if p not in sys.path:
         sys.path.insert(0, p)
 

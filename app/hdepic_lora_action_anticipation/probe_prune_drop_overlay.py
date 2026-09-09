@@ -5,14 +5,16 @@
 # offline calibrated map (pred_offline_*). Single clip, same window builder as the overlay probe.
 # Slurm only.
 from __future__ import annotations
+from app.hdepic_lora_action_anticipation.share_paths import DATA_ROOT as SHARE_DATA_ROOT, VJEPA_ROOT as SHARE_VJEPA_ROOT
 
-import argparse, os, sys
+import argparse, os, sys, json
+from app.hdepic_lora_action_anticipation.share_reproduction import select_sample, file_sha256, sample_frame_indices
 from pathlib import Path
 import numpy as np, torch
 from decord import VideoReader, cpu
 
 CODE_ROOT = os.environ.get("PROJECT_ROOT", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-for p in (os.path.join(CODE_ROOT, "vjepa2"), CODE_ROOT):
+for p in (str(SHARE_VJEPA_ROOT), CODE_ROOT):
     if p not in sys.path:
         sys.path.insert(0, p)
 
@@ -63,6 +65,8 @@ def main():
     ap.add_argument("--strategy", required=True)
     ap.add_argument("--calib-path", default=None); ap.add_argument("--score-block", type=int, default=0)
     ap.add_argument("--video-id", default=None)
+    ap.add_argument("--frame-mode", choices=("csv", "legacy_stride"), default="csv", help="Use accuracy CSV frames, or explicitly reproduce the historical visualization sampling")
+    ap.add_argument("--row-index", type=int, default=None, help="Zero-based CSV data-row index; must match context/video filters")
     ap.add_argument("--keep-count", type=int, default=4096)
     ap.add_argument("--n-slots-show", type=int, default=8)
     ap.add_argument("--img-size", type=int, default=256); ap.add_argument("--frames", type=int, default=128)
@@ -73,18 +77,12 @@ def main():
     device = torch.device("cuda")
 
     ds = FpsSubsampledStreamMTPDataset(args.val_csv, args.video_root, args.img_size, src_fps=args.src_fps, fps=args.fps)
-    cand = [r for r in ds.rows if abs(float(r["context_sec"]) - args.context_sec) < 1e-6]
-    if args.video_id:
-        cand = [r for r in cand if str(r["video_id"]) == args.video_id] or cand
-    row = cand[0]; vid = str(row["video_id"])
+    row_index, row = select_sample(ds.rows, args.context_sec, args.video_id, args.row_index)
+    vid = str(row["video_id"])
     fi = [int(x) for x in T._parse_int_list(row["frame_indices"])]
-    stride = (fi[1] - fi[0]) if len(fi) > 1 else args.src_fps // args.fps
-    end = fi[-1]
-    idxf = np.array([end - (args.frames - 1 - i) * stride for i in range(args.frames)], dtype=np.int64)
-    pid = vid.split("_")[0] if "_" in vid else vid.split("-")[0]
+    idxf = np.asarray(sample_frame_indices(fi, args.src_fps, args.fps, args.frames, args.frame_mode), dtype=np.int64)
+    pid = vid.split("_")[0]
     vpath = Path(args.video_root) / pid / f"{vid}.MP4"
-    if not vpath.exists():
-        vpath = next(Path(args.video_root).rglob(f"{vid}.MP4"))
     vr = VideoReader(str(vpath), ctx=cpu(0), num_threads=1, width=args.img_size, height=args.img_size)
     idxf = np.clip(idxf, 0, len(vr) - 1)
     rgb = vr.get_batch(idxf.tolist()).asnumpy()   # (frames,H,W,C) uint8
@@ -123,9 +121,16 @@ def main():
     fig.suptitle(f"EGTEA {vid}  strategy={args.strategy}  keep={args.keep_count}/{N} "
                  f"({100*n_kept/N:.0f}% kept)  black=DROPPED patch", fontsize=11)
     fig.tight_layout(rect=[0, 0, 1, 0.92])
-    figpath = out / f"drop_{args.strategy}_{vid}_{T_SLOTS}slots.png"
+    stem = f"{args.strategy}_{vid}_row{row_index}_{T_SLOTS}slots_{args.frame_mode}"
+    figpath = out / f"drop_{stem}.png"
     fig.savefig(figpath, dpi=140, bbox_inches="tight"); plt.close(fig)
-    np.save(out / f"slot_keep_{args.strategy}_{vid}.npy", slot_keep)
+    np.save(out / f"slot_keep_{stem}.npy", slot_keep)
+    np.save(out / f"kept_indices_{stem}.npy", np.asarray(sorted(kept_set), dtype=np.int64))
+    metadata = dict(video_id=vid, row_index=row_index, csv_sha256=file_sha256(args.val_csv),
+                    source_row=row, decoded_frame_indices=idxf.tolist(), shown_slots=show_slots.tolist(),
+                    strategy=args.strategy, keep_count=n_kept, total_tokens=N,
+                    arguments=vars(args), meaning="black=dropped; one displayed frame per tubelet slot")
+    (out / f"sample_{stem}.json").write_text(json.dumps(metadata, indent=2)+"\n")
     print(f"[{args.strategy}] {vid} kept={n_kept} dropped={n_drop} "
           f"slot_keep(min/mean/max)={slot_keep.min()}/{slot_keep.mean():.1f}/{slot_keep.max()} -> {figpath}", flush=True)
 

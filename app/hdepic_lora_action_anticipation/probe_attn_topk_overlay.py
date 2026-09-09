@@ -12,6 +12,7 @@
 # --site predictor: predictor block --block over the context tokens (our finding-15 site).
 # Single clip per video, same window builder as probe_all_heads_mass_Tx256.py. Slurm only.
 from __future__ import annotations
+from app.hdepic_lora_action_anticipation.share_paths import DATA_ROOT as SHARE_DATA_ROOT, VJEPA_ROOT as SHARE_VJEPA_ROOT
 
 import argparse, os, sys
 from pathlib import Path
@@ -19,7 +20,7 @@ import numpy as np, torch
 from decord import VideoReader, cpu
 
 CODE_ROOT = os.environ.get("PROJECT_ROOT", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-for p in (os.path.join(CODE_ROOT, "vjepa2"), CODE_ROOT):
+for p in (str(SHARE_VJEPA_ROOT), CODE_ROOT):
     if p not in sys.path:
         sys.path.insert(0, p)
 

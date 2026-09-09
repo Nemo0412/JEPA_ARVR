@@ -7,6 +7,7 @@ The full-context predictor scoring pass is shared by L0 and L11. No labels are
 used by selection. The 12+4 split and primary contrasts are fixed before eval.
 """
 from __future__ import annotations
+from app.hdepic_lora_action_anticipation.share_paths import DATA_ROOT as SHARE_DATA_ROOT, VJEPA_ROOT as SHARE_VJEPA_ROOT
 
 import argparse
 import csv
@@ -261,8 +262,8 @@ def main():
         "source_sha256": {str(x): sha(x) for x in [Path(__file__), Path(T.__file__),
             Path(__file__).with_name("eval_stream_mtp_multi_strategy.py"),
             Path(__file__).with_name("eval_stream_mtp_kvcache_prune.py"),
-            Path(__file__).resolve().parents[2] / "vjepa2/src/models/utils/modules.py",
-            Path(__file__).resolve().parents[2] / "vjepa2/src/models/predictor.py"]},
+            SHARE_VJEPA_ROOT / "src/models/utils/modules.py",
+            SHARE_VJEPA_ROOT / "src/models/predictor.py"]},
         "train_csv_sha256": sha(args.train_csv),
         "calibration_sha256": {str(x): sha(x) for x in [args.calib_l0, args.calib_l11]},
         "checkpoint_paths": [str(x) for x in [args.checkpoint, args.init_from_ckpt,

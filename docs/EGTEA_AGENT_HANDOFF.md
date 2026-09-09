@@ -407,3 +407,12 @@ checkpoint role without recording it as a protocol deviation.
 
 If a preflight fails, fix the data port or path.  Do not compensate by changing
 ll's model implementation.
+
+## B13/B17/B18 shared analysis additions
+
+The optional pruning modules and dedicated launchers are imported from
+VJEPA2-EXP `f057ba2`. They reuse this branch's existing MTP code and gaze reader;
+the original baseline/model ownership rules above still apply. For the main B18
+accuracy table and deterministic sample-video patch-drop figures, start with
+[B18_PRUNING_REPRODUCE.md](B18_PRUNING_REPRODUCE.md). This guide is separate from
+the baseline training matrix and does not alter its method definitions.

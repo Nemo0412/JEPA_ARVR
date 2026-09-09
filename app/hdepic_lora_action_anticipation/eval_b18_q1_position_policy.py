@@ -5,6 +5,7 @@ The checkpoint-compatible RoPE implementation is unchanged. Common translation
 is measured, not assumed invariant: upstream preserves a frequency-repeat bug.
 """
 from __future__ import annotations
+from app.hdepic_lora_action_anticipation.share_paths import VJEPA_ROOT as SHARE_VJEPA_ROOT
 
 import argparse
 import hashlib
@@ -214,7 +215,7 @@ def main():
     source_paths = [Path(__file__), Path(P.__file__), Path(Q.__file__), Path(P.T.__file__),
         code_root / "app/hdepic_lora_action_anticipation/eval_stream_mtp_multi_strategy.py",
         code_root / "app/hdepic_lora_action_anticipation/eval_stream_mtp_kvcache_prune.py",
-        Path(imported_modules.__file__), code_root / "vjepa2/src/models/predictor.py",
+        Path(imported_modules.__file__), SHARE_VJEPA_ROOT / "src/models/predictor.py",
         code_root / "scripts/egtea/run_b18_q1_position_policy.slurm"]
     metadata = {"evaluation_protocol": PROTOCOL, "run_tag": args.tag, "job_id": os.environ.get("SLURM_JOB_ID"),
         "metric_scope": "native", "eval_path": "EGTEA fixed4000; shared encoder; frozen masks; paired predictor coordinates",

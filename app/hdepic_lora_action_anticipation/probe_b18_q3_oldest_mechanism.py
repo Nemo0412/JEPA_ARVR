@@ -6,6 +6,7 @@ Actual attention score uses the historical BF16 chunk reductions unchanged.
 The no-RoPE result is a readout of the same q/k, not a model intervention.
 """
 from __future__ import annotations
+from app.hdepic_lora_action_anticipation.share_paths import VJEPA_ROOT as SHARE_VJEPA_ROOT
 import argparse
 import contextlib
 import hashlib
@@ -84,8 +85,8 @@ def prepare(args):
         assert digest(path) == expected, f"archived dependency changed: {path}"
     dependencies[str(Path(__file__).resolve())] = digest(__file__)
     root = Path(__file__).resolve().parents[2]
-    for rel in ("vjepa2/src/models/utils/modules.py", "vjepa2/src/models/vision_transformer.py", "vjepa2/src/models/predictor.py"):
-        dependencies[str(root / rel)] = digest(root / rel)
+    for rel in ("src/models/utils/modules.py", "src/models/vision_transformer.py", "src/models/predictor.py"):
+        dependencies[str(SHARE_VJEPA_ROOT / rel)] = digest(SHARE_VJEPA_ROOT / rel)
     write_json(args.out / "manifest.json", dict(protocol=PROTOCOL, group=GROUP, conditions=CONDITIONS,
                source_manifest=str(args.source_manifest), source_manifest_sha256=digest(args.source_manifest),
                source=source, replacement_seeds=SEEDS, rows=rows, code_sha256=dependencies,

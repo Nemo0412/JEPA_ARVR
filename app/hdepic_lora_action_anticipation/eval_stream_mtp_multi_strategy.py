@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse, hashlib, json, os, subprocess, time
 from collections import defaultdict
 from pathlib import Path
+from app.hdepic_lora_action_anticipation.share_reproduction import select_shard, file_sha256
 
 import torch
 from torch.utils.data import DataLoader
@@ -158,6 +159,8 @@ def main():
     ap.add_argument("--tag", type=str, default="multi")
     ap.add_argument("--dataset", default=None, help="result label; inferred for EGTEA/HD_EPIC CSV pairs")
     ap.add_argument("--split", default=None, help="result label; defaults to split_stats.json protocol")
+    ap.add_argument("--row-start", type=int, default=0, help="Start in context-filtered CSV order (inclusive)")
+    ap.add_argument("--row-stop", type=int, default=None, help="Stop in context-filtered CSV order (exclusive)")
     args = ap.parse_args()
     provenance = result_provenance(args)
 
@@ -173,6 +176,14 @@ def main():
         want = float(args.only_context_sec)
         val_ds.rows = [r for r in val_ds.rows if abs(float(r["context_sec"]) - want) < 1e-6]
         print(f"[filter] context_sec={want}: {len(val_ds.rows)} rows", flush=True)
+    val_ds.rows, row_range, population_size = select_shard(val_ds.rows, args.row_start, args.row_stop)
+    asset_paths = {k: getattr(args, k) for k in ('train_csv','val_csv','checkpoint','init_from_ckpt',
+                                               'encoder_lora','predictor_lora','pred_calib_path')}
+    provenance.update(row_range=row_range, population_size=population_size,
+        partial_batches=args.max_val_batches > 0,
+        input_sha256={k: file_sha256(p) if p else None for k, p in asset_paths.items()},
+        evaluation_contract={k: getattr(args,k) for k in ('horizons_sec','anticipation_sec','fps','src_fps',
+            'img_size','pred_score_block','batch_size')})
     sampler = T.ContextBucketBatchSampler(val_ds, args.batch_size, shuffle=False, seed=0)
     lk = dict(num_workers=args.num_workers, collate_fn=T.collate_stream, pin_memory=False)
     if args.num_workers > 0:

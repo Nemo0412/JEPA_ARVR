@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """B18 Q3 exact diagonal readout; run only in a Slurm project container."""
 from __future__ import annotations
+from app.hdepic_lora_action_anticipation.share_paths import DATA_ROOT as SHARE_DATA_ROOT, VJEPA_ROOT as SHARE_VJEPA_ROOT
 import argparse
 import contextlib
 import io
@@ -17,7 +18,7 @@ GROUP = "B18-predictor-prune-keep-pattern-causes"
 GP, NS, NH = 256, 64, 12
 SUFFIXES = ("actual", "no_rope_readout")
 ROW_FIELDS = ("self", "same_slot", "same_slot_other", "other_context", "context", "target", "all")
-ROOT = Path("/scratch/yh6416/VJEPA2-EXP")
+ROOT = Path(str(SHARE_DATA_ROOT))
 OLD = ROOT / "outputs/attn_corner_sink/q3_oldest_mechanism"
 
 

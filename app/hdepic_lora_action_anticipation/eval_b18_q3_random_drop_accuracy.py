@@ -6,6 +6,7 @@ fixed across validation examples; this estimates fixed random position pruning,
 not per-example resampling.
 """
 from __future__ import annotations
+from app.hdepic_lora_action_anticipation.share_paths import DATA_ROOT as SHARE_DATA_ROOT, VJEPA_ROOT as SHARE_VJEPA_ROOT
 
 import argparse
 import hashlib
@@ -24,7 +25,7 @@ from app.hdepic_lora_action_anticipation import train_stream_mtp as T
 from app.hdepic_lora_action_anticipation.eval_stream_mtp_multi_strategy import predict_from_encoded
 
 PROTOCOL = "b18-predictor-prune/egtea-q3-random-drop-accuracy-v1"
-ROOT = Path("/scratch/yh6416/VJEPA2-EXP")
+ROOT = Path(str(SHARE_DATA_ROOT))
 OUTROOT = ROOT / "outputs/attn_corner_sink/q3_random_drop_accuracy"
 ANN = ROOT / "data/egtea/vjepa_annotations/stream_16s_split/split1"
 Q1MANIFEST = ROOT / "outputs/attn_corner_sink/q1_evidence_audit_20260905/paired4000_manifest.csv"
@@ -171,8 +172,8 @@ def evaluate(args):
         hardware_gate=dict(relative_l2_max=0.005, logit_max_abs=0.15),
         source_sha256={str(Path(p)): sha(Path(p)) for p in [__file__, P.__file__, L.__file__, T.__file__,
             Path(__file__).with_name("eval_stream_mtp_multi_strategy.py"),
-            Path(__file__).resolve().parents[2] / "vjepa2/src/models/utils/modules.py",
-            Path(__file__).resolve().parents[2] / "vjepa2/src/models/predictor.py"]},
+            SHARE_VJEPA_ROOT / "src/models/utils/modules.py",
+            SHARE_VJEPA_ROOT / "src/models/predictor.py"]},
         gpu=dict(name=torch.cuda.get_device_name(), memory=torch.cuda.get_device_properties(0).total_memory,
                  torch=torch.__version__, cuda=torch.version.cuda), model_load="P.build strict missing/unexpected zero")
     write_json(args.out / "metadata.json", metadata)

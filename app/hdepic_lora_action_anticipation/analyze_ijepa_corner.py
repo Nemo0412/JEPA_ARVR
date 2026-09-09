@@ -23,7 +23,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-os.environ.setdefault("HF_HOME", "/scratch/yh6416/.huggingface")
+os.environ.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 IMG, PATCH = 224, 14

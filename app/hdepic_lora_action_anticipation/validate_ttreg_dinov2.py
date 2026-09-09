@@ -9,7 +9,7 @@ import argparse, glob, json, os
 import numpy as np, torch
 from PIL import Image
 
-os.environ.setdefault("TORCH_HOME", "/scratch/yh6416/.cache/torch")
+os.environ.setdefault("TORCH_HOME", os.path.expanduser("~/.cache/torch"))
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 IMG, PATCH = 224, 14

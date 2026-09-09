@@ -20,6 +20,7 @@ Windows are rebuilt from the stream half-split val CSV by extending each tick
 backward to 16s (skip if video/half origin cannot supply 128 model frames).
 """
 from __future__ import annotations
+from app.hdepic_lora_action_anticipation.share_paths import DATA_ROOT as SHARE_DATA_ROOT, VJEPA_ROOT as SHARE_VJEPA_ROOT
 
 import argparse
 import csv
@@ -39,7 +40,7 @@ from decord import VideoReader, cpu
 from torch.utils.data import DataLoader, Dataset
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-VJEPA_ROOT = Path(os.environ.get("VJEPA_ROOT", "/home/ll5914/ARVR_Video/vjepa2"))
+VJEPA_ROOT = Path(os.environ.get("VJEPA_ROOT", str(SHARE_VJEPA_ROOT)))
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(VJEPA_ROOT))
 
