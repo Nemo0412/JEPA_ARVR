@@ -56,7 +56,6 @@ from eval_nopred_128_vs_stream16x8 import IMAGENET_MEAN, IMAGENET_STD  # noqa: E
 from eval_nopred_kvcache_size_sweep import sample_even_per_video  # noqa: E402
 from eval_64slot_pred0_prune_vs_last16 import Ctx64Dataset, collate, summarize  # noqa: E402
 from eval_probe_posenc_kvcache_128_34 import (  # noqa: E402
-    HORIZONS,
     MTP_COLS,
     classify_independent,
     update_metrics_by_horizon,
