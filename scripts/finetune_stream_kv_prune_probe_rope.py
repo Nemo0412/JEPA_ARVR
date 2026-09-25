@@ -10,7 +10,8 @@ Protocol:
     against kept KV; packed 94+34=128 → probe again (prediction + scores for
     the following tick).
   * One-clip FT/eval bootstrap: fill 128 → probe-blk0 scores → step(+34) → probe.
-  * RoPE arm: 1D temporal RoPE on probe Q/K with original surviving frame ids.
+  * RoPE arm: 1D temporal RoPE on Probe.blocks[0] Q/K with abs surviving frame ids.
+  * Horizon: single-horizon via ``--horizons 2`` or ``--horizons 6`` (default 2).
 
 Fair comparison: both arms finetune probe+heads from the same nopred init.
 """
@@ -147,11 +148,21 @@ def mtp_ce_loss(outputs, batch_dev, horizons, weights, verb_map, noun_map, actio
 
 
 @torch.no_grad()
-def eval_arm(stream, mtp_clf, embed_dim, loader, device, ck_meta, rope: ProbeTemporalRoPE | None, prefix: str, chunk: int):
+def eval_arm(
+    stream,
+    mtp_clf,
+    embed_dim,
+    loader,
+    device,
+    ck_meta,
+    rope: ProbeTemporalRoPE | None,
+    prefix: str,
+    chunk: int,
+    horizons,
+):
     totals = defaultdict(float)
     counts = defaultdict(int)
     verb_map, noun_map, action_map = ck_meta["verb_map"], ck_meta["noun_map"], ck_meta["action_map"]
-    horizons = list(HORIZONS)
     mtp_clf.eval()
     pooler = mtp_clf.pooler
     for batch in loader:
@@ -182,7 +193,8 @@ def eval_arm(stream, mtp_clf, embed_dim, loader, device, ck_meta, rope: ProbeTem
         f"@{h:g}s": round(100.0 * metrics.get(f"{prefix}/action_top5@{h:g}s", float("nan")), 4)
         for h in horizons
     }
-    table["n@2s"] = int(metrics.get(f"n|{prefix}/action_top5@2s", 0))
+    for h in horizons:
+        table[f"n@{h:g}s"] = int(metrics.get(f"n|{prefix}/action_top5@{h:g}s", 0))
     return table, metrics
 
 
@@ -253,7 +265,8 @@ def finetune_probe(
 def plot_results(payload: dict, png: Path, copy_png: Path | None):
     fig, ax = plt.subplots(figsize=(8.2, 4.6))
     table = payload["accuracy"]["table_action_top5"]
-    horizons = ["2s", "6s"]
+    cfg_h = payload.get("config", {}).get("horizons_sec") or [2.0]
+    horizons = [f"{float(h):g}s" for h in cfg_h]
     arms = [a for a in ARMS if a in table]
     xh = np.arange(len(horizons))
     w = 0.2
@@ -262,7 +275,7 @@ def plot_results(payload: dict, png: Path, copy_png: Path | None):
         ys = [table[arm].get(f"@{h}", float("nan")) for h in horizons]
         ax.bar(xh + (i - off) * w, ys, w, color=ARM_COLORS[arm], label=ARM_LABELS[arm])
     ax.set_xticks(xh)
-    ax.set_xticklabels(["+2s", "+6s"])
+    ax.set_xticklabels([f"+{h}" for h in horizons])
     ax.set_ylabel("Action Top-5 (%)")
     n = payload["accuracy"].get("n_val_clips", 0)
     ax.set_title(f"Stream KV + probe-blk0 prune (128←94+34) → probe   val={n}")
@@ -323,6 +336,12 @@ def main():
     ap.add_argument("--require-ctx-sec", type=float, default=10.0)
     ap.add_argument("--num-workers", type=int, default=2)
     ap.add_argument("--chunk", type=int, default=256)
+    ap.add_argument(
+        "--horizons",
+        type=str,
+        default="2",
+        help="Comma-separated horizons in seconds (single-horizon preferred: 2 or 6)",
+    )
     args = ap.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -333,7 +352,12 @@ def main():
     torch.backends.cudnn.allow_tf32 = True
 
     total_frames = CACHE_FRAMES + NEW_FRAMES
-    horizons = list(HORIZONS)
+    horizons = [float(x.strip()) for x in str(args.horizons).split(",") if x.strip()]
+    if not horizons:
+        raise SystemExit("--horizons must list at least one value, e.g. 2 or 6")
+    for h in horizons:
+        if float(h) not in MTP_COLS:
+            raise SystemExit(f"unsupported horizon {h}; known cols={sorted(MTP_COLS)}")
     weights = [1.0] * len(horizons)
 
     logger.info(
@@ -373,12 +397,14 @@ def main():
 
     logger.info("eval zs_no_rope")
     zs_no, _ = eval_arm(
-        stream, mtp_clf, embed_dim, val_loader, device, ck_meta, rope=None, prefix="zs_no_rope", chunk=args.chunk
+        stream, mtp_clf, embed_dim, val_loader, device, ck_meta, rope=None,
+        prefix="zs_no_rope", chunk=args.chunk, horizons=horizons,
     )
     rope = ProbeTemporalRoPE(pooler, rope_cross_attn_k=False, only_block0=True)
     logger.info("eval zs_rope")
     zs_rope, _ = eval_arm(
-        stream, mtp_clf, embed_dim, val_loader, device, ck_meta, rope=rope, prefix="zs_rope", chunk=args.chunk
+        stream, mtp_clf, embed_dim, val_loader, device, ck_meta, rope=rope,
+        prefix="zs_rope", chunk=args.chunk, horizons=horizons,
     )
 
     # Freeze prune path: cache tokens with *init* probe blk0 scores (not trained).
@@ -415,7 +441,8 @@ def main():
     ft_no_ckpt = args.out_dir / "probe_ft_no_rope.pt"
     torch.save({"mtp_classifier": mtp_clf.state_dict(), "rope": False, "prune": "probe_blk0"}, ft_no_ckpt)
     ft_no, _ = eval_arm(
-        stream, mtp_clf, embed_dim, val_loader, device, ck_meta, rope=None, prefix="ft_no_rope", chunk=args.chunk
+        stream, mtp_clf, embed_dim, val_loader, device, ck_meta, rope=None,
+        prefix="ft_no_rope", chunk=args.chunk, horizons=horizons,
     )
     logger.info("ft_no_rope %s", json.dumps(ft_no))
 
@@ -434,11 +461,13 @@ def main():
             "prune": "probe_blk0",
             "cache_frames": CACHE_FRAMES,
             "new_frames": NEW_FRAMES,
+            "horizons_sec": horizons,
         },
         ft_rope_ckpt,
     )
     ft_rope, _ = eval_arm(
-        stream, mtp_clf, embed_dim, val_loader, device, ck_meta, rope=rope, prefix="ft_rope", chunk=args.chunk
+        stream, mtp_clf, embed_dim, val_loader, device, ck_meta, rope=rope,
+        prefix="ft_rope", chunk=args.chunk, horizons=horizons,
     )
     logger.info("ft_rope %s", json.dumps(ft_rope))
     rope.remove()
@@ -460,6 +489,7 @@ def main():
             "Probe FT under stream KV + prune by Probe blocks[0] self-attn "
             "received mass (recorded for next tick; not a trained pruner). "
             "Bootstrap one-clip: score on fill-128 then admit +34. "
+            f"Single-horizon FT/eval on {horizons}s. "
             "RoPE uses abs surviving frame/slot ids. Encoder frozen."
         ),
         "device": torch.cuda.get_device_name(0),
@@ -475,6 +505,7 @@ def main():
             "keep_frames_after_prune": CACHE_FRAMES - NEW_FRAMES,
             "tick_sec_approx": NEW_FRAMES / float(args.fps),
             "fps": args.fps,
+            "horizons_sec": horizons,
             "prune": "probe blocks[0] self-attn received mass → drop lowest 34 frames",
             "rope": "1D temporal RoPE on Probe.blocks[0] self-attn Q/K only (not blk1/2, not cross-attn)",
             "epochs": args.epochs,

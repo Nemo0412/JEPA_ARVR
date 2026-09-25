@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=kvprune_rope
+#SBATCH --job-name=kvprune2
 #SBATCH --account=torch_pr_111_tandon_advanced
 #SBATCH --partition=a100_tandon
 #SBATCH --nodes=1
@@ -16,13 +16,19 @@ export TMPDIR=/scratch/ll5914/tmp
 mkdir -p "$TMPDIR" /scratch/ll5914/logs
 
 # Stream KV + Probe-blk0-attn prune; probe FT ± abs-frame RoPE (blk0 only).
-# Prune scores = Probe.blocks[0] self-attn received mass (recorded for next tick).
-# Submit as a 3-partition race with low mem (prefer 96G):
-#   for spec in 'a100_tandon|gpu:a100:1' 'h100_tandon|gpu:h100:1' 'h200_tandon|gpu:h200:1'; do
-#     IFS='|' read -r part gres <<< "$spec"
-#     sbatch --job-name=kvprune_rope --partition="$part" --gres="$gres" \
-#       --mem=96G --cpus-per-task=8 --time=01:50:00 this.slurm
+# Single horizon via HORIZON=2|6 (default 2). Separate out-dirs per horizon.
+#
+# Race A100/H100/H200 with low mem:
+#   for H in 2 6; do
+#     for spec in 'a100_tandon|gpu:a100:1' 'h100_tandon|gpu:h100:1' 'h200_tandon|gpu:h200:1'; do
+#       IFS='|' read -r part gres <<< "$spec"
+#       sbatch --job-name="kvprune${H}" --partition="$part" --gres="$gres" \
+#         --mem=96G --cpus-per-task=8 --time=01:50:00 --export=HORIZON=$H this.slurm
+#     done
 #   done
+
+HORIZON="${HORIZON:-2}"
+case "${HORIZON}" in 2|6) ;; *) echo "ERROR: HORIZON must be 2 or 6" >&2; exit 2 ;; esac
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
 PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
@@ -32,7 +38,7 @@ export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/scripts:${VJEPA_ROOT}:${PYTHO
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 
-OUT="/scratch/ll5914/experiments/stream_kv_probe_blk0_prune_ft_rope"
+OUT="/scratch/ll5914/experiments/stream_kv_probe_blk0_prune_ft_rope_h${HORIZON}s"
 DONE="${OUT}/DONE"
 mkdir -p "$OUT"
 
@@ -50,9 +56,9 @@ if [[ -f "${DONE}" ]]; then
 fi
 
 echo "========================================================"
-echo "Stream KV + Probe-blk0 prune  (± abs-frame RoPE FT)"
+echo "Stream KV + Probe-blk0 prune  (± RoPE FT)  HORIZON=${HORIZON}s"
 echo "Job=${SLURM_JOB_ID:-manual} partition=${SLURM_JOB_PARTITION:-} $(date)"
-echo "host=$(hostname)"
+echo "host=$(hostname) OUT=${OUT}"
 echo "cache=128f new=34f keep=94; scores=Probe.blocks[0] self-attn mass"
 echo "========================================================"
 nvidia-smi -L || true
@@ -64,8 +70,9 @@ cd "$PROJECT_ROOT"
 
 "$PYTHON" scripts/finetune_stream_kv_prune_probe_rope.py \
   --out-dir "$OUT" \
-  --copy-json "${PROJECT_ROOT}/configs/jepa_pe/stream_kv_probe_blk0_prune_ft_rope.json" \
-  --copy-png "${PROJECT_ROOT}/plots/stream_kv_probe_blk0_prune_ft_rope.png" \
+  --copy-json "${PROJECT_ROOT}/configs/jepa_pe/stream_kv_probe_blk0_prune_ft_rope_h${HORIZON}s.json" \
+  --copy-png "${PROJECT_ROOT}/plots/stream_kv_probe_blk0_prune_ft_rope_h${HORIZON}s.png" \
+  --horizons "${HORIZON}" \
   --max-train 400 \
   --max-val 200 \
   --train-clips-per-video 8 \
@@ -75,11 +82,12 @@ cd "$PROJECT_ROOT"
 
 date > "${DONE}"
 echo "Done $(date)"
-"$PYTHON" - <<'PY'
+"$PYTHON" - <<PY
 import json
-p="/scratch/ll5914/experiments/stream_kv_probe_blk0_prune_ft_rope/metrics.json"
+p="${OUT}/metrics.json"
 d=json.load(open(p))
 print("method", d.get("method"))
+print("horizons", d.get("config", {}).get("horizons_sec"))
 print("table", json.dumps(d["accuracy"]["table_action_top5"], indent=2))
 print("delta_pp", json.dumps(d["accuracy"]["delta_pp"], indent=2))
 PY

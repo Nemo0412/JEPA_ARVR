@@ -101,7 +101,7 @@ surviving frame/slot ids for RoPE (survivors keep original stream index).
 | **kvmatch0** | **16f** (last 2s) | 0 + 16 | off | 2s | 2 | 8 |
 | **kvmatch112** | **128f** | 112 + 16 | off | 2s | 2 | 8 |
 | **kvrope112** | **128f** | 112 + 16 | **on** (`only_block0`) | 2s | 2 | 8 |
-| **kvprune_rope** | stream 128→94+34 | prune by probe-blk0 | FT ± RoPE (`only_block0`) | MTP 2/4/6s | — | 8 |
+| **kvprune_rope** | stream 128→94+34 | prune by probe-blk0 | FT ± RoPE (`only_block0`) | **single** 2s or 6s | — | 8 |
 
 Shared settings (matched train):
 
@@ -142,21 +142,30 @@ race kvmatch112 "CACHE_FRAMES=112,PROBE_ROPE=0,$EXPORT_COMMON"
 race kvrope112  "CACHE_FRAMES=112,PROBE_ROPE=1,$EXPORT_COMMON"
 ```
 
-Probe-blk0 prune FT (± RoPE):
+Probe-blk0 prune FT (± RoPE), **single horizon** (`HORIZON=2` or `6`):
 
 ```bash
 SCR=scripts/submit_stream_kv_prune_probe_rope_ll5914.slurm
-for spec in 'a100_tandon|gpu:a100:1' 'h100_tandon|gpu:h100:1' 'h200_tandon|gpu:h200:1'; do
-  IFS='|' read -r part gres <<< "$spec"
-  sbatch --job-name=kvprune_rope --partition="$part" --gres="$gres" \
-    --mem=96G --cpus-per-task=8 --time=01:50:00 "$SCR"
+for H in 2 6; do
+  for spec in 'a100_tandon|gpu:a100:1' 'h100_tandon|gpu:h100:1' 'h200_tandon|gpu:h200:1'; do
+    IFS='|' read -r part gres <<< "$spec"
+    sbatch --job-name="kvprune${H}" --partition="$part" --gres="$gres" \
+      --mem=96G --cpus-per-task=8 --time=01:50:00 --export=HORIZON=$H "$SCR"
+  done
 done
+```
+
+Matched train at +6s (separate from running h2s jobs):
+
+```bash
+race kvmatch6 "CACHE_FRAMES=112,PROBE_ROPE=0,HORIZON=6,BATCH_SIZE=2,NUM_WORKERS=2,VAL_NUM_WORKERS=1,PREFETCH_FACTOR=1"
+race kvrope6  "CACHE_FRAMES=112,PROBE_ROPE=1,HORIZON=6,BATCH_SIZE=2,NUM_WORKERS=2,VAL_NUM_WORKERS=1,PREFETCH_FACTOR=1"
 ```
 
 Scratch outs:
 
-- matched: `/scratch/ll5914/experiments/clip_stream_kv_{matched,rope}_c*_h2s/`
-- prune FT: `/scratch/ll5914/experiments/stream_kv_probe_blk0_prune_ft_rope/`
+- matched: `/scratch/ll5914/experiments/clip_stream_kv_{matched,rope}_c*_h{2,6}s/`
+- prune FT: `/scratch/ll5914/experiments/stream_kv_probe_blk0_prune_ft_rope_h{2,6}s/`
 
 ---
 
