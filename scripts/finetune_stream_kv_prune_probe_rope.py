@@ -150,6 +150,7 @@ def mtp_ce_loss(outputs, batch_dev, horizons, weights, verb_map, noun_map, actio
 def eval_arm(
     stream,
     mtp_clf,
+    pooler,
     embed_dim,
     loader,
     device,
@@ -163,7 +164,6 @@ def eval_arm(
     counts = defaultdict(int)
     verb_map, noun_map, action_map = ck_meta["verb_map"], ck_meta["noun_map"], ck_meta["action_map"]
     mtp_clf.eval()
-    pooler = mtp_clf.pooler
     for batch in loader:
         clips = normalize_clip(batch["clip"], device)
         if clips.size(2) != CACHE_FRAMES + NEW_FRAMES:
@@ -396,13 +396,13 @@ def main():
 
     logger.info("eval zs_no_rope")
     zs_no, _ = eval_arm(
-        stream, mtp_clf, embed_dim, val_loader, device, ck_meta, rope=None,
+        stream, mtp_clf, pooler, embed_dim, val_loader, device, ck_meta, rope=None,
         prefix="zs_no_rope", chunk=args.chunk, horizons=horizons,
     )
     rope = ProbeTemporalRoPE(pooler, rope_cross_attn_k=False, only_block0=True)
     logger.info("eval zs_rope")
     zs_rope, _ = eval_arm(
-        stream, mtp_clf, embed_dim, val_loader, device, ck_meta, rope=rope,
+        stream, mtp_clf, pooler, embed_dim, val_loader, device, ck_meta, rope=rope,
         prefix="zs_rope", chunk=args.chunk, horizons=horizons,
     )
 
@@ -416,7 +416,7 @@ def main():
             clips = normalize_clip(batch["clip"], device)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 tok, frame_ids, _next = encode_probe_attn_pruned(
-                    stream, mtp_clf.pooler, clips, embed_dim, chunk=args.chunk
+                    stream, pooler, clips, embed_dim, chunk=args.chunk
                 )
             cached.append(
                 {
@@ -440,13 +440,13 @@ def main():
     ft_no_ckpt = args.out_dir / "probe_ft_no_rope.pt"
     torch.save({"mtp_classifier": mtp_clf.state_dict(), "rope": False, "prune": "probe_blk0"}, ft_no_ckpt)
     ft_no, _ = eval_arm(
-        stream, mtp_clf, embed_dim, val_loader, device, ck_meta, rope=None,
+        stream, mtp_clf, pooler, embed_dim, val_loader, device, ck_meta, rope=None,
         prefix="ft_no_rope", chunk=args.chunk, horizons=horizons,
     )
     logger.info("ft_no_rope %s", json.dumps(ft_no))
 
     mtp_clf.load_state_dict(init_state)
-    rope = ProbeTemporalRoPE(mtp_clf.pooler, rope_cross_attn_k=False, only_block0=True)
+    rope = ProbeTemporalRoPE(pooler, rope_cross_attn_k=False, only_block0=True)
     logger.info("finetune ft_rope (abs frame id; Probe.blocks[0] only)")
     t_rope, loss_rope = finetune_probe(
         mtp_clf, cached, rope=rope, epochs=args.epochs, lr=args.lr,
@@ -465,7 +465,7 @@ def main():
         ft_rope_ckpt,
     )
     ft_rope, _ = eval_arm(
-        stream, mtp_clf, embed_dim, val_loader, device, ck_meta, rope=rope,
+        stream, mtp_clf, pooler, embed_dim, val_loader, device, ck_meta, rope=rope,
         prefix="ft_rope", chunk=args.chunk, horizons=horizons,
     )
     logger.info("ft_rope %s", json.dumps(ft_rope))

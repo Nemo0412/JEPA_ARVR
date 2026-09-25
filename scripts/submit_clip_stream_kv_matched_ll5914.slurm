@@ -123,19 +123,33 @@ request_resubmit() {
   # Keep TMPDIR on scratch — auto-resubmit previously failed silently when /tmp was full.
   export TMPDIR="${TMPDIR:-/scratch/ll5914/tmp}"
   mkdir -p "${TMPDIR}"
-  out="$(sbatch --job-name="${SLURM_JOB_NAME:-kvmatch}" \
-    --account="${SLURM_JOB_ACCOUNT:-torch_pr_111_tandon_advanced}" \
-    --partition="${SLURM_JOB_PARTITION:-h100_tandon}" \
-    --gres="${SLURM_JOB_GRES:-gpu:h100:1}" \
-    --mem="${SLURM_MEM_PER_NODE:-96G}" \
-    --cpus-per-task="${SLURM_CPUS_PER_TASK:-8}" \
-    --time="${SLURM_TIMELIMIT:-01:50:00}" \
-    "${dep[@]}" \
-    --export=CACHE_FRAMES="${CACHE_FRAMES}",HORIZON="${HORIZON}",CHUNK_FRAMES="${CHUNK_FRAMES}",BATCH_SIZE="${BATCH_SIZE}",NUM_WORKERS="${NUM_WORKERS}",VAL_NUM_WORKERS="${VAL_NUM_WORKERS}",PREFETCH_FACTOR="${PREFETCH_FACTOR}",PROBE_ROPE="${PROBE_ROPE}" \
-    "${SCRIPT_PATH}" 2>&1)" || true
-  echo "${out}"
-  if ! grep -q 'Submitted batch job' <<<"${out}"; then
-    echo "WARN: sbatch resubmit failed: ${out}" >&2
+  # Do NOT reuse SLURM_JOB_GRES (often "gpu:1" without type → invalid on tandon).
+  # Race A100/H100/H200 with explicit typed gres + low mem.
+  local mem_gb="${SLURM_MEM_PER_NODE:-96G}"
+  # SLURM_MEM_PER_NODE may be numeric MB; normalize to G if needed.
+  if [[ "${mem_gb}" =~ ^[0-9]+$ ]]; then
+    mem_gb="$((mem_gb / 1024))G"
+  fi
+  local ok=0
+  for spec in 'a100_tandon|gpu:a100:1' 'h100_tandon|gpu:h100:1' 'h200_tandon|gpu:h200:1'; do
+    IFS='|' read -r part gres <<< "$spec"
+    out="$(sbatch --job-name="${SLURM_JOB_NAME:-kvmatch}" \
+      --account="${SLURM_JOB_ACCOUNT:-torch_pr_111_tandon_advanced}" \
+      --partition="$part" \
+      --gres="$gres" \
+      --mem="${mem_gb}" \
+      --cpus-per-task="${SLURM_CPUS_PER_TASK:-8}" \
+      --time="${SLURM_TIMELIMIT:-01:50:00}" \
+      "${dep[@]}" \
+      --export=CACHE_FRAMES="${CACHE_FRAMES}",HORIZON="${HORIZON}",CHUNK_FRAMES="${CHUNK_FRAMES}",BATCH_SIZE="${BATCH_SIZE}",NUM_WORKERS="${NUM_WORKERS}",VAL_NUM_WORKERS="${VAL_NUM_WORKERS}",PREFETCH_FACTOR="${PREFETCH_FACTOR}",PROBE_ROPE="${PROBE_ROPE}" \
+      "${SCRIPT_PATH}" 2>&1)" || true
+    echo "$part => ${out}"
+    if grep -q 'Submitted batch job' <<<"${out}"; then
+      ok=1
+    fi
+  done
+  if [[ "${ok}" != "1" ]]; then
+    echo "WARN: sbatch resubmit failed on all partitions" >&2
   fi
 }
 
