@@ -7,6 +7,8 @@ Protocol (see scripts/make_hdepic_stream_half_split.py):
   - Communicating-MLP MTP heads (no RNN).
   - If encoder tokens exceed ``--keep-count``, attention-importance prune
     *before* the predictor (rebased positions) so long contexts fit.
+  - ``--no-prune`` keeps the dense tubelet grid so predictor RoPE indices are
+    true video time; +2/+4/+6s queries sit at now+horizon (not packed+rebase).
 
 Optional / separate from the fixed-clip anticipative eval path.
 """
@@ -132,42 +134,129 @@ class TokenPruner:
             self._orig_forward = None
 
 
+def n_pred_tokens_per_slot(core) -> int:
+    """Spatial tokens predicted for one tubelet (16×16=256 with ViT-L / patch 16)."""
+    return int(core.grid_size**2 * (core.num_output_frames // core.tubelet_size))
+
+
+def build_predictor_targets(
+    core,
+    n_context: int,
+    batch: int,
+    device,
+    *,
+    anticipation_times: torch.Tensor | None = None,
+    predict_horizons_sec: list[float] | tuple[float, ...] | None = None,
+) -> tuple[torch.Tensor, int]:
+    """Build predictor ``masks_y``.
+
+    Positions are 1D indices in tubelet-major layout (``t * grid^2 + spatial``).
+    With an unpruned encoder, ``n_context`` is the dense prefix ``0..T-1``, so
+    ``skip = n_context + grid^2 * horizon_tubelets`` is true *now + horizon*.
+    After prune+rebase the same formula is measured from the packed prefix, not
+    the original clock — use ``--no-prune`` when that distinction matters.
+
+    Default recipe: one 256-token spatial grid at ``anticipation_times``
+    (typically +2s). If ``predict_horizons_sec`` is set (e.g. 2, 4, 6), concatenate
+    one grid per horizon so a single predictor forward sees ``256×H`` mask tokens.
+    """
+    gp = int(core.grid_size**2)
+    n_slot = n_pred_tokens_per_slot(core)
+    if predict_horizons_sec:
+        chunks = []
+        for horizon in predict_horizons_sec:
+            steps = int(round(float(horizon) * float(core.frames_per_second) / float(core.tubelet_size)))
+            skip = int(n_context) + gp * steps
+            chunks.append(torch.arange(n_slot, device=device).unsqueeze(0).expand(batch, -1) + skip)
+        tgt = torch.cat(chunks, dim=1)
+        return tgt, int(tgt.size(1))
+    if anticipation_times is None:
+        raise ValueError("build_predictor_targets needs anticipation_times or predict_horizons_sec")
+    steps = (anticipation_times * core.frames_per_second / core.tubelet_size).to(torch.int64)
+    skip = int(n_context) + gp * steps
+    tgt = torch.arange(n_slot, device=device).unsqueeze(0).expand(batch, -1) + skip.unsqueeze(1)
+    return tgt, n_slot
+
+
+def ensure_predictor_capacity(predictor, tgt_positions: torch.Tensor, gp: int = 256) -> int:
+    """Raise ``num_patches`` so gather(masks_y) stays in range (RoPE has no extra params)."""
+    needed = int(tgt_positions.max().item()) + 1
+    needed = ((needed + gp - 1) // gp + 1) * gp
+    current = int(getattr(predictor, "num_patches", 0) or 0)
+    if current < needed:
+        predictor.num_patches = needed
+        logger.info("Lifted predictor.num_patches %d → %d", current, needed)
+        return needed
+    return current
+
+
+def run_predictor_on_context(
+    core,
+    x_full: torch.Tensor,
+    anticipation_times: torch.Tensor | None,
+    predict_horizons_sec: list[float] | tuple[float, ...] | None = None,
+) -> torch.Tensor:
+    """Predictor pass on already-encoded (and possibly pruned) tokens → encoder⊕pred."""
+    B, N, D_full = x_full.size()
+    embed_dim = core.encoder.embed_dim
+    use_hierarchical = D_full > embed_dim
+    x = x_full[:, :, -embed_dim:] if use_hierarchical else x_full
+    x_accumulate = x.clone()
+    ctxt_positions = torch.arange(N, device=x.device).unsqueeze(0).repeat(B, 1)
+    tgt_positions, n_pred = build_predictor_targets(
+        core,
+        N,
+        B,
+        x.device,
+        anticipation_times=anticipation_times,
+        predict_horizons_sec=predict_horizons_sec,
+    )
+    if predict_horizons_sec and int(core.num_steps) != 1:
+        raise ValueError("multi-horizon mask tokens require num_steps=1")
+    ensure_predictor_capacity(core.predictor, tgt_positions, gp=int(core.grid_size**2))
+    x_pred_input = x_full
+    for _ in range(core.num_steps):
+        pred_out = core.predictor(x_pred_input, masks_x=ctxt_positions, masks_y=tgt_positions)
+        x_pred_full = pred_out[0] if isinstance(pred_out, tuple) else pred_out
+        x_pred = x_pred_full[:, :, -embed_dim:] if x_pred_full.size(-1) != embed_dim else x_pred_full
+        x_accumulate = torch.cat([x_accumulate, x_pred], dim=1)
+        x_pred_for_input = x_pred_full if x_pred_full.size(-1) == x_pred_input.size(-1) else x_pred
+        x_pred_input = torch.cat([x_pred_input[:, n_pred:, :], x_pred_for_input], dim=1)
+    return x_accumulate
+
+
 class PrunedAnticipativeModel(nn.Module):
     """Encode → optional prune → predictor with rebased context positions."""
 
-    def __init__(self, base: nn.Module, pruner: TokenPruner | None, prune_threshold: int):
+    def __init__(
+        self,
+        base: nn.Module,
+        pruner: TokenPruner | None,
+        prune_threshold: int,
+        predict_horizons_sec: list[float] | tuple[float, ...] | None = None,
+    ):
         super().__init__()
         self.base = base
         self.pruner = pruner
         self.prune_threshold = int(prune_threshold)
         self.embed_dim = getattr(base, "embed_dim", None)
+        self.predict_horizons_sec = list(predict_horizons_sec) if predict_horizons_sec else None
 
     def forward(self, x, anticipation_times):
         core = self.base
         x_full = core.encoder(x)
         B, N, D_full = x_full.size()
-        embed_dim = core.encoder.embed_dim
         if self.pruner is not None and N > self.prune_threshold:
             x_full, _ = self.pruner.prune(x_full)
-            B, N, D_full = x_full.size()
-        use_hierarchical = D_full > embed_dim
-        x = x_full[:, :, -embed_dim:] if use_hierarchical else x_full
-        x_accumulate = x.clone()
-        ctxt_positions = torch.arange(N, device=x.device).unsqueeze(0).repeat(B, 1)
-        anticipation_steps = (anticipation_times * core.frames_per_second / core.tubelet_size).to(torch.int64)
-        skip_positions = N + int(core.grid_size**2) * anticipation_steps
-        N_pred = int(core.grid_size**2 * (core.num_output_frames // core.tubelet_size))
-        tgt_positions = torch.arange(N_pred, device=x.device).unsqueeze(0).repeat(B, 1)
-        tgt_positions = tgt_positions + skip_positions.unsqueeze(1)
-        x_pred_input = x_full
-        for _ in range(core.num_steps):
-            pred_out = core.predictor(x_pred_input, masks_x=ctxt_positions, masks_y=tgt_positions)
-            x_pred_full = pred_out[0] if isinstance(pred_out, tuple) else pred_out
-            x_pred = x_pred_full[:, :, -embed_dim:] if x_pred_full.size(-1) != embed_dim else x_pred_full
-            x_accumulate = torch.cat([x_accumulate, x_pred], dim=1)
-            x_pred_for_input = x_pred_full if x_pred_full.size(-1) == x_pred_input.size(-1) else x_pred
-            x_pred_input = torch.cat([x_pred_input[:, N_pred:, :], x_pred_for_input], dim=1)
-        return x_accumulate
+        if getattr(core, "no_predictor", False):
+            embed_dim = core.encoder.embed_dim
+            return x_full[:, :, -embed_dim:] if x_full.size(-1) > embed_dim else x_full
+        return run_predictor_on_context(
+            core,
+            x_full,
+            anticipation_times,
+            predict_horizons_sec=self.predict_horizons_sec,
+        )
 
 
 # ── data ─────────────────────────────────────────────────────────────────────
@@ -316,7 +405,15 @@ def map_labels(verbs, nouns, verb_map, noun_map, action_map, device):
 
 
 # ── model build / warm start ─────────────────────────────────────────────────
-def build_model(device, max_frames: int, fps: int, img_size: int, checkpoint: str):
+def build_model(
+    device,
+    max_frames: int,
+    fps: int,
+    img_size: int,
+    checkpoint: str,
+    *,
+    no_predictor: bool = False,
+):
     model_kwargs = {
         "use_v2_1": False,
         "encoder": {
@@ -343,7 +440,7 @@ def build_model(device, max_frames: int, fps: int, img_size: int, checkpoint: st
             "use_rope": True,
         },
     }
-    wrapper_kwargs = {"no_predictor": False, "num_output_frames": 2, "num_steps": 1}
+    wrapper_kwargs = {"no_predictor": bool(no_predictor), "num_output_frames": 2, "num_steps": 1}
     model = init_anticipative_module(
         frames_per_clip=max_frames,
         frames_per_second=fps,
@@ -355,7 +452,14 @@ def build_model(device, max_frames: int, fps: int, img_size: int, checkpoint: st
     return model
 
 
-def load_lora_sidecars(model, enc_path: str | None, pred_path: str | None):
+def load_lora_sidecars(
+    model,
+    enc_path: str | None,
+    pred_path: str | None,
+    *,
+    encoder_trainable: bool = False,
+    predictor_trainable: bool = True,
+):
     try:
         from app.hdepic_lora_action_anticipation.encoder_lora import (
             inject_encoder_lora,
@@ -373,13 +477,21 @@ def load_lora_sidecars(model, enc_path: str | None, pred_path: str | None):
     if enc_path and Path(enc_path).is_file():
         inject_encoder_lora(model, rank=8, alpha=16.0, dropout=0.05, last_n_blocks=0)
         load_encoder_lora_checkpoint(model, enc_path)
-        set_encoder_lora_trainable(model, trainable=False)
-        logger.info("Loaded encoder LoRA from %s (frozen)", enc_path)
+        set_encoder_lora_trainable(model, trainable=bool(encoder_trainable))
+        logger.info(
+            "Loaded encoder LoRA from %s (%s)",
+            enc_path,
+            "trainable" if encoder_trainable else "frozen",
+        )
     if pred_path and Path(pred_path).is_file():
         inject_predictor_lora(model, rank=8, alpha=16.0, dropout=0.05, last_n_blocks=0)
         load_predictor_lora_checkpoint(model, pred_path)
-        set_predictor_lora_trainable(model, trainable=True)
-        logger.info("Loaded predictor LoRA from %s (trainable)", pred_path)
+        set_predictor_lora_trainable(model, trainable=bool(predictor_trainable))
+        logger.info(
+            "Loaded predictor LoRA from %s (%s)",
+            pred_path,
+            "trainable" if predictor_trainable else "frozen",
+        )
 
 
 # ── train / val loops ────────────────────────────────────────────────────────
@@ -443,6 +555,8 @@ def run_epoch(
     save_fn=None,
     stop_flag=None,
     metric_state=None,
+    n_pred_per_horizon: int | None = None,
+    label_cols: list[int] | None = None,
 ):
     model.train(mode=train)
     classifier.train(mode=train)
@@ -478,15 +592,16 @@ def run_epoch(
 
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
             tokens = model(clips, ant)
-            outputs = classifier(tokens)
+            outputs = classifier(tokens, n_pred_per_horizon=n_pred_per_horizon)
             head_loss = clips.new_zeros(())
             for hi, h in enumerate(horizons):
-                valid = mtp_mask[:, hi] > 0.5
+                ci = int(label_cols[hi]) if label_cols is not None else hi
+                valid = mtp_mask[:, ci] > 0.5
                 if not bool(valid.any()):
                     continue
                 v_lab, n_lab, a_lab, keep = map_labels(
-                    mtp_verbs[valid, hi],
-                    mtp_nouns[valid, hi],
+                    mtp_verbs[valid, ci],
+                    mtp_nouns[valid, ci],
                     verb_map,
                     noun_map,
                     action_map,
@@ -516,11 +631,12 @@ def run_epoch(
 
             # primary metric
             h0 = horizons[primary_idx]
-            valid = mtp_mask[:, primary_idx] > 0.5
+            c0 = int(label_cols[primary_idx]) if label_cols is not None else primary_idx
+            valid = mtp_mask[:, c0] > 0.5
             if bool(valid.any()):
                 v_lab, n_lab, a_lab, keep = map_labels(
-                    mtp_verbs[valid, primary_idx],
-                    mtp_nouns[valid, primary_idx],
+                    mtp_verbs[valid, c0],
+                    mtp_nouns[valid, c0],
                     verb_map,
                     noun_map,
                     action_map,
@@ -606,15 +722,58 @@ def main():
     ap.add_argument("--predictor-lora", type=Path, default=None)
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--horizons-sec", type=str, default="2,4,6")
+    ap.add_argument(
+        "--csv-horizons-sec",
+        type=str,
+        default="",
+        help="Label column order in the CSV (default: same as --horizons-sec). "
+        "Use 2,4,6 when training a 2s/6s subset from the existing stream CSVs.",
+    )
     ap.add_argument("--loss-weights", type=str, default="1.0,0.7,0.5")
     ap.add_argument("--primary-horizon-sec", type=float, default=2.0)
     ap.add_argument("--anticipation-sec", type=float, default=2.0)
+    ap.add_argument(
+        "--predict-horizons-sec",
+        type=str,
+        default="",
+        help="If set (e.g. 2,4,6), one predictor forward places 256 mask tokens at each "
+        "horizon (256×H) instead of a single 256-token block at --anticipation-sec.",
+    )
+    ap.add_argument(
+        "--horizon-token-pool",
+        type=str,
+        default="shared",
+        choices=("shared", "split"),
+        help="shared: pool encoder+all predicted tokens once. split: pool encoder+"
+        "each horizon's 256 tokens separately (use with --predict-horizons-sec).",
+    )
     ap.add_argument("--max-frames", type=int, default=80)  # 10s @ 8fps
     ap.add_argument("--fps", type=int, default=8)
     ap.add_argument("--img-size", type=int, default=256)
-    ap.add_argument("--keep-count", type=int, default=4096)
+    ap.add_argument(
+        "--keep-count",
+        type=int,
+        default=4096,
+        help="Prune encoder tokens to this count when N exceeds it. Ignored if "
+        "--no-prune or keep-count<=0.",
+    )
+    ap.add_argument(
+        "--no-prune",
+        action="store_true",
+        help="Do not prune encoder tokens. Predictor RoPE then uses the dense "
+        "original tubelet timeline (true now+2/4/6s queries).",
+    )
+    ap.add_argument(
+        "--no-predictor",
+        action="store_true",
+        help="Skip JEPA predictor; MTP pools encoder tokens. Encoder LoRA is "
+        "unfrozen (finetune); predictor LoRA is not used.",
+    )
     ap.add_argument("--batch-size", type=int, default=2)
     ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument("--prefetch-factor", type=int, default=4)
+    ap.add_argument("--pin-memory", action="store_true")
+    ap.add_argument("--persistent-workers", action="store_true")
     ap.add_argument("--epochs", type=int, default=8)
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--save-every", type=int, default=200, help="Save latest.pt every N train steps (0=off)")
@@ -639,12 +798,33 @@ def main():
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     horizons = [float(x) for x in args.horizons_sec.split(",")]
     weights = [float(x) for x in args.loss_weights.split(",")]
     assert len(horizons) == len(weights)
+    csv_horizons = [float(x) for x in args.csv_horizons_sec.split(",") if x.strip()] or list(horizons)
+    try:
+        label_cols = [csv_horizons.index(h) for h in horizons]
+    except ValueError as exc:
+        raise SystemExit(f"--horizons-sec {horizons} not in --csv-horizons-sec {csv_horizons}: {exc}") from exc
     primary_h = float(args.primary_horizon_sec)
     primary_idx = horizons.index(primary_h) if primary_h in horizons else 0
+    logger.info("MTP heads %s loss_w=%s csv_cols=%s (csv=%s)", horizons, weights, label_cols, csv_horizons)
+    predict_horizons = [float(x) for x in args.predict_horizons_sec.split(",") if x.strip()]
+    if predict_horizons and args.horizon_token_pool == "split" and predict_horizons != horizons:
+        raise SystemExit("--predict-horizons-sec must match --horizons-sec when --horizon-token-pool=split")
+    n_pred_per_horizon = 256 if (predict_horizons and args.horizon_token_pool == "split") else None
+    logger.info(
+        "predictor masks: %s",
+        (
+            f"{len(predict_horizons)}×256 at {predict_horizons}s, pool={args.horizon_token_pool}"
+            if predict_horizons
+            else f"256 at anticipation_sec={args.anticipation_sec}"
+        ),
+    )
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     done_flag = args.out_dir / "TRAINING_DONE"
@@ -662,25 +842,78 @@ def main():
     loader_kwargs = dict(
         num_workers=args.num_workers,
         collate_fn=collate_stream,
-        pin_memory=False,
-        persistent_workers=False,
+        pin_memory=bool(args.pin_memory),
+        persistent_workers=bool(args.persistent_workers) and args.num_workers > 0,
     )
     if args.num_workers > 0:
-        loader_kwargs["prefetch_factor"] = 2
+        loader_kwargs["prefetch_factor"] = max(2, int(args.prefetch_factor))
+        # spawn: workers start after CUDA init; fork-after-CUDA stalls decode.
+        loader_kwargs["multiprocessing_context"] = "spawn"
+    logger.info(
+        "dataloader workers=%d prefetch=%s pin=%s persistent=%s ctx=%s",
+        args.num_workers,
+        loader_kwargs.get("prefetch_factor"),
+        loader_kwargs["pin_memory"],
+        loader_kwargs["persistent_workers"],
+        loader_kwargs.get("multiprocessing_context", "main"),
+    )
     train_loader = DataLoader(train_ds, batch_sampler=train_sampler, **loader_kwargs)
     val_loader = DataLoader(val_ds, batch_sampler=val_sampler, **loader_kwargs)
 
-    base = build_model(device, args.max_frames, args.fps, args.img_size, str(args.checkpoint))
+    base = build_model(
+        device,
+        args.max_frames,
+        args.fps,
+        args.img_size,
+        str(args.checkpoint),
+        no_predictor=bool(args.no_predictor),
+    )
     for p in base.encoder.parameters():
         p.requires_grad = False
     load_lora_sidecars(
         base,
         str(args.encoder_lora) if args.encoder_lora else None,
-        str(args.predictor_lora) if args.predictor_lora else None,
+        None if args.no_predictor else (str(args.predictor_lora) if args.predictor_lora else None),
+        encoder_trainable=bool(args.no_predictor),
+        predictor_trainable=not bool(args.no_predictor),
     )
+    if args.no_predictor:
+        logger.info("no-predictor: MTP pools encoder tokens; encoder LoRA trainable")
+        predict_horizons = []
+        n_pred_per_horizon = None
     gp = int(base.grid_size**2)
-    pruner = TokenPruner(base.encoder, keep_count=args.keep_count, gp=gp)
-    model = PrunedAnticipativeModel(base, pruner, prune_threshold=args.keep_count).to(device)
+    if n_pred_per_horizon is not None:
+        n_pred_per_horizon = n_pred_tokens_per_slot(base)
+    disable_prune = bool(args.no_prune) or int(args.keep_count) <= 0
+    if disable_prune:
+        pruner = None
+        prune_threshold = 10**9
+        logger.info("Prune disabled; predictor context RoPE is dense original time 0..N-1")
+    else:
+        pruner = TokenPruner(base.encoder, keep_count=args.keep_count, gp=gp)
+        prune_threshold = args.keep_count
+        logger.info("Prune enabled keep_count=%d (rebase context to 0..K-1)", args.keep_count)
+    if not args.no_predictor:
+        query_horizons = predict_horizons or [float(args.anticipation_sec)]
+        n_tubes = int(args.max_frames) // int(base.tubelet_size)
+        now_t = n_tubes - 1
+        for h in query_horizons:
+            steps = int(round(float(h) * float(args.fps) / float(base.tubelet_size)))
+            q_t = n_tubes + steps
+            logger.info(
+                "max-ctx query +%.0fs -> tubelet t=%d (now t=%d, abs %.2fs) %s",
+                h,
+                q_t,
+                now_t,
+                q_t * float(base.tubelet_size) / float(args.fps),
+                "(true clock iff no prune)" if disable_prune else "(packed clock after prune)",
+            )
+    model = PrunedAnticipativeModel(
+        base,
+        pruner,
+        prune_threshold=prune_threshold,
+        predict_horizons_sec=predict_horizons or None,
+    ).to(device)
 
     classifier = AttentiveClassifier(
         verb_classes=verb_map,
@@ -826,6 +1059,8 @@ def main():
             model, mtp_clf, val_loader, device, horizons, weights, primary_idx,
             verb_map, noun_map, action_map, train=False, anticipation_sec=args.anticipation_sec,
             stop_flag=stop_flag,
+            n_pred_per_horizon=n_pred_per_horizon,
+            label_cols=label_cols,
         )
         metrics_pub = {k: v for k, v in metrics.items() if not str(k).startswith("_")}
         logger.info(
@@ -857,6 +1092,8 @@ def main():
                 save_fn=_periodic_save,
                 stop_flag=stop_flag,
                 metric_state=(resume_metric_state if epoch_start_step > 0 else None),
+                n_pred_per_horizon=n_pred_per_horizon,
+                label_cols=label_cols,
             )
             train_sampler.set_start_batch(0)
             if tr.get("stopped_early"):
@@ -881,6 +1118,8 @@ def main():
             save_fn=_periodic_save,
             stop_flag=stop_flag,
             metric_state=(resume_metric_state if (skip_train and val_start_step > 0) else None),
+            n_pred_per_horizon=n_pred_per_horizon,
+            label_cols=label_cols,
         )
         val_sampler.set_start_batch(0)
         if va.get("stopped_early"):

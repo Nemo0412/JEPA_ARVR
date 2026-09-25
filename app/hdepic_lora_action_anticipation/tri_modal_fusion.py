@@ -727,8 +727,14 @@ class TriModalFusionAdaptedModel(nn.Module):
         # → larger batches → more GPU work per decode).
         if not any(p.requires_grad for p in base.encoder.parameters()):
             x_full = x_full.detach()
+
+        x_fused = self._fuse_for_predictor(x_full, gaze_map, imu_batch)
+        if torch.is_tensor(x_fused) and not torch.isfinite(x_fused).all():
+            return None
+        # Skip JEPA predictor: probe sees fused encoder tokens (gaze concat is
+        # already in the RGB adapter; IMU/gaze CA still runs here).
         if base.no_predictor:
-            return x_full
+            return x_fused
 
         embed_dim = base.encoder.embed_dim
         use_hierarchical = x_full.size(-1) > embed_dim
@@ -739,9 +745,7 @@ class TriModalFusionAdaptedModel(nn.Module):
         else:
             x_accumulate = x_last_obs.clone()
 
-        x_pred_input = self._fuse_for_predictor(x_full, gaze_map, imu_batch)
-        if torch.is_tensor(x_pred_input) and not torch.isfinite(x_pred_input).all():
-            return None
+        x_pred_input = x_fused
 
         n_aux = int(getattr(self, "_n_aux_context_tokens", 0) or 0)
         if (
@@ -1120,13 +1124,25 @@ def train_one_epoch_with_tri_modal_fusion(
         "tri_modal train async prefetch: depth=%d (decode‖aux pipeline)",
         prefetch_depth,
     )
+    start_itr = max(0, int(getattr(base_eval, "_mid_epoch_start_itr", 0) or 0))
+    save_fn = getattr(base_eval, "_mid_epoch_save_fn", None)
+    save_every = int(getattr(base_eval, "_mid_epoch_save_every", 0) or 0)
+    if start_itr >= ipe:
+        logger.warning("tri_modal start_itr=%d >= ipe=%d; ignoring mid-epoch resume offset", start_itr, ipe)
+        start_itr = 0
+    if start_itr > 0:
+        logger.info("tri_modal mid-epoch resume at itr=%d/%d", start_itr, ipe)
+        for _ in range(start_itr):
+            [s.step() for s in scheduler]
+            [wds_.step() for wds_ in wd_scheduler]
+
     prefetcher = _TriModalBatchPrefetcher(
         data_loader, gaze_map_builder, imu_loader, depth=prefetch_depth
     )
     decode_meter = AverageMeter()
     aux_meter = AverageMeter()
     try:
-        for itr in range(ipe):
+        for itr in range(start_itr, ipe):
             itr_start_time = time.time()
             [s.step() for s in scheduler]
             [wds_.step() for wds_ in wd_scheduler]
@@ -1246,6 +1262,11 @@ def train_one_epoch_with_tri_modal_fusion(
                         aux_meter.avg,
                         step_ms,
                     )
+            if save_every > 0 and save_fn is not None and ((itr + 1) % save_every == 0 or itr == ipe - 1):
+                try:
+                    save_fn(itr)
+                except Exception as exc:
+                    logger.warning("Mid-epoch save failed at itr=%d: %s", itr, exc)
     finally:
         prefetcher.close()
 

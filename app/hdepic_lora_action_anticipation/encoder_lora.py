@@ -422,9 +422,21 @@ def train_one_epoch_encoder_lora(
 
     from app.hdepic_lora_action_anticipation.data_prefetch import DataLoaderPrefetcher
 
+    start_itr = max(0, int(getattr(base_eval, "_mid_epoch_start_itr", 0) or 0))
+    save_fn = getattr(base_eval, "_mid_epoch_save_fn", None)
+    save_every = int(getattr(base_eval, "_mid_epoch_save_every", 0) or 0)
+    if start_itr >= ipe:
+        logger.warning("encoder-LoRA start_itr=%d >= ipe=%d; ignoring mid-epoch resume offset", start_itr, ipe)
+        start_itr = 0
+    if start_itr > 0:
+        logger.info("encoder-LoRA mid-epoch resume at itr=%d/%d", start_itr, ipe)
+        for _ in range(start_itr):
+            [s.step() for s in scheduler]
+            [wds.step() for wds in wd_scheduler]
+
     prefetcher = DataLoaderPrefetcher(data_loader, name="enc-lora-prefetch")
     try:
-        for itr in range(ipe):
+        for itr in range(start_itr, ipe):
             itr_start_time = time.time()
             with breakdown.section("data_load", sync_before=False):
                 udata, fetch_ms = prefetcher.get()
@@ -572,6 +584,11 @@ def train_one_epoch_encoder_lora(
                         data_elapsed_time_meter.avg,
                         step_ms,
                     )
+            if save_every > 0 and save_fn is not None and ((itr + 1) % save_every == 0 or itr == ipe - 1):
+                try:
+                    save_fn(itr)
+                except Exception as exc:
+                    logger.warning("Mid-epoch save failed at itr=%d: %s", itr, exc)
     finally:
         prefetcher.close()
 

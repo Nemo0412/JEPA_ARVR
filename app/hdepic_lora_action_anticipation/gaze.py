@@ -14,6 +14,7 @@ import time
 import zipfile
 from collections import Counter, OrderedDict
 from dataclasses import dataclass
+from multiprocessing import Value
 from pathlib import Path
 from typing import Any
 
@@ -568,6 +569,9 @@ class ResampledItems(torch.utils.data.IterableDataset):
         self.items = list(items)
         self.epoch = epoch
         self.training = training
+        # Shared across persistent DataLoader workers (spawn). Used to fast-skip
+        # already-trained samples on mid-epoch resume without decoding them.
+        self.skip_items = Value("i", 0)
         logger.info("Done initializing clip-balanced items: %d", len(self.items))
 
     def __iter__(self):
@@ -590,8 +594,32 @@ class ResampledItems(torch.utils.data.IterableDataset):
                     order.extend(video_items[int(i)] for i in item_perm)
                 else:
                     order.extend(video_items)
-        for idx in order:
+        skip = int(getattr(self.skip_items, "value", 0) or 0)
+        for i, idx in enumerate(order):
+            if i < skip:
+                continue
             yield self.items[int(idx)]
+
+
+def set_clip_balanced_skip_items(data_loader, n: int) -> bool:
+    """Skip the first ``n`` clip-balanced samples (no decode). Returns True if applied."""
+    n = int(max(0, n))
+    ds = getattr(data_loader, "dataset", data_loader)
+    pipeline = getattr(ds, "pipeline", None)
+    stages = list(pipeline) if pipeline is not None else [ds]
+    for stage in stages:
+        skip_holder = getattr(stage, "skip_items", None)
+        if skip_holder is None:
+            continue
+        if hasattr(skip_holder, "value"):
+            skip_holder.value = n
+        else:
+            stage.skip_items = n
+        logger.info("clip-balanced skip_items=%d", n)
+        return True
+    if n > 0:
+        logger.warning("Could not set clip-balanced skip_items=%d on dataloader", n)
+    return False
 
 
 class ContiguousSplitByWorker(wds.PipelineStage):

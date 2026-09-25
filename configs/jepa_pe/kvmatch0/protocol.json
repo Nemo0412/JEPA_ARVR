@@ -1,0 +1,10 @@
+{
+  "dataset": "clip_split HD-EPIC P01",
+  "protocol": "stream_kv_matched_train_eval",
+  "cache_frames": 0,
+  "chunk_frames": 16,
+  "window_frames": 16,
+  "horizon_sec": 2,
+  "frames_per_clip_loaded": 128,
+  "note": "Data loads 128f newest-aligned; encode uses last cache+chunk via streamed KV"
+}

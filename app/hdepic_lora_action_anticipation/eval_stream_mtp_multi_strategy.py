@@ -68,28 +68,12 @@ def result_provenance(args):
     return provenance
 
 
-def predict_from_encoded(core, x_full, anticipation_times):
+def predict_from_encoded(core, x_full, anticipation_times, predict_horizons_sec=None):
     """Predictor pass on an already-encoded (and possibly pruned) context -> x_accumulate.
     Mirrors ``PrunedAnticipativeModel.forward`` from just after the encoder/prune step."""
-    B, N, D_full = x_full.size()
-    embed_dim = core.encoder.embed_dim
-    use_hier = D_full > embed_dim
-    x = x_full[:, :, -embed_dim:] if use_hier else x_full
-    x_acc = x.clone()
-    ctxt_positions = torch.arange(N, device=x.device).unsqueeze(0).repeat(B, 1)
-    anticipation_steps = (anticipation_times * core.frames_per_second / core.tubelet_size).to(torch.int64)
-    skip_positions = N + int(core.grid_size ** 2) * anticipation_steps
-    N_pred = int(core.grid_size ** 2 * (core.num_output_frames // core.tubelet_size))
-    tgt_positions = torch.arange(N_pred, device=x.device).unsqueeze(0).repeat(B, 1) + skip_positions.unsqueeze(1)
-    x_pred_input = x_full
-    for _ in range(core.num_steps):
-        pred_out = core.predictor(x_pred_input, masks_x=ctxt_positions, masks_y=tgt_positions)
-        x_pred_full = pred_out[0] if isinstance(pred_out, tuple) else pred_out
-        x_pred = x_pred_full[:, :, -embed_dim:] if x_pred_full.size(-1) != embed_dim else x_pred_full
-        x_acc = torch.cat([x_acc, x_pred], dim=1)
-        x_pred_for_input = x_pred_full if x_pred_full.size(-1) == x_pred_input.size(-1) else x_pred
-        x_pred_input = torch.cat([x_pred_input[:, N_pred:, :], x_pred_for_input], dim=1)
-    return x_acc
+    return T.run_predictor_on_context(
+        core, x_full, anticipation_times, predict_horizons_sec=predict_horizons_sec
+    )
 
 
 class StrategySelector:

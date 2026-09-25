@@ -419,24 +419,53 @@ class CommunicatingMLPMTPClassifier(nn.Module):
             z = block(z)
         return [z[:, i] for i in range(z.size(1))]
 
-    def forward(self, tokens: torch.Tensor) -> dict[float, dict[str, torch.Tensor]]:
+    def _split_horizon_tokens(self, tokens: torch.Tensor, n_pred_per_horizon: int):
+        n_h = len(self.horizons_sec)
+        n_pred = int(n_pred_per_horizon) * n_h
+        if tokens.size(1) < n_pred:
+            raise ValueError(
+                f"tokens length {tokens.size(1)} < {n_pred} predicted tokens "
+                f"({n_pred_per_horizon}×{n_h} horizons)"
+            )
+        n_enc = tokens.size(1) - n_pred
+        enc = tokens[:, :n_enc]
+        feat_v, feat_n, feat_a = [], [], []
+        for i in range(n_h):
+            start = n_enc + i * int(n_pred_per_horizon)
+            stop = start + int(n_pred_per_horizon)
+            fv, fn, fa = self._pool_slots(torch.cat([enc, tokens[:, start:stop]], dim=1))
+            feat_v.append(fv)
+            feat_n.append(fn)
+            feat_a.append(fa)
+        return feat_v, feat_n, feat_a
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        n_pred_per_horizon: int | None = None,
+    ) -> dict[float, dict[str, torch.Tensor]]:
         if isinstance(tokens, (list, tuple)):
             raise TypeError(
                 "CommunicatingMLPMTPClassifier expects a single token tensor "
                 "(backbone_mode=shared); got a sequence — use CascadedMTPClassifier "
                 "or set backbone_mode=shared"
             )
-        feat_v, feat_n, feat_a = self._pool_slots(tokens)
-        # Communicate on the action slot; verb/noun slots get the same residual
-        # shift so the three classifiers stay aligned with the warm-started head.
-        shared = self._communicate([feat_a for _ in self.horizons_sec])
+        n_pred_per_horizon = n_pred_per_horizon or getattr(self, "n_pred_per_horizon", None)
+        if n_pred_per_horizon:
+            feat_v, feat_n, feat_a = self._split_horizon_tokens(tokens, int(n_pred_per_horizon))
+            shared = self._communicate(feat_a)
+        else:
+            fv, fn, fa = self._pool_slots(tokens)
+            feat_v = [fv for _ in self.horizons_sec]
+            feat_n = [fn for _ in self.horizons_sec]
+            feat_a = [fa for _ in self.horizons_sec]
+            shared = self._communicate(feat_a)
         outputs: dict[float, dict[str, torch.Tensor]] = {}
         action_only = getattr(self.base, "action_only", False) or getattr(self.base, "num_verb_classes", 1) == 0
-        for h, z_a in zip(self.horizons_sec, shared):
-            # Delta from communicated action feature applied to v/n as well.
-            delta = z_a - feat_a
-            zv = feat_v + delta
-            zn = feat_n + delta
+        for h, z_a, fv, fn, fa in zip(self.horizons_sec, shared, feat_v, feat_n, feat_a):
+            delta = z_a - fa
+            zv = fv + delta
+            zn = fn + delta
             if action_only:
                 outputs[float(h)] = dict(action=self.base.action_classifier(z_a))
             else:

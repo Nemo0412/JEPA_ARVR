@@ -1,0 +1,152 @@
+# Jepa_PE — Stream KV + Probe Temporal RoPE
+
+Branch for **probe positional encoding / temporal RoPE** work on HD-EPIC P01,
+with **train/eval-matched stream KV** encoding (newest-aligned chunked cache).
+
+Status snapshot (2026-09-24): training still in **epoch 0**; no val metrics yet.
+Train curves and configs are under `plots/` and `configs/jepa_pe/`.
+Large `.pt` checkpoints stay on scratch (gitignored).
+
+---
+
+## Download HD-EPIC
+
+Official site: [hd-epic.github.io](https://hd-epic.github.io/)  
+DOI / Bristol dump: [data.bris](https://data.bris.ac.uk/data/dataset/3cqb5b81wk2dc2379fx1mrxh47) (~2.3 TiB full)  
+Annotations: [hd-epic/hd-epic-annotations](https://github.com/hd-epic/hd-epic-annotations)  
+Downloader: [hd-epic/hd-epic-downloader](https://github.com/hd-epic/hd-epic-downloader)
+
+### Recommended (videos + SLAM/gaze, skip VRS)
+
+VRS alone is ~1.9 TB. For V-JEPA anticipation you mainly need **mp4 videos**,
+**narrations/action annotations**, and optionally **SLAM-and-Gaze**.
+
+```bash
+# 1) Annotations
+git clone https://github.com/hd-epic/hd-epic-annotations.git \
+  /path/to/HD-EPIC/hd-epic-annotations
+
+# 2) Downloader
+git clone https://github.com/hd-epic/hd-epic-downloader.git \
+  /path/to/HD-EPIC/hd-epic-downloader
+cd /path/to/HD-EPIC/hd-epic-downloader
+
+# 3) Download (resumable via md5). Parent dir will get HD-EPIC/
+python hd-epic-downloader.py /path/to/HD-EPIC \
+  --videos --slam-gaze \
+  --digital-twin --audio --hands \
+  --consent-form --acquisition-guidelines
+# Optional: --participant 1   (P01 only, faster for smoke tests)
+```
+
+Cluster helper used here (paths are machine-specific; edit before submit):
+
+```bash
+sbatch scripts/submit_download_hdepic_full_cpu_ll5914.slurm
+# or the portable template:
+# sbatch scripts/download_hdepic_data_cpu.slurm
+```
+
+### Convert to V-JEPA CSV + video link tree
+
+```bash
+python scripts/convert_hdepic_to_vjepa_csv.py \
+  --annotations-pkl /path/to/HD-EPIC/hd-epic-annotations/narrations-and-action-segments/HD_EPIC_Narrations.pkl \
+  --video-root /path/to/HD-EPIC/HD-EPIC \
+  --output-dir /path/to/HD-EPIC/hdepic_vjepa_annotations/full_pool \
+  --link-root /path/to/HD-EPIC/hdepic_vjepa_videos \
+  --link-method symlink \
+  --skip-missing-videos \
+  --no-video-probe --fps 30 \
+  --split-preset legacy --val-ratio 0.2
+```
+
+P01 clip-level 80/20 split (what the current runs use):
+
+```bash
+python scripts/make_hdepic_clip_split.py \
+  --pool /path/to/HD-EPIC/hdepic_vjepa_annotations/full_pool \
+  --out  /path/to/HD-EPIC/hdepic_vjepa_annotations/clip_split
+# All participants P01–P09 (optional):
+# python scripts/make_hdepic_clip_split_all.py --pool ... --out .../clip_split_all --force
+```
+
+More notes: [`scripts/README_hdepic_action_anticipation.md`](../scripts/README_hdepic_action_anticipation.md).
+
+---
+
+## Current runs (configs)
+
+| Job name | Encode window | Cache + chunk | Probe RoPE | Horizon | BS | Epochs |
+|---|---|---|---|---|---|---|
+| **kvmatch0** | **16f** (last 2s) | 0 + 16 | off | 2s | 2 | 8 |
+| **kvmatch112** | **128f** | 112 + 16 | off | 2s | 2 | 8 |
+| **kvrope112** | **128f** | 112 + 16 | **on** (1D temporal on AttentivePooler) | 2s | 2 | 8 |
+
+Shared settings:
+
+- Dataset: HD-EPIC **P01** `clip_split`
+- Backbone: ViT-L/16 @ 256, encoder LoRA (rank 8)
+- Dataloader: `frames_per_clip=128`, `frames_per_second=8` (~16s clip)
+- Protocol: newest-aligned **stream KV** (chunked encode; history under `no_grad`, train last chunk only)
+- Probe RoPE position = dense slot ids `0..S-1` inside the packed window (not absolute video frame id)
+
+Frozen copies of each run’s `config.yaml` + `protocol.json`:
+
+- [`configs/jepa_pe/kvmatch0/`](../configs/jepa_pe/kvmatch0/)
+- [`configs/jepa_pe/kvmatch112/`](../configs/jepa_pe/kvmatch112/)
+- [`configs/jepa_pe/kvrope112/`](../configs/jepa_pe/kvrope112/)
+- Progress snapshot: [`configs/jepa_pe/status.json`](../configs/jepa_pe/status.json)
+
+### Submit (cluster)
+
+```bash
+SCR=scripts/submit_clip_stream_kv_matched_ll5914.slurm
+EXPORT_COMMON=HORIZON=2,BATCH_SIZE=2,NUM_WORKERS=2,VAL_NUM_WORKERS=1,PREFETCH_FACTOR=1
+
+# short context (cache=0 → encode last 16f of the 128f clip)
+sbatch --job-name=kvmatch0 --mem=128G --cpus-per-task=8 \
+  --export=CACHE_FRAMES=0,PROBE_ROPE=0,$EXPORT_COMMON "$SCR"
+
+# long context matched train/eval
+sbatch --job-name=kvmatch112 --mem=128G --cpus-per-task=8 \
+  --export=CACHE_FRAMES=112,PROBE_ROPE=0,$EXPORT_COMMON "$SCR"
+
+# same as kvmatch112 + probe temporal RoPE (warm-starts from kvmatch112 ckpt when present)
+sbatch --job-name=kvrope112 --mem=128G --cpus-per-task=8 \
+  --export=CACHE_FRAMES=112,PROBE_ROPE=1,$EXPORT_COMMON "$SCR"
+```
+
+Script supports a multi-partition race (A100/H100/H200): first job to start cancels same-name siblings.
+
+---
+
+## Results so far (train only)
+
+| Run | Logged itrs (epoch 0) | Last train loss | Last train acc action | Last recall@5 action |
+|---|---:|---:|---:|---:|
+| kvmatch0 | 0 → ~760 | ~12.0 | ~25.7% | ~23.2% |
+| kvmatch112 | 0 → 510 | 11.25 | 18.4% | 12.9% |
+| kvrope112 | 0 → 230 | 13.69 | 19.5% | 11.7% |
+
+Overlap train comparison (itr 0–230): RoPE ≈ **−0.2** loss, **+1.4pp** action acc vs kvmatch112 — early / noisy; **no val yet**.
+
+Plots:
+
+- [`plots/kvrope112_vs_kvmatch112_train_loss_from0.png`](../plots/kvrope112_vs_kvmatch112_train_loss_from0.png)
+- [`plots/kvrope112_vs_kvmatch112_train_loss_smooth.png`](../plots/kvrope112_vs_kvmatch112_train_loss_smooth.png)
+- [`plots/kvrope112_vs_kvmatch112_train_curves_full.csv`](../plots/kvrope112_vs_kvmatch112_train_curves_full.csv)
+
+Earlier abs-frame RoPE ablation (prune survivors keep raw slot id; hurt @2s):  
+[`configs/jepa_pe/probe_temporal_rope_abs_frame_128kv.json`](../configs/jepa_pe/probe_temporal_rope_abs_frame_128kv.json)
+
+---
+
+## Code map
+
+| Piece | Path |
+|---|---|
+| Stream KV encode + probe RoPE helpers | `app/hdepic_lora_action_anticipation/stream_kvcache_attn_prune.py` |
+| Wire stream KV / probe RoPE into eval | `app/hdepic_lora_action_anticipation/eval.py` |
+| Train/eval launcher | `scripts/submit_clip_stream_kv_matched_ll5914.slurm` |
+| Abs-frame RoPE FT/eval script | `scripts/finetune_eval_probe_temporal_rope_abs_frame.py` |

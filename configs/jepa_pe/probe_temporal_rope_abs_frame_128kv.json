@@ -1,0 +1,52 @@
+{
+  "method": "ProbeTemporalRoPEAbsFrame",
+  "note": "Probe 1D temporal RoPE with original Frame/slot Index after 128+34 attn prune. Finetune probe+heads; encoder frozen.",
+  "device": "NVIDIA A100-SXM4-80GB",
+  "accuracy": {
+    "table_action_top5": {
+      "baseline": {
+        "@2s": 14.1176,
+        "@6s": 10.9375,
+        "n@2s": 85
+      },
+      "rope_zeroshot": {
+        "@2s": 11.7647,
+        "@6s": 12.5,
+        "n@2s": 85
+      },
+      "rope_ft": {
+        "@2s": 8.2353,
+        "@6s": 10.9375,
+        "n@2s": 85
+      }
+    },
+    "delta_pp": {
+      "zeroshot_minus_baseline@2s": -2.3529,
+      "ft_minus_baseline@2s": -5.8823,
+      "ft_minus_zeroshot@2s": -3.5294,
+      "zeroshot_minus_baseline@6s": 1.5625,
+      "ft_minus_baseline@6s": 0.0,
+      "ft_minus_zeroshot@6s": -1.5625
+    },
+    "n_val_clips": 108,
+    "n_train_clips": 108
+  },
+  "config": {
+    "cache_frames": 128,
+    "new_frames": 34,
+    "prune": "encoder last-block slot attention, replace lowest 34 frames",
+    "rope": "1D temporal on probe self-attn Q/K (+ cross-attn K); abs stream slot id",
+    "formula": "Q'=R(p)Q, K'=R(p)K, theta_p,m = p * omega_m, p=original Frame Index",
+    "epochs": 8,
+    "lr": 0.0001,
+    "train_seconds": 102.3842978477478,
+    "ckpt": "/scratch/ll5914/experiments/p01_stream_mtp_nopred_vanilla_2_4_6/latest.pt",
+    "ckpt_meta": {
+      "epoch": 6,
+      "step": 3249,
+      "phase": "val"
+    },
+    "ft_ckpt": "/scratch/ll5914/experiments/probe_temporal_rope_abs_frame_128kv/probe_temporal_rope_ft.pt"
+  },
+  "png": "/scratch/ll5914/experiments/probe_temporal_rope_abs_frame_128kv/probe_temporal_rope_abs_frame_128kv.png"
+}

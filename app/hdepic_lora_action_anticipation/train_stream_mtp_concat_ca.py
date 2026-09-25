@@ -313,6 +313,7 @@ class PrunedConcatCAStreamModel(nn.Module):
         cap_total_to_keep: bool = False,
         max_aux_tokens: int = 0,
         aux_tokens_per_slot: int = 1,
+        no_predictor: bool = False,
     ):
         super().__init__()
         self.concat_ca = concat_ca
@@ -329,6 +330,7 @@ class PrunedConcatCAStreamModel(nn.Module):
         # If >0, keep only the last max_aux_tokens of the auxiliary prefix.
         self.max_aux_tokens = int(max_aux_tokens)
         self.aux_tokens_per_slot = max(1, int(aux_tokens_per_slot))
+        self.no_predictor = bool(no_predictor)
         self.embed_dim = concat_ca.embed_dim
         if self.prune_mode not in ("encoder_attn", "postfuse_recency"):
             raise ValueError(f"Unknown prune_mode={self.prune_mode!r}")
@@ -486,6 +488,9 @@ class PrunedConcatCAStreamModel(nn.Module):
                 f"(aux={n_aux}, video={x_pred.size(1) - n_aux}, ca_aux={ca_aux})"
             )
 
+        if self.no_predictor:
+            embed_dim = base_m.encoder.embed_dim
+            return x_pred[:, :, -embed_dim:] if x_pred.size(-1) != embed_dim else x_pred
         return tri._forward_single_step(base_m, x_pred, x_accumulate, anticipation_times)
 
 
@@ -516,15 +521,25 @@ def build_concat_ca_model(
     ffn_mult: int = 4,
     ca_aux: str = "imu",
     adapter_in_channels: int | None = None,
+    no_predictor: bool = False,
 ):
     ca_aux = str(ca_aux).lower().strip()
     if ca_aux not in ("imu", "gaze"):
         raise ValueError(f"ca_aux must be 'imu' or 'gaze', got {ca_aux!r}")
 
-    base_model = base.build_model(device, max_frames, fps, img_size, checkpoint)
+    base_model = base.build_model(
+        device, max_frames, fps, img_size, checkpoint, no_predictor=bool(no_predictor)
+    )
     for p in base_model.encoder.parameters():
         p.requires_grad = False
-    base.load_lora_sidecars(base_model, encoder_lora, predictor_lora)
+    pred_lora = None if no_predictor else predictor_lora
+    base.load_lora_sidecars(
+        base_model,
+        encoder_lora,
+        pred_lora,
+        encoder_trainable=bool(no_predictor),
+        predictor_trainable=not bool(no_predictor),
+    )
 
     embed_dim = int(base_model.embed_dim)
     grid_size = int(base_model.grid_size)
@@ -617,13 +632,21 @@ def build_concat_ca_model(
     )
     for p in wrapped.base_model.parameters():
         p.requires_grad = False
-    # Re-enable predictor LoRA (load_lora_sidecars set it; the blanket freeze above cleared it).
-    try:
-        from app.hdepic_lora_action_anticipation.predictor_lora import set_predictor_lora_trainable
+    if no_predictor:
+        try:
+            from app.hdepic_lora_action_anticipation.encoder_lora import set_encoder_lora_trainable
 
-        set_predictor_lora_trainable(wrapped.base_model, trainable=True)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not re-enable predictor LoRA: %s", exc)
+            set_encoder_lora_trainable(wrapped.base_model, trainable=True)
+            logger.info("no-predictor: encoder LoRA re-enabled (finetune); predictor unused")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not enable encoder LoRA: %s", exc)
+    else:
+        try:
+            from app.hdepic_lora_action_anticipation.predictor_lora import set_predictor_lora_trainable
+
+            set_predictor_lora_trainable(wrapped.base_model, trainable=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not re-enable predictor LoRA: %s", exc)
 
     side = str(video_query_side).lower()
     if fusion_ckpt and Path(fusion_ckpt).is_file():
@@ -675,7 +698,7 @@ def build_concat_ca_model(
             p.requires_grad = not freeze_fusion
         if freeze_fusion:
             logger.info("Froze fusion + aux encoder params")
-    if freeze_encoder_lora:
+    if freeze_encoder_lora and not no_predictor:
         try:
             from app.hdepic_lora_action_anticipation.encoder_lora import set_encoder_lora_trainable
 
@@ -705,6 +728,7 @@ def build_concat_ca_model(
         cap_total_to_keep=cap_total_to_keep,
         max_aux_tokens=max_aux_tokens,
         aux_tokens_per_slot=n_g if use_gaze else n_i,
+        no_predictor=bool(no_predictor),
     ).to(device)
     logger.info(
         "ConcatCA stream: ca_aux=%s adapter_ch=%d n_v=%d n_g=%d n_i=%d keep=%d "
@@ -1120,6 +1144,11 @@ def main():
     )
     ap.add_argument("--ffn-mult", type=int, default=4, help="FFN expand ratio (default 4×embed_dim).")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--no-predictor",
+        action="store_true",
+        help="Skip JEPA predictor; MTP pools fused encoder tokens. Encoder LoRA finetuned.",
+    )
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -1272,6 +1301,8 @@ def main():
         ffn_mult=int(args.ffn_mult),
         ca_aux=ca_aux,
         adapter_in_channels=(int(args.adapter_in_channels) if int(args.adapter_in_channels) > 0 else None),
+        no_predictor=bool(args.no_predictor),
+        freeze_encoder_lora=not bool(args.no_predictor),
     )
     base_enc = model.concat_ca.base_model
     classifier = AttentiveClassifier(

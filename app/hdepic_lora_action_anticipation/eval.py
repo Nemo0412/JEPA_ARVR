@@ -18,6 +18,7 @@ from app.hdepic_lora_action_anticipation.gaze import (
     PredictionDumper,
     patch_clip_balanced_dataloader,
     patch_metadata_dataloader,
+    set_clip_balanced_skip_items,
     train_one_epoch_with_gaze,
     validate_with_gaze,
 )
@@ -794,28 +795,7 @@ def _patch_best_checkpointing_and_early_stop(base_eval, args_eval):
                 shutil.copy2(src, dst)
                 logger.info("Copied best sidecar checkpoint: %s", dst)
 
-    def save_with_best_tracking(obj, f, *args, **kwargs):
-        path = Path(f) if isinstance(f, (str, os.PathLike)) else None
-        is_latest = path is not None and path.name == "latest.pt"
-        if not is_latest or not isinstance(obj, dict) or state["pending_metric"] is None:
-            return original_torch_save(obj, f, *args, **kwargs)
-
-        epoch = int(obj.get("epoch", 0) or 0)
-        current = float(state["pending_metric"])
-        improved = state["best_metric"] is None or current > float(state["best_metric"])
-        if improved:
-            state["best_metric"] = current
-            state["best_epoch"] = epoch
-            state["bad_validations"] = 0
-        else:
-            state["bad_validations"] += 1
-
-        obj["best_metric"] = state["best_metric"]
-        obj["best_metric_name"] = metric_name
-        obj["best_epoch"] = state["best_epoch"]
-        obj["bad_validations"] = state["bad_validations"]
-        original_torch_save(obj, f, *args, **kwargs)
-
+    def save_latest_sidecars(path: Path):
         predictor_lora_model = getattr(base_eval, "_predictor_lora_model", None)
         if predictor_lora_model is not None:
             save_predictor_lora_checkpoint(predictor_lora_model, path.parent / "predictor_lora_latest.pt")
@@ -844,6 +824,52 @@ def _patch_best_checkpointing_and_early_stop(base_eval, args_eval):
                     {"input_adapter": inner.input_adapter.state_dict()},
                     path.parent / "binary_input_adapter_latest.pt",
                 )
+
+    def save_with_best_tracking(obj, f, *args, **kwargs):
+        path = Path(f) if isinstance(f, (str, os.PathLike)) else None
+        is_latest = path is not None and path.name == "latest.pt"
+        if not is_latest or not isinstance(obj, dict):
+            return original_torch_save(obj, f, *args, **kwargs)
+
+        # Mid-epoch latest.pt: still write probe + LoRA/fusion sidecars so a 1:50
+        # preemption can resume weights. Do not touch best.pt / patience.
+        # pending_metric stays set after the previous epoch's validate(), so also
+        # key off train_itr>0 written by the mid-epoch saver.
+        mid_epoch = state["pending_metric"] is None or int(obj.get("train_itr", 0) or 0) > 0
+        if mid_epoch:
+            if state["best_metric"] is not None:
+                obj["best_metric"] = state["best_metric"]
+                obj["best_metric_name"] = metric_name
+                obj["best_epoch"] = state["best_epoch"]
+                obj["bad_validations"] = state["bad_validations"]
+            original_torch_save(obj, f, *args, **kwargs)
+            save_latest_sidecars(path)
+            logger.info(
+                "Wrote mid-epoch checkpoint %s epoch=%s train_itr=%s",
+                path,
+                obj.get("epoch"),
+                obj.get("train_itr"),
+            )
+            return None
+
+        epoch = int(obj.get("epoch", 0) or 0)
+        current = float(state["pending_metric"])
+        improved = state["best_metric"] is None or current > float(state["best_metric"])
+        if improved:
+            state["best_metric"] = current
+            state["best_epoch"] = epoch
+            state["bad_validations"] = 0
+        else:
+            state["bad_validations"] += 1
+
+        obj["best_metric"] = state["best_metric"]
+        obj["best_metric_name"] = metric_name
+        obj["best_epoch"] = state["best_epoch"]
+        obj["bad_validations"] = state["bad_validations"]
+        obj["train_itr"] = 0
+        original_torch_save(obj, f, *args, **kwargs)
+        save_latest_sidecars(path)
+        state["pending_metric"] = None
 
         if improved:
             best_path = path.with_name("best.pt")
@@ -876,6 +902,92 @@ def _patch_best_checkpointing_and_early_stop(base_eval, args_eval):
         base_eval.validate = original_validate
         torch.save = original_torch_save
         base_eval.torch.save = original_torch_save
+
+    return restore
+
+
+def _patch_mid_epoch_checkpointing(base_eval, args_eval):
+    """Periodic latest.pt during an epoch + resume at train_itr (not only start_epoch)."""
+    original_load_checkpoint = base_eval.load_checkpoint
+    original_train_one_epoch = base_eval.train_one_epoch
+    opt_cfg = dict(args_eval.get("experiment", {}).get("optimization", {}) or {})
+    batch_size = int(opt_cfg.get("batch_size", 1) or 1)
+    save_every = int(os.environ.get("MID_EPOCH_SAVE_EVERY", "100") or "100")
+    base_eval._resume_train_itr = 0
+    base_eval._current_train_epoch = 0
+
+    def load_checkpoint(device, r_path, classifiers, opt, scaler, val_only=False):
+        classifiers, opt, scaler, epoch = original_load_checkpoint(
+            device, r_path, classifiers, opt, scaler, val_only=val_only
+        )
+        train_itr = 0
+        try:
+            ckpt = robust_checkpoint_loader(r_path, map_location=torch.device("cpu"))
+            if isinstance(ckpt, dict):
+                train_itr = int(ckpt.get("train_itr", 0) or 0)
+        except Exception as exc:
+            logger.warning("Failed to read train_itr from %s: %s", r_path, exc)
+        if val_only:
+            train_itr = 0
+        base_eval._resume_train_itr = max(0, train_itr)
+        base_eval._current_train_epoch = int(epoch or 0)
+        if train_itr > 0:
+            logger.info("Mid-epoch resume: epoch=%s start_itr=%d", epoch, train_itr)
+        return classifiers, opt, scaler, epoch
+
+    def train_one_epoch_with_mid_ckpt(*args, **kwargs):
+        epoch = int(getattr(base_eval, "_current_train_epoch", 0) or 0)
+        start_itr = int(getattr(base_eval, "_resume_train_itr", 0) or 0)
+        base_eval._resume_train_itr = 0
+        loader = kwargs.get("data_loader")
+        if start_itr > 0 and loader is not None:
+            set_clip_balanced_skip_items(loader, start_itr * max(1, batch_size))
+            logger.info(
+                "Mid-epoch resume skip %d samples (itr %d, bs=%d)",
+                start_itr * max(1, batch_size),
+                start_itr,
+                batch_size,
+            )
+
+        def save_fn(itr):
+            classifiers = kwargs.get("classifiers")
+            optimizer = kwargs.get("optimizer")
+            scaler = kwargs.get("scaler")
+            if classifiers is None or optimizer is None:
+                logger.warning("Skipping mid-epoch save at itr=%s: missing classifier/optimizer", itr)
+                return
+            save_dict = {
+                "classifiers": [c.state_dict() for c in classifiers],
+                "opt": [o.state_dict() for o in optimizer],
+                "scaler": None if scaler is None else [s.state_dict() for s in scaler],
+                "epoch": epoch,
+                "train_itr": int(itr) + 1,
+                "batch_size": batch_size,
+                "world_size": 1,
+            }
+            latest_path = _run_dir(args_eval) / "latest.pt"
+            torch.save(save_dict, latest_path)
+
+        base_eval._mid_epoch_start_itr = start_itr
+        base_eval._mid_epoch_save_fn = save_fn
+        base_eval._mid_epoch_save_every = save_every
+        try:
+            return original_train_one_epoch(*args, **kwargs)
+        finally:
+            base_eval._mid_epoch_start_itr = 0
+            base_eval._mid_epoch_save_fn = None
+            base_eval._mid_epoch_save_every = 0
+            if loader is not None:
+                set_clip_balanced_skip_items(loader, 0)
+            base_eval._current_train_epoch = epoch + 1
+
+    base_eval.load_checkpoint = load_checkpoint
+    base_eval.train_one_epoch = train_one_epoch_with_mid_ckpt
+    logger.info("Mid-epoch checkpointing enabled: save_every=%d", save_every)
+
+    def restore():
+        base_eval.load_checkpoint = original_load_checkpoint
+        base_eval.train_one_epoch = original_train_one_epoch
 
     return restore
 
@@ -1864,6 +1976,17 @@ def main(args_eval, resume_preempt=False):
             _patch_load_checkpoint_for_encoder_lora(base_eval, encoder_lora_cfg)
         baseline_train_loop = base_eval.train_one_epoch is _UPSTREAM_TRAIN_ONE_EPOCH
         _patch_for_encoder_lora(base_eval, encoder_lora_cfg, baseline_train_loop=baseline_train_loop)
+
+    # Stream KV train/eval match: encode with the same newest-aligned chunked KV
+    # cache protocol used in eval_nopred_kvcache_size_sweep (not one-shot full).
+    stream_kv_cfg = dict(lora_cfg.get("stream_kv", {}) or {})
+    if bool(stream_kv_cfg.get("enabled", False)):
+        _patch_for_stream_kv_encode(base_eval, stream_kv_cfg)
+
+    probe_rope_cfg = dict(lora_cfg.get("probe_temporal_rope", {}) or {})
+    if bool(probe_rope_cfg.get("enabled", False)):
+        _patch_for_probe_temporal_rope(base_eval, probe_rope_cfg, data_cfg)
+
     if predictor_lora_cfg is not None:
         # Same baseline-train-loop detection as encoder LoRA above. NOTE: if both
         # encoder_lora_cfg and predictor_lora_cfg are enabled together, whichever
@@ -1896,6 +2019,7 @@ def main(args_eval, resume_preempt=False):
     restore_post_train_test, run_post_train_test = _patch_post_train_test_eval(base_eval, args_eval, dumper=dumper)
     restore_top5_reporting = _patch_top5_epoch_reporting(base_eval, args_eval)
     restore_best_checkpointing = _patch_best_checkpointing_and_early_stop(base_eval, args_eval)
+    restore_mid_epoch = _patch_mid_epoch_checkpointing(base_eval, args_eval)
     try:
         result = base_eval.main(args_eval=args_eval, resume_preempt=resume_preempt)
         run_post_train_test()
@@ -1905,6 +2029,7 @@ def main(args_eval, resume_preempt=False):
         run_post_train_test()
         return None
     finally:
+        restore_mid_epoch()
         restore_best_checkpointing()
         restore_top5_reporting()
         restore_post_train_test()
@@ -2158,6 +2283,127 @@ def _patch_for_encoder_lora(base_eval, enc_cfg: dict, baseline_train_loop: bool)
     if baseline_train_loop:
         logger.info("Encoder LoRA baseline path: installing grad-flowing train_one_epoch")
         base_eval.train_one_epoch = lambda **kwargs: train_one_epoch_encoder_lora(base_eval, **kwargs)
+
+
+def _patch_for_stream_kv_encode(base_eval, stream_kv_cfg: dict):
+    """Install newest-aligned stream KV encode on the anticipative wrapper.
+
+    Config (experiment.lora.stream_kv):
+      enabled: true
+      cache_frames: 0|16|...|112   # history length; live chunk is always +chunk_frames
+      chunk_frames: 16             # default 2s @ 8fps
+      train_last_chunk_only: true  # detach history (inference-matched, memory-safe)
+    """
+    from app.hdepic_lora_action_anticipation.stream_kvcache_attn_prune import (
+        install_stream_kv_encode_on_wrapper,
+    )
+
+    cache_frames = int(stream_kv_cfg.get("cache_frames", 112))
+    chunk_frames = int(stream_kv_cfg.get("chunk_frames", 16))
+    train_last_only = bool(stream_kv_cfg.get("train_last_chunk_only", True))
+    inner_init_module = base_eval.init_module
+
+    def init_module_with_stream_kv(*args, **kwargs):
+        model = inner_init_module(*args, **kwargs)
+        install_stream_kv_encode_on_wrapper(
+            model,
+            cache_frames=cache_frames,
+            chunk_frames=chunk_frames,
+            train_last_chunk_only=train_last_only,
+        )
+        logger.info(
+            "Stream KV encode ON: cache_frames=%d chunk_frames=%d "
+            "window=%df train_last_chunk_only=%s (train/eval matched)",
+            cache_frames,
+            chunk_frames,
+            cache_frames + chunk_frames,
+            train_last_only,
+        )
+        return model
+
+    base_eval.init_module = init_module_with_stream_kv
+
+
+def _patch_for_probe_temporal_rope(base_eval, rope_cfg: dict, data_cfg: dict):
+    """Install 1D temporal RoPE on AttentivePooler Q/K (abs packed Frame Index).
+
+    Config (experiment.lora.probe_temporal_rope):
+      enabled: true
+      rope_cross_attn_k: true
+      grid_size: 16   # spatial patches per side (256/16)
+    Frame ids are dense slot indices 0..S-1 within the current packed window
+    (matches newest-aligned stream KV positions that restart at 0 each forward).
+    """
+    from app.hdepic_lora_action_anticipation.stream_kvcache_attn_prune import (
+        ProbeTemporalRoPE,
+        token_frame_ids_from_slots,
+    )
+
+    rope_cross = bool(rope_cfg.get("rope_cross_attn_k", True))
+    resolution = int(data_cfg.get("resolution", 256) or 256)
+    patch = int(rope_cfg.get("patch_size", 16) or 16)
+    grid = int(rope_cfg.get("grid_size", resolution // patch) or (resolution // patch))
+    gp = int(grid * grid)
+    tubelet = int(rope_cfg.get("tubelet_size", 2) or 2)
+    inner_init_classifier = base_eval.init_classifier
+
+    def _wrap_classifier(clf):
+        pooler = getattr(clf, "pooler", None)
+        if pooler is None:
+            logger.warning("probe_temporal_rope: classifier has no pooler; skip")
+            return clf
+        rope = ProbeTemporalRoPE(pooler, rope_cross_attn_k=rope_cross)
+        orig_forward = clf.forward
+
+        def forward_with_rope(x, *args, **kwargs):
+            # x: encoder tokens [B, N, D]
+            if not torch.is_tensor(x) or x.ndim != 3:
+                return orig_forward(x, *args, **kwargs)
+            b, n, _d = x.shape
+            if n % gp != 0:
+                raise RuntimeError(
+                    f"probe_temporal_rope: token count N={n} not divisible by gp={gp} "
+                    f"(grid={grid}, expected tubelet-aligned tokens)"
+                )
+            n_slots = n // gp
+            slot_ids = torch.arange(n_slots, device=x.device, dtype=torch.long)
+            slot_ids = slot_ids.unsqueeze(0).expand(b, -1)
+            frame_ids = token_frame_ids_from_slots(slot_ids, gp)
+            # Keep frame_ids set through backward: AttentiveClassifier uses
+            # activation checkpointing; clearing here makes recompute see
+            # frame_ids=None and raises CheckpointError (tensor count mismatch).
+            rope.set_frame_ids(frame_ids)
+            return orig_forward(x, *args, **kwargs)
+
+        clf.forward = forward_with_rope  # type: ignore[method-assign]
+        clf._probe_temporal_rope = rope
+        return clf
+
+    def init_classifier_with_rope(*args, **kwargs):
+        out = inner_init_classifier(*args, **kwargs)
+        # upstream may return a list of classifiers or a single module
+        if isinstance(out, (list, tuple)):
+            wrapped = [_wrap_classifier(c) for c in out]
+            logger.info(
+                "Probe temporal RoPE ON: %d classifier(s) gp=%d grid=%d tubelet=%d cross_k=%s",
+                len(wrapped),
+                gp,
+                grid,
+                tubelet,
+                rope_cross,
+            )
+            return type(out)(wrapped) if isinstance(out, tuple) else wrapped
+        wrapped = _wrap_classifier(out)
+        logger.info(
+            "Probe temporal RoPE ON: gp=%d grid=%d tubelet=%d cross_k=%s",
+            gp,
+            grid,
+            tubelet,
+            rope_cross,
+        )
+        return wrapped
+
+    base_eval.init_classifier = init_classifier_with_rope
 
 
 def _patch_load_checkpoint_for_predictor_lora(base_eval, predictor_lora_cfg: dict):

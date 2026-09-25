@@ -1,0 +1,92 @@
+{
+  "date": "2026-09-24",
+  "status": "in_progress_epoch0",
+  "note": "No val epoch yet. Train metrics only. Checkpoints live on scratch (not in git).",
+  "runs": {
+    "kvmatch0": {
+      "cache_frames": 0,
+      "chunk_frames": 16,
+      "window_encode": 16,
+      "probe_rope": false,
+      "horizon_sec": 2,
+      "frames_per_clip": 128,
+      "bs": 2,
+      "epochs": 8,
+      "progress": {
+        "n_logged": 77,
+        "itr_first": 0,
+        "itr_last": 760,
+        "last": {
+          "itr": 760,
+          "loss": 12.0,
+          "acc_a": 25.7,
+          "acc_v": 52.5,
+          "acc_n": 50.8,
+          "rec_a": 23.2,
+          "rec_v": 33.5,
+          "rec_n": 40.0
+        }
+      },
+      "scratch": "/scratch/ll5914/experiments/clip_stream_kv_matched_c0_h2s/action_anticipation_frozen/clip-stream-kv-c0-h2s-vitl16-256-8ep"
+    },
+    "kvmatch112": {
+      "cache_frames": 112,
+      "chunk_frames": 16,
+      "window_encode": 128,
+      "probe_rope": false,
+      "horizon_sec": 2,
+      "frames_per_clip": 128,
+      "bs": 2,
+      "epochs": 8,
+      "progress": {
+        "n_logged": 52,
+        "itr_first": 0,
+        "itr_last": 510,
+        "last": {
+          "itr": 510,
+          "loss": 11.25,
+          "acc_a": 18.4,
+          "acc_v": 50.2,
+          "acc_n": 35.8,
+          "rec_a": 12.9,
+          "rec_v": 24.1,
+          "rec_n": 26.1
+        }
+      },
+      "scratch": "/scratch/ll5914/experiments/clip_stream_kv_matched_c112_h2s/action_anticipation_frozen/clip-stream-kv-c112-h2s-vitl16-256-8ep"
+    },
+    "kvrope112": {
+      "cache_frames": 112,
+      "chunk_frames": 16,
+      "window_encode": 128,
+      "probe_rope": true,
+      "horizon_sec": 2,
+      "frames_per_clip": 128,
+      "bs": 2,
+      "epochs": 8,
+      "progress": {
+        "n_logged": 24,
+        "itr_first": 0,
+        "itr_last": 230,
+        "last": {
+          "itr": 230,
+          "loss": 13.6875,
+          "acc_a": 19.5,
+          "acc_v": 54.5,
+          "acc_n": 37.4,
+          "rec_a": 11.7,
+          "rec_v": 24.7,
+          "rec_n": 25.8
+        }
+      },
+      "scratch": "/scratch/ll5914/experiments/clip_stream_kv_rope_c112_h2s/action_anticipation_frozen/clip-stream-kv-rope-c112-h2s-vitl16-256-8ep",
+      "warm_start_from": "kvmatch112 mid-run ckpt"
+    }
+  },
+  "plots": [
+    "plots/kvrope112_vs_kvmatch112_train_loss_from0.png",
+    "plots/kvrope112_vs_kvmatch112_train_loss_smooth.png",
+    "plots/kvrope112_vs_kvmatch112_train_loss_full.png",
+    "plots/kvrope112_vs_kvmatch112_train_curves_full.csv"
+  ]
+}
