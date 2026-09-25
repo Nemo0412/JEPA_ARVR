@@ -1,8 +1,12 @@
 # JEPA_ARVR
 
+> **kvprune joint (stream KV + prune + Probe RoPE):** how we train, which
+> ckpt to start from (`vitl.pt`), 2s results, and **6s all-block RoPE**
+> recipe → [`docs/KVPRUNE_JOINT.md`](docs/KVPRUNE_JOINT.md).
+
 > **Jepa_PE (stream KV + probe temporal RoPE):** HD-EPIC download, matched
 > stream-KV runs (`kvmatch0` / `kvmatch112` / `kvrope112`), probe-blk0 prune
-> FT (`kvprune_rope`), and RoPE-on-`Probe.blocks[0]` only →
+> FT (`kvprune_rope`), and RoPE notes →
 > [`docs/JEPA_PE.md`](docs/JEPA_PE.md). Branch: `Jepa_PE`.
 
 > **EGTEA streaming handoff:** agents working on the shared EGTEA

@@ -412,27 +412,65 @@ class StreamKVAttnPruneEncoder:
         ps = int(self.encoder.patch_size)
         return h // ps, w // ps
 
+    def _run_block(
+        self,
+        blk: nn.Module,
+        x: torch.Tensor,
+        pos: torch.Tensor,
+        gh: int,
+        gw: int,
+        *,
+        cache_k_i: torch.Tensor | None = None,
+        cache_v_i: torch.Tensor | None = None,
+        need_qk: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One encoder block; returns (x, k, v, q, k). ``need_qk`` kept for API compat."""
+        del need_qk  # always return q,k so checkpoint save/recompute tensor counts match
+        b, n, _ = x.shape
+        q, k, v = rope_qkv(blk.attn, blk.norm1(x), pos, gh, gw)
+        if cache_k_i is not None:
+            assert cache_v_i is not None
+            y = F.scaled_dot_product_attention(
+                q, torch.cat([cache_k_i, k], dim=2), torch.cat([cache_v_i, v], dim=2),
+                dropout_p=0.0, is_causal=False,
+            )
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        y = y.transpose(1, 2).reshape(b, n, -1)
+        # Bypass Dropout (proj_drop / DropPath) — nondeterministic under checkpoint.
+        y = blk.attn.proj(y)
+        x = x + y
+        x = x + blk.mlp(blk.norm2(x))
+        return x, k, v, q, k
+
     def _encode_full(self, clips: torch.Tensor, pos: torch.Tensor) -> tuple[
         torch.Tensor, list[torch.Tensor], list[torch.Tensor], torch.Tensor, torch.Tensor
     ]:
         encoder = self.encoder
-        b = clips.size(0)
         gh, gw = self._patch_hw(clips)
         x = encoder.patch_embed(clips)
-        n = x.size(1)
         cache_k, cache_v = [], []
         last_q = last_k = None
+        n_blocks = len(encoder.blocks)
+        entered_trainable = False
         for li, blk in enumerate(encoder.blocks):
-            q, k, v = rope_qkv(blk.attn, blk.norm1(x), pos, gh, gw)
-            y = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
-            y = y.transpose(1, 2).reshape(b, n, -1)
-            y = blk.attn.proj_drop(blk.attn.proj(y))
-            x = x + blk.drop_path(y)
-            x = x + blk.drop_path(blk.mlp(blk.norm2(x)))
+            trainable = any(p.requires_grad for p in blk.parameters())
+            if trainable and not entered_trainable:
+                # Boundary: frozen stem → LoRA blocks (enable grad for checkpoint-free FT).
+                if not x.requires_grad:
+                    x = x.detach().requires_grad_(True)
+                entered_trainable = True
+            if trainable:
+                x, k, v, q_out, k_out = self._run_block(blk, x, pos, gh, gw)
+            else:
+                with torch.no_grad():
+                    x, k, v, q_out, k_out = self._run_block(blk, x, pos, gh, gw)
+                k = k.detach()
+                v = v.detach()
             cache_k.append(k)
             cache_v.append(v)
-            if li == len(encoder.blocks) - 1:
-                last_q, last_k = q, k
+            if li == n_blocks - 1:
+                last_q, last_k = q_out, k_out
         if encoder.norm is not None:
             x = encoder.norm(x)
         assert last_q is not None and last_k is not None
@@ -446,25 +484,35 @@ class StreamKVAttnPruneEncoder:
         pos: torch.Tensor,
     ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], torch.Tensor, torch.Tensor]:
         encoder = self.encoder
-        b = clips.size(0)
         gh, gw = self._patch_hw(clips)
         x = encoder.patch_embed(clips)
-        n_new = x.size(1)
         new_k, new_v = [], []
         last_q = last_k = None
+        n_blocks = len(encoder.blocks)
+        entered_trainable = False
         for li, blk in enumerate(encoder.blocks):
-            q, k, v = rope_qkv(blk.attn, blk.norm1(x), pos, gh, gw)
-            k_all = torch.cat([cache_k[li], k], dim=2)
-            v_all = torch.cat([cache_v[li], v], dim=2)
-            y = F.scaled_dot_product_attention(q, k_all, v_all, dropout_p=0.0, is_causal=False)
-            y = y.transpose(1, 2).reshape(b, n_new, -1)
-            y = blk.attn.proj_drop(blk.attn.proj(y))
-            x = x + blk.drop_path(y)
-            x = x + blk.drop_path(blk.mlp(blk.norm2(x)))
+            trainable = any(p.requires_grad for p in blk.parameters())
+            if trainable and not entered_trainable:
+                if not x.requires_grad:
+                    x = x.detach().requires_grad_(True)
+                entered_trainable = True
+            if trainable:
+                x, k, v, q_out, k_out = self._run_block(
+                    blk, x, pos, gh, gw,
+                    cache_k_i=cache_k[li], cache_v_i=cache_v[li],
+                )
+            else:
+                with torch.no_grad():
+                    x, k, v, q_out, k_out = self._run_block(
+                        blk, x, pos, gh, gw,
+                        cache_k_i=cache_k[li], cache_v_i=cache_v[li],
+                    )
+                k = k.detach()
+                v = v.detach()
             new_k.append(k)
             new_v.append(v)
-            if li == len(encoder.blocks) - 1:
-                last_q, last_k = q, k
+            if li == n_blocks - 1:
+                last_q, last_k = q_out, k_out
         if encoder.norm is not None:
             x = encoder.norm(x)
         assert last_q is not None and last_k is not None
@@ -473,7 +521,13 @@ class StreamKVAttnPruneEncoder:
     def _score(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
         return slot_importance_from_qk(q, k, self.scale, self.gp, chunk=self.chunk)
 
-    def fill(self, clips: torch.Tensor, slot_start: int = 0) -> StreamKVState:
+    def fill(
+        self,
+        clips: torch.Tensor,
+        slot_start: int = 0,
+        *,
+        refresh_scores: bool = True,
+    ) -> StreamKVState:
         if clips.size(2) != self.cache_frames:
             raise ValueError(f"fill expects T={self.cache_frames}, got {clips.size(2)}")
         b = clips.size(0)
@@ -484,6 +538,13 @@ class StreamKVAttnPruneEncoder:
         tokens, cache_k, cache_v, last_q, last_k = self._encode_full(clips, pos)
         slot_ids = torch.arange(slot_start, slot_start + self.n_slots, device=device)
         slot_ids = slot_ids.unsqueeze(0).expand(b, -1)
+        if refresh_scores:
+            scores = self._score(last_q, last_k)
+        else:
+            # Probe-driven prune path: skip encoder QK score (saves a large softmax).
+            scores = torch.zeros(b, self.n_slots, device=device, dtype=torch.float32)
+            last_q = last_q.detach()
+            last_k = last_k.detach()
         return StreamKVState(
             tokens=tokens,
             cache_k=cache_k,
@@ -492,7 +553,7 @@ class StreamKVAttnPruneEncoder:
             last_k=last_k,
             pos=pos,
             slot_ids=slot_ids,
-            slot_scores=self._score(last_q, last_k),
+            slot_scores=scores,
             next_slot=slot_start + self.n_slots,
         )
 
@@ -519,12 +580,14 @@ class StreamKVAttnPruneEncoder:
         clips_new: torch.Tensor,
         mode: PruneMode = "attn",
         slot_scores: torch.Tensor | None = None,
+        *,
+        refresh_scores: bool = True,
     ) -> StreamKVState:
         """Admit ``new_frames``. If ``slot_scores`` is set (e.g. probe blk0 from the
         previous probe pass), use them to drop 34 frames; else encoder last-block
         scores on ``state`` (legacy). After encode, ``state.slot_scores`` is
-        refreshed with encoder scores — callers that want probe-lag should
-        overwrite with ``probe_blk0_slot_scores`` after the next probe.
+        refreshed with encoder scores unless ``refresh_scores=False`` (joint /
+        probe-score path — avoids a large QK softmax on the packed window).
         """
         if clips_new.size(2) != self.new_frames:
             raise ValueError(f"step expects T={self.new_frames}, got {clips_new.size(2)}")
@@ -559,6 +622,12 @@ class StreamKVAttnPruneEncoder:
         last_k = torch.cat([last_k_keep, last_k_new], dim=2)
         pos = torch.cat([pos_keep, pos_new], dim=1)
         slot_ids = torch.cat([slot_keep, slot_new], dim=1)
+        if refresh_scores:
+            scores = self._score(last_q, last_k)
+        else:
+            scores = torch.zeros(b, self.n_slots, device=clips_new.device, dtype=torch.float32)
+            last_q = last_q.detach()
+            last_k = last_k.detach()
         return StreamKVState(
             tokens=tokens,
             cache_k=cache_k,
@@ -567,7 +636,7 @@ class StreamKVAttnPruneEncoder:
             last_k=last_k,
             pos=pos,
             slot_ids=slot_ids,
-            slot_scores=self._score(last_q, last_k),
+            slot_scores=scores,
             next_slot=state.next_slot + self.drop_slots,
         )
 

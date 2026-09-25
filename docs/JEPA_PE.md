@@ -82,15 +82,17 @@ More notes: [`scripts/README_hdepic_action_anticipation.md`](../scripts/README_h
 All PE finetunes train **encoder LoRA + probe/heads jointly** (encoder base
 weights stay frozen; LoRA `lr_mult=0.5`). Probe-only FT underperforms.
 
-Both prune/RoPE signals live on **`Probe.blocks[0]` self-attn** (not a trained
-pruner) unless noted:
-
-| Piece | Default |
+| Piece | Default / next |
 |---|---|
-| **Probe temporal RoPE** | `only_block0=False` — rotate Q/K on **all** `Probe.blocks[*]` self-attn; `rope_cross_attn_k=False` |
-| **Stream prune scores** (`kvprune*`) | mean received mass from Probe block-0 self-attn; **detached** for keep/drop; used on the **next** admit |
+| **Probe temporal RoPE** | `only_block0=False` — Q/K on **all** `Probe.blocks[*]` self-attn; `rope_cross_attn_k=False` |
+| **Stream prune scores** (`kvprune*`) | mean received mass from Probe **block-0** self-attn; **detached** top-k for keep/drop |
 | **Prune geometry** | cache 128f → drop lowest 34f (17 slots) → keep 94 + encode new 34 → packed 128 |
 | **Matched stream KV** (`kvmatch*` / `kvrope*`) | joint enc-LoRA + probe via `evals.main` |
+| **Local joint 2s (this box)** | running with legacy `--only-block0 1`; see curves |
+| **Local joint 6s (next)** | `--only-block0 0` (all blocks) × with/without RoPE |
+
+Local launch, **ckpt to start from** (`vitl.pt`), and loss CSV paths:
+[`docs/KVPRUNE_JOINT.md`](KVPRUNE_JOINT.md).
 
 Matched stream-KV train uses dense slot ids `0..S-1` inside the packed window.
 Prune / abs-frame RoPE FT arms use **abs** surviving frame/slot ids for RoPE.
