@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""Streaming + KV-cache + probe-blk0-attn prune: probe FT with vs without temporal RoPE.
+"""Streaming + KV-cache + probe-blk0-attn prune: joint encoder-LoRA + probe FT ± RoPE.
 
 Protocol:
 
   * Streaming ticks ~every 4s: encode NEW_FRAMES=34 (no predictor).
   * KV cache = CACHE_FRAMES=128. After probe on the current 128, **Probe
-    blocks[0] self-attn** received mass → slot scores (recorded, not trained).
+    blocks[0] self-attn** received mass → slot scores (recorded/detached, not
+    trained through the discrete keep/drop).
   * Next admit: drop lowest 34 frames by those scores; keep 94; encode new 34
-    against kept KV; packed 94+34=128 → probe again (prediction + scores for
-    the following tick).
-  * One-clip FT/eval bootstrap: fill 128 → probe-blk0 scores → step(+34) → probe.
+    against kept KV; packed 94+34=128 → probe prediction.
+  * One-clip bootstrap: fill 128 → probe-blk0 scores → step(+34) → probe.
+  * **Joint FT:** encoder LoRA + probe/heads. History ``fill`` is ``no_grad``
+    (detached K/V); the admit ``step`` and probe run with grad (same spirit as
+    matched stream ``train_last_chunk_only``).
   * RoPE arm: 1D temporal RoPE on Probe.blocks[0] Q/K with abs surviving frame ids.
-  * Horizon: single-horizon via ``--horizons 2`` or ``--horizons 6`` (default 2).
-
-Fair comparison: both arms finetune probe+heads from the same nopred init.
+  * Horizon: ``--horizons 2`` or ``--horizons 6`` (default 2).
 """
 from __future__ import annotations
 
@@ -44,6 +45,12 @@ os.environ.setdefault("VJEPA_ROOT", "/home/ll5914/ARVR_Video/vjepa2")
 sys.path.insert(0, os.environ["VJEPA_ROOT"])
 
 import dump_probe_blk0_selfattn_16s_maps as P  # noqa: E402
+from app.hdepic_lora_action_anticipation.encoder_lora import (  # noqa: E402
+    encoder_lora_state_dict,
+    load_encoder_lora_state_dict,
+    set_encoder_lora_trainable,
+    trainable_encoder_lora_params,
+)
 from app.hdepic_lora_action_anticipation.stream_kvcache_attn_prune import (  # noqa: E402
     CACHE_FRAMES,
     NEW_FRAMES,
@@ -65,13 +72,13 @@ logger = logging.getLogger("kv_prune_rope_ft")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 GP = 256
-METHOD = "StreamKVProbeBlk0Prune_RoPE_FT"
+METHOD = "StreamKVProbeBlk0Prune_JointEncProbe_RoPE_FT"
 ARMS = ("zs_no_rope", "zs_rope", "ft_no_rope", "ft_rope")
 ARM_LABELS = {
     "zs_no_rope": "KV+probePrune (no FT)",
     "zs_rope": "KV+probePrune+RoPE (no FT)",
-    "ft_no_rope": "KV+probePrune FT",
-    "ft_rope": "KV+probePrune+RoPE FT",
+    "ft_no_rope": "KV+probePrune joint FT",
+    "ft_rope": "KV+probePrune+RoPE joint FT",
 }
 ARM_COLORS = {
     "zs_no_rope": "#9e9e9e",
@@ -93,28 +100,35 @@ def encode_probe_attn_pruned(
     embed_dim: int,
     *,
     chunk: int = 256,
+    train_mode: bool = False,
 ):
     """fill 128 → probe-blk0 scores → step(+34 prune) → tokens + abs frame ids.
 
-    Also returns ``next_scores`` from probe-blk0 on the packed 128 (for the
-    following streaming tick; unused in one-step clips).
+    ``train_mode``: history fill + prune scores under ``no_grad``; admit encode
+    runs with grad so encoder LoRA + probe can jointly train.
     """
     hist = clips[:, :, :CACHE_FRAMES]
     new = clips[:, :, CACHE_FRAMES:]
-    state = stream.fill(hist)
-    tok0 = state.tokens
-    if tok0.size(-1) != embed_dim:
-        tok0 = tok0[:, :, -embed_dim:]
-    # Record probe blk0 attention on current cache; use it to prune for this admit.
-    scores = probe_blk0_slot_scores(pooler, tok0, stream.gp, chunk=chunk)
-    state = stream.step(state, new, mode="attn", slot_scores=scores)
+    if train_mode:
+        with torch.no_grad():
+            state = stream.fill(hist)
+            tok0 = state.tokens
+            if tok0.size(-1) != embed_dim:
+                tok0 = tok0[:, :, -embed_dim:]
+            scores = probe_blk0_slot_scores(pooler, tok0, stream.gp, chunk=chunk).detach()
+        state = stream.step(state, new, mode="attn", slot_scores=scores)
+    else:
+        state = stream.fill(hist)
+        tok0 = state.tokens
+        if tok0.size(-1) != embed_dim:
+            tok0 = tok0[:, :, -embed_dim:]
+        scores = probe_blk0_slot_scores(pooler, tok0, stream.gp, chunk=chunk)
+        state = stream.step(state, new, mode="attn", slot_scores=scores)
     tok = state.tokens
     if tok.size(-1) != embed_dim:
         tok = tok[:, :, -embed_dim:]
     frame_ids = token_frame_ids_from_slots(state.slot_ids, stream.gp)
-    # Next-tick scores: probe blk0 on packed 94+34 (caller may stash these).
-    next_scores = probe_blk0_slot_scores(pooler, tok, stream.gp, chunk=chunk)
-    return tok, frame_ids, next_scores
+    return tok, frame_ids
 
 
 def mtp_ce_loss(outputs, batch_dev, horizons, weights, verb_map, noun_map, action_map, device):
@@ -174,8 +188,8 @@ def eval_arm(
             "mtp_mask": batch["mtp_mask"].to(device),
         }
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            tok, frame_ids, _next = encode_probe_attn_pruned(
-                stream, pooler, clips, embed_dim, chunk=chunk
+            tok, frame_ids = encode_probe_attn_pruned(
+                stream, pooler, clips, embed_dim, chunk=chunk, train_mode=False
             )
             if rope is not None:
                 rope.set_frame_ids(frame_ids)
@@ -197,42 +211,78 @@ def eval_arm(
     return table, metrics
 
 
-def finetune_probe(
+def set_joint_trainable(model, mtp_clf, *, train_encoder_lora: bool):
+    for p in mtp_clf.parameters():
+        p.requires_grad = True
+    n_lora = set_encoder_lora_trainable(model, trainable=train_encoder_lora)
+    # Keep non-LoRA encoder weights frozen.
+    for name, p in model.named_parameters():
+        if "lora_A" in name or "lora_B" in name:
+            continue
+        p.requires_grad = False
+    return n_lora
+
+
+def finetune_joint(
+    model,
     mtp_clf,
-    cached,
+    pooler,
+    stream,
+    embed_dim,
+    train_loader,
     *,
     rope: ProbeTemporalRoPE | None,
     epochs: int,
     lr: float,
+    encoder_lr_mult: float,
     horizons,
     weights,
     ck_meta,
     device,
+    chunk: int,
 ):
-    for p in mtp_clf.parameters():
-        p.requires_grad = True
+    n_lora = set_joint_trainable(model, mtp_clf, train_encoder_lora=True)
     mtp_clf.train()
-    opt = torch.optim.AdamW([p for p in mtp_clf.parameters() if p.requires_grad], lr=lr, weight_decay=1e-4)
+    model.train()
+    probe_params = [p for p in mtp_clf.parameters() if p.requires_grad]
+    enc_params = trainable_encoder_lora_params(model)
+    param_groups = [{"params": probe_params, "lr": lr}]
+    if enc_params:
+        param_groups.append({"params": enc_params, "lr": lr * float(encoder_lr_mult)})
+    opt = torch.optim.AdamW(param_groups, weight_decay=1e-4)
     scaler = torch.cuda.amp.GradScaler(enabled=True)
     verb_map, noun_map, action_map = ck_meta["verb_map"], ck_meta["noun_map"], ck_meta["action_map"]
+    logger.info(
+        "joint FT: probe_params=%d enc_lora_params=%d (n_lora_tensors~%d) lr=%.2e enc_lr=%.2e",
+        sum(p.numel() for p in probe_params),
+        sum(p.numel() for p in enc_params),
+        n_lora,
+        lr,
+        lr * float(encoder_lr_mult),
+    )
     t0 = time.time()
     n_step = 0
     loss_meter = 0.0
+    batches = list(train_loader)
     for ep in range(epochs):
-        order = np.random.permutation(len(cached))
+        order = np.random.permutation(len(batches))
         for idx in order:
-            item = cached[int(idx)]
-            tok = item["tok"].to(device, non_blocking=True)
-            frame_ids = item["frame_ids"].to(device, non_blocking=True)
+            batch = batches[int(idx)]
+            clips = normalize_clip(batch["clip"], device)
+            if clips.size(2) != CACHE_FRAMES + NEW_FRAMES:
+                raise RuntimeError(f"expected T={CACHE_FRAMES + NEW_FRAMES}, got {clips.size(2)}")
             batch_dev = {
-                "mtp_verbs": item["mtp_verbs"].to(device),
-                "mtp_nouns": item["mtp_nouns"].to(device),
-                "mtp_mask": item["mtp_mask"].to(device),
+                "mtp_verbs": batch["mtp_verbs"].to(device),
+                "mtp_nouns": batch["mtp_nouns"].to(device),
+                "mtp_mask": batch["mtp_mask"].to(device),
             }
-            if rope is not None:
-                rope.set_frame_ids(frame_ids)
             try:
                 with torch.autocast("cuda", dtype=torch.bfloat16):
+                    tok, frame_ids = encode_probe_attn_pruned(
+                        stream, pooler, clips, embed_dim, chunk=chunk, train_mode=True
+                    )
+                    if rope is not None:
+                        rope.set_frame_ids(frame_ids)
                     outputs = classify_independent(mtp_clf, tok, horizons)
                     head_loss, n_used = mtp_ce_loss(
                         outputs, batch_dev, horizons, weights, verb_map, noun_map, action_map, device
@@ -245,7 +295,9 @@ def finetune_probe(
             opt.zero_grad(set_to_none=True)
             scaler.scale(head_loss).backward()
             scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_([p for p in mtp_clf.parameters() if p.requires_grad], 1.0)
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in probe_params + enc_params if p.requires_grad], 1.0
+            )
             scaler.step(opt)
             scaler.update()
             loss_meter += float(head_loss.detach())
@@ -277,7 +329,7 @@ def plot_results(payload: dict, png: Path, copy_png: Path | None):
     ax.set_xticklabels([f"+{h}" for h in horizons])
     ax.set_ylabel("Action Top-5 (%)")
     n = payload["accuracy"].get("n_val_clips", 0)
-    ax.set_title(f"Stream KV + probe-blk0 prune (128←94+34) → probe   val={n}")
+    ax.set_title(f"Stream KV + probe-blk0 prune joint enc+probe   val={n}")
     ax.grid(True, axis="y", alpha=0.35)
     ax.legend(fontsize=8)
     fig.tight_layout()
@@ -316,13 +368,13 @@ def main():
     ap.add_argument("--checkpoint", type=Path, default=Path("/scratch/ll5914/models/vjepa2/vitl.pt"))
     ap.add_argument("--nopred-ckpt", type=Path, default=P.NOPRED_CKPT)
     ap.add_argument("--out-dir", type=Path, default=Path(
-        "/scratch/ll5914/experiments/stream_kv_probe_blk0_prune_ft_rope"
+        "/scratch/ll5914/experiments/stream_kv_probe_blk0_prune_joint_ft_rope"
     ))
     ap.add_argument("--copy-json", type=Path, default=Path(
-        "/home/ll5914/Jepa_yifan/JEPA_ARVR/configs/jepa_pe/stream_kv_probe_blk0_prune_ft_rope.json"
+        "/home/ll5914/Jepa_yifan/JEPA_ARVR/configs/jepa_pe/stream_kv_probe_blk0_prune_joint_ft_rope.json"
     ))
     ap.add_argument("--copy-png", type=Path, default=Path(
-        "/home/ll5914/Jepa_yifan/JEPA_ARVR/plots/stream_kv_probe_blk0_prune_ft_rope.png"
+        "/home/ll5914/Jepa_yifan/JEPA_ARVR/plots/stream_kv_probe_blk0_prune_joint_ft_rope.png"
     ))
     ap.add_argument("--fps", type=int, default=8)
     ap.add_argument("--img-size", type=int, default=256)
@@ -332,6 +384,7 @@ def main():
     ap.add_argument("--max-val", type=int, default=200)
     ap.add_argument("--epochs", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--encoder-lr-mult", type=float, default=0.5)
     ap.add_argument("--require-ctx-sec", type=float, default=10.0)
     ap.add_argument("--num-workers", type=int, default=2)
     ap.add_argument("--chunk", type=int, default=256)
@@ -380,11 +433,9 @@ def main():
     stream = StreamKVAttnPruneEncoder(
         encoder, gp=gp, tubelet_size=2, cache_frames=CACHE_FRAMES, new_frames=NEW_FRAMES, chunk=args.chunk
     )
-    encoder.eval()
-    for p in encoder.parameters():
-        p.requires_grad = False
 
-    init_state = copy.deepcopy(mtp_clf.state_dict())
+    init_probe = copy.deepcopy(mtp_clf.state_dict())
+    init_enc_lora = encoder_lora_state_dict(model)
 
     train_loader, train_ds = make_loader(
         args.train_csv, args.video_root, args, args.train_clips_per_video, args.max_train
@@ -394,6 +445,10 @@ def main():
     )
     logger.info("train=%d val=%d", len(train_ds), len(val_ds))
 
+    # Zero-shot eval with frozen weights.
+    set_joint_trainable(model, mtp_clf, train_encoder_lora=False)
+    model.eval()
+    mtp_clf.eval()
     logger.info("eval zs_no_rope")
     zs_no, _ = eval_arm(
         stream, mtp_clf, pooler, embed_dim, val_loader, device, ck_meta, rope=None,
@@ -405,65 +460,65 @@ def main():
         stream, mtp_clf, pooler, embed_dim, val_loader, device, ck_meta, rope=rope,
         prefix="zs_rope", chunk=args.chunk, horizons=horizons,
     )
-
-    # Freeze prune path: cache tokens with *init* probe blk0 scores (not trained).
-    logger.info("cache tokens with init-probe blk0 prune scores (encoder frozen)")
-    mtp_clf.load_state_dict(init_state)
-    mtp_clf.eval()
-    cached = []
-    with torch.no_grad():
-        for batch in train_loader:
-            clips = normalize_clip(batch["clip"], device)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                tok, frame_ids, _next = encode_probe_attn_pruned(
-                    stream, pooler, clips, embed_dim, chunk=args.chunk
-                )
-            cached.append(
-                {
-                    "tok": tok.float().cpu(),
-                    "frame_ids": frame_ids.cpu(),
-                    "mtp_verbs": batch["mtp_verbs"].clone(),
-                    "mtp_nouns": batch["mtp_nouns"].clone(),
-                    "mtp_mask": batch["mtp_mask"].clone(),
-                }
-            )
-    logger.info("cached %d clips", len(cached))
-
-    mtp_clf.load_state_dict(init_state)
     rope.remove()
     rope = None
-    logger.info("finetune ft_no_rope")
-    t_no, loss_no = finetune_probe(
-        mtp_clf, cached, rope=None, epochs=args.epochs, lr=args.lr,
-        horizons=horizons, weights=weights, ck_meta=ck_meta, device=device,
+
+    def _reset_init():
+        mtp_clf.load_state_dict(init_probe)
+        load_encoder_lora_state_dict(model, init_enc_lora, strict=False)
+
+    _reset_init()
+    logger.info("joint finetune ft_no_rope (encoder LoRA + probe)")
+    t_no, loss_no = finetune_joint(
+        model, mtp_clf, pooler, stream, embed_dim, train_loader,
+        rope=None, epochs=args.epochs, lr=args.lr, encoder_lr_mult=args.encoder_lr_mult,
+        horizons=horizons, weights=weights, ck_meta=ck_meta, device=device, chunk=args.chunk,
     )
-    ft_no_ckpt = args.out_dir / "probe_ft_no_rope.pt"
-    torch.save({"mtp_classifier": mtp_clf.state_dict(), "rope": False, "prune": "probe_blk0"}, ft_no_ckpt)
+    ft_no_ckpt = args.out_dir / "probe_enc_ft_no_rope.pt"
+    torch.save(
+        {
+            "mtp_classifier": mtp_clf.state_dict(),
+            "encoder_lora": encoder_lora_state_dict(model),
+            "rope": False,
+            "prune": "probe_blk0",
+            "train": "joint_encoder_lora_probe",
+        },
+        ft_no_ckpt,
+    )
+    model.eval()
+    mtp_clf.eval()
+    set_joint_trainable(model, mtp_clf, train_encoder_lora=False)
     ft_no, _ = eval_arm(
         stream, mtp_clf, pooler, embed_dim, val_loader, device, ck_meta, rope=None,
         prefix="ft_no_rope", chunk=args.chunk, horizons=horizons,
     )
     logger.info("ft_no_rope %s", json.dumps(ft_no))
 
-    mtp_clf.load_state_dict(init_state)
+    _reset_init()
     rope = ProbeTemporalRoPE(pooler, rope_cross_attn_k=False, only_block0=True)
-    logger.info("finetune ft_rope (abs frame id; Probe.blocks[0] only)")
-    t_rope, loss_rope = finetune_probe(
-        mtp_clf, cached, rope=rope, epochs=args.epochs, lr=args.lr,
-        horizons=horizons, weights=weights, ck_meta=ck_meta, device=device,
+    logger.info("joint finetune ft_rope (abs frame id; Probe.blocks[0] only)")
+    t_rope, loss_rope = finetune_joint(
+        model, mtp_clf, pooler, stream, embed_dim, train_loader,
+        rope=rope, epochs=args.epochs, lr=args.lr, encoder_lr_mult=args.encoder_lr_mult,
+        horizons=horizons, weights=weights, ck_meta=ck_meta, device=device, chunk=args.chunk,
     )
-    ft_rope_ckpt = args.out_dir / "probe_ft_rope.pt"
+    ft_rope_ckpt = args.out_dir / "probe_enc_ft_rope.pt"
     torch.save(
         {
             "mtp_classifier": mtp_clf.state_dict(),
+            "encoder_lora": encoder_lora_state_dict(model),
             "rope": "temporal_1d_abs_frame_index_blk0_only",
             "prune": "probe_blk0",
+            "train": "joint_encoder_lora_probe",
             "cache_frames": CACHE_FRAMES,
             "new_frames": NEW_FRAMES,
             "horizons_sec": horizons,
         },
         ft_rope_ckpt,
     )
+    model.eval()
+    mtp_clf.eval()
+    set_joint_trainable(model, mtp_clf, train_encoder_lora=False)
     ft_rope, _ = eval_arm(
         stream, mtp_clf, pooler, embed_dim, val_loader, device, ck_meta, rope=rope,
         prefix="ft_rope", chunk=args.chunk, horizons=horizons,
@@ -474,10 +529,9 @@ def main():
     table = {"zs_no_rope": zs_no, "zs_rope": zs_rope, "ft_no_rope": ft_no, "ft_rope": ft_rope}
     delta = {}
     for h in horizons:
-        key = f"@{h:g}s"
-        b0 = zs_no.get(key, float("nan"))
-        fn = ft_no.get(key, float("nan"))
-        fr = ft_rope.get(key, float("nan"))
+        b0 = zs_no.get(f"@{h:g}s", float("nan"))
+        fn = ft_no.get(f"@{h:g}s", float("nan"))
+        fr = ft_rope.get(f"@{h:g}s", float("nan"))
         delta[f"ft_no_rope_minus_zs@{h:g}s"] = round(float(fn - b0), 4)
         delta[f"ft_rope_minus_zs@{h:g}s"] = round(float(fr - b0), 4)
         delta[f"ft_rope_minus_ft_no_rope@{h:g}s"] = round(float(fr - fn), 4)
@@ -485,11 +539,11 @@ def main():
     payload = {
         "method": METHOD,
         "note": (
-            "Probe FT under stream KV + prune by Probe blocks[0] self-attn "
-            "received mass (recorded for next tick; not a trained pruner). "
-            "Bootstrap one-clip: score on fill-128 then admit +34. "
+            "Joint encoder-LoRA + probe FT under stream KV + prune by Probe "
+            "blocks[0] self-attn received mass (scores detached for keep/drop). "
+            "Bootstrap: fill-128 no_grad → admit +34 with grad → probe. "
             f"Single-horizon FT/eval on {horizons}s. "
-            "RoPE uses abs surviving frame/slot ids. Encoder frozen."
+            "RoPE uses abs surviving frame/slot ids."
         ),
         "device": torch.cuda.get_device_name(0),
         "accuracy": {
@@ -505,8 +559,10 @@ def main():
             "tick_sec_approx": NEW_FRAMES / float(args.fps),
             "fps": args.fps,
             "horizons_sec": horizons,
+            "train": "joint_encoder_lora_probe",
+            "encoder_lr_mult": args.encoder_lr_mult,
             "prune": "probe blocks[0] self-attn received mass → drop lowest 34 frames",
-            "rope": "1D temporal RoPE on Probe.blocks[0] self-attn Q/K only (not blk1/2, not cross-attn)",
+            "rope": "1D temporal RoPE on Probe.blocks[0] self-attn Q/K only",
             "epochs": args.epochs,
             "lr": args.lr,
             "train_seconds_no_rope": t_no,
@@ -518,7 +574,7 @@ def main():
             "ft_rope_ckpt": str(ft_rope_ckpt),
         },
     }
-    png = args.out_dir / "stream_kv_probe_blk0_prune_ft_rope.png"
+    png = args.out_dir / "stream_kv_probe_blk0_prune_joint_ft_rope.png"
     plot_results(payload, png, args.copy_png)
     payload["png"] = str(png)
     text = json.dumps(payload, indent=2) + "\n"

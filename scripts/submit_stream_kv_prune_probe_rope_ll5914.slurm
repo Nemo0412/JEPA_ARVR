@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=kvprune2
+#SBATCH --job-name=kvprune2j
 #SBATCH --account=torch_pr_111_tandon_advanced
 #SBATCH --partition=a100_tandon
 #SBATCH --nodes=1
@@ -8,21 +8,21 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=96G
 #SBATCH --time=01:50:00
-#SBATCH --output=/scratch/ll5914/logs/kvprune_rope_%j.out
-#SBATCH --error=/scratch/ll5914/logs/kvprune_rope_%j.err
+#SBATCH --output=/scratch/ll5914/logs/kvprune_joint_%j.out
+#SBATCH --error=/scratch/ll5914/logs/kvprune_joint_%j.err
 
 set -euo pipefail
 export TMPDIR=/scratch/ll5914/tmp
 mkdir -p "$TMPDIR" /scratch/ll5914/logs
 
-# Stream KV + Probe-blk0-attn prune; probe FT ± abs-frame RoPE (blk0 only).
-# Single horizon via HORIZON=2|6 (default 2). Separate out-dirs per horizon.
+# Stream KV + Probe-blk0 prune; **joint** encoder-LoRA + probe FT ± RoPE (blk0).
+# Single horizon via HORIZON=2|6 (default 2).
 #
 # Race A100/H100/H200 with low mem:
 #   for H in 2 6; do
 #     for spec in 'a100_tandon|gpu:a100:1' 'h100_tandon|gpu:h100:1' 'h200_tandon|gpu:h200:1'; do
 #       IFS='|' read -r part gres <<< "$spec"
-#       sbatch --job-name="kvprune${H}" --partition="$part" --gres="$gres" \
+#       sbatch --job-name="kvprune${H}j" --partition="$part" --gres="$gres" \
 #         --mem=96G --cpus-per-task=8 --time=01:50:00 --export=HORIZON=$H this.slurm
 #     done
 #   done
@@ -38,7 +38,7 @@ export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/scripts:${VJEPA_ROOT}:${PYTHO
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 
-OUT="/scratch/ll5914/experiments/stream_kv_probe_blk0_prune_ft_rope_h${HORIZON}s"
+OUT="/scratch/ll5914/experiments/stream_kv_probe_blk0_prune_joint_ft_rope_h${HORIZON}s"
 DONE="${OUT}/DONE"
 mkdir -p "$OUT"
 
@@ -56,10 +56,10 @@ if [[ -f "${DONE}" ]]; then
 fi
 
 echo "========================================================"
-echo "Stream KV + Probe-blk0 prune  (± RoPE FT)  HORIZON=${HORIZON}s"
+echo "Stream KV + Probe-blk0 prune  JOINT enc-LoRA+probe  H=${HORIZON}s"
 echo "Job=${SLURM_JOB_ID:-manual} partition=${SLURM_JOB_PARTITION:-} $(date)"
 echo "host=$(hostname) OUT=${OUT}"
-echo "cache=128f new=34f keep=94; scores=Probe.blocks[0] self-attn mass"
+echo "cache=128f new=34f keep=94; scores=Probe.blocks[0] (detached)"
 echo "========================================================"
 nvidia-smi -L || true
 
@@ -70,15 +70,16 @@ cd "$PROJECT_ROOT"
 
 "$PYTHON" scripts/finetune_stream_kv_prune_probe_rope.py \
   --out-dir "$OUT" \
-  --copy-json "${PROJECT_ROOT}/configs/jepa_pe/stream_kv_probe_blk0_prune_ft_rope_h${HORIZON}s.json" \
-  --copy-png "${PROJECT_ROOT}/plots/stream_kv_probe_blk0_prune_ft_rope_h${HORIZON}s.png" \
+  --copy-json "${PROJECT_ROOT}/configs/jepa_pe/stream_kv_probe_blk0_prune_joint_ft_rope_h${HORIZON}s.json" \
+  --copy-png "${PROJECT_ROOT}/plots/stream_kv_probe_blk0_prune_joint_ft_rope_h${HORIZON}s.png" \
   --horizons "${HORIZON}" \
   --max-train 400 \
   --max-val 200 \
   --train-clips-per-video 8 \
   --val-clips-per-video 4 \
   --epochs 8 \
-  --lr 1e-4
+  --lr 1e-4 \
+  --encoder-lr-mult 0.5
 
 date > "${DONE}"
 echo "Done $(date)"
@@ -87,8 +88,9 @@ import json
 p="${OUT}/metrics.json"
 d=json.load(open(p))
 print("method", d.get("method"))
+print("train", d.get("config", {}).get("train"))
 print("horizons", d.get("config", {}).get("horizons_sec"))
 print("table", json.dumps(d["accuracy"]["table_action_top5"], indent=2))
 print("delta_pp", json.dumps(d["accuracy"]["delta_pp"], indent=2))
 PY
-ls -lh "$OUT"/metrics.json "$OUT"/probe_ft_*.pt "$OUT"/*.png 2>/dev/null || true
+ls -lh "$OUT"/metrics.json "$OUT"/probe_enc_ft_*.pt "$OUT"/*.png 2>/dev/null || true
