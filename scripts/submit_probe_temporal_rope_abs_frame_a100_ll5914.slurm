@@ -1,19 +1,27 @@
 #!/bin/bash
-#SBATCH --job-name=probe_trope
+#SBATCH --job-name=trope_j
 #SBATCH --account=torch_pr_111_tandon_advanced
 #SBATCH --partition=a100_tandon
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:a100:1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=200G
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=96G
 #SBATCH --time=01:50:00
-#SBATCH --output=/scratch/ll5914/logs/probe_temporal_rope_%j.out
-#SBATCH --error=/scratch/ll5914/logs/probe_temporal_rope_%j.err
+#SBATCH --output=/scratch/ll5914/logs/probe_temporal_rope_joint_%j.out
+#SBATCH --error=/scratch/ll5914/logs/probe_temporal_rope_joint_%j.err
 
 set -euo pipefail
 export TMPDIR=/scratch/ll5914/tmp
 mkdir -p "$TMPDIR" /scratch/ll5914/logs
+
+# Abs-frame probe RoPE FT with **joint** encoder-LoRA + probe.
+# Race A100/H100/H200:
+#   for spec in 'a100_tandon|gpu:a100:1' 'h100_tandon|gpu:h100:1' 'h200_tandon|gpu:h200:1'; do
+#     IFS='|' read -r part gres <<< "$spec"
+#     sbatch --job-name=trope_j --partition="$part" --gres="$gres" \
+#       --mem=96G --cpus-per-task=8 --time=01:50:00 this.slurm
+#   done
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
 PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
@@ -23,13 +31,26 @@ export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/scripts:${VJEPA_ROOT}:${PYTHO
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 
-OUT="/scratch/ll5914/experiments/probe_temporal_rope_abs_frame_128kv"
+OUT="/scratch/ll5914/experiments/probe_temporal_rope_abs_frame_joint_128kv"
+DONE="${OUT}/DONE"
 mkdir -p "$OUT"
 
+if [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_JOB_NAME:-}" ]]; then
+  while read -r sib; do
+    [[ -z "${sib}" || "${sib}" == "${SLURM_JOB_ID}" ]] && continue
+    echo "Canceling sibling ${sib} (same name ${SLURM_JOB_NAME})"
+    scancel --signal=KILL "${sib}" 2>/dev/null || true
+  done < <(squeue -u "${USER}" -n "${SLURM_JOB_NAME}" -h -o '%i' 2>/dev/null || true)
+fi
+
+if [[ -f "${DONE}" ]]; then
+  echo "Already done (${DONE}); exiting."
+  exit 0
+fi
+
 echo "========================================================"
-echo "Probe 1D temporal RoPE (abs Frame Index) vs 128 KV baseline"
+echo "Probe 1D temporal RoPE (abs Frame Index) JOINT enc+probe"
 echo "Job=${SLURM_JOB_ID:-manual}  $(date)  host=$(hostname)"
-echo "Finetune probe+heads with RoPE; encoder frozen"
 echo "========================================================"
 nvidia-smi -L || true
 
@@ -40,22 +61,25 @@ cd "$PROJECT_ROOT"
 
 "$PYTHON" scripts/finetune_eval_probe_temporal_rope_abs_frame.py \
   --out-dir "$OUT" \
-  --copy-json /home/ll5914/Jepa_yifan/probe_temporal_rope_abs_frame_128kv.json \
-  --copy-png /home/ll5914/Jepa_yifan/probe_temporal_rope_abs_frame_128kv.png \
+  --copy-json "${PROJECT_ROOT}/configs/jepa_pe/probe_temporal_rope_abs_frame_joint_128kv.json" \
+  --copy-png "${PROJECT_ROOT}/plots/probe_temporal_rope_abs_frame_joint_128kv.png" \
   --max-train 108 \
   --max-val 108 \
   --train-clips-per-video 4 \
   --val-clips-per-video 4 \
   --epochs 8 \
-  --lr 1e-4
+  --lr 1e-4 \
+  --encoder-lr-mult 0.5
 
+date > "${DONE}"
 echo "Done $(date)"
 "$PYTHON" - <<'PY'
 import json
-p="/scratch/ll5914/experiments/probe_temporal_rope_abs_frame_128kv/metrics.json"
+p="/scratch/ll5914/experiments/probe_temporal_rope_abs_frame_joint_128kv/metrics.json"
 d=json.load(open(p))
 print("method", d.get("method"))
+print("train", d.get("config", {}).get("train"))
 print("table", json.dumps(d["accuracy"]["table_action_top5"], indent=2))
 print("delta_pp", json.dumps(d["accuracy"]["delta_pp"], indent=2))
 PY
-ls -lh "$OUT"/metrics.json "$OUT"/probe_temporal_rope_abs_frame_128kv.png 2>/dev/null || true
+ls -lh "$OUT"/metrics.json "$OUT"/*.png "$OUT"/*.pt 2>/dev/null || true

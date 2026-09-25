@@ -79,18 +79,21 @@ More notes: [`scripts/README_hdepic_action_anticipation.md`](../scripts/README_h
 
 ## Design notes (RoPE + prune)
 
-Both signals live on **`Probe.blocks[0]` self-attn** (not encoder last-block,
-not a trained pruner):
+All PE finetunes train **encoder LoRA + probe/heads jointly** (encoder base
+weights stay frozen; LoRA `lr_mult=0.5`). Probe-only FT underperforms.
+
+Both prune/RoPE signals live on **`Probe.blocks[0]` self-attn** (not a trained
+pruner) unless noted:
 
 | Piece | Default |
 |---|---|
 | **Probe temporal RoPE** | `only_block0=True`, `rope_cross_attn_k=False` — rotate Q/K of block 0 only |
-| **Stream prune scores** | mean received mass from Probe block-0 self-attn; **recorded** after each probe pass and used on the **next** admit (`step(..., slot_scores=...)`) |
+| **Stream prune scores** (`kvprune*`) | mean received mass from Probe block-0 self-attn; **detached** for keep/drop; used on the **next** admit |
 | **Prune geometry** | cache 128f → drop lowest 34f (17 slots) → keep 94 + encode new 34 → packed 128 |
+| **Matched stream KV** (`kvmatch*` / `kvrope*`) | already joint enc-LoRA + probe via `evals.main` |
 
-Matched stream-KV train (`kvmatch*` / `kvrope112`) uses dense slot ids `0..S-1`
-inside the packed window. The prune FT arm (`kvprune_rope`) uses **abs**
-surviving frame/slot ids for RoPE (survivors keep original stream index).
+Matched stream-KV train uses dense slot ids `0..S-1` inside the packed window.
+Prune / abs-frame RoPE FT arms use **abs** surviving frame/slot ids for RoPE.
 
 ---
 
