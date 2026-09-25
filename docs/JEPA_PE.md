@@ -1,11 +1,13 @@
 # Jepa_PE — Stream KV + Probe Temporal RoPE
 
 Branch for **probe positional encoding / temporal RoPE** work on HD-EPIC P01,
-with **train/eval-matched stream KV** encoding (newest-aligned chunked cache).
+with **train/eval-matched stream KV** encoding (newest-aligned chunked cache)
+and a **probe-blk0 attention prune** streaming finetune (± RoPE).
 
-Status snapshot (2026-09-24): training still in **epoch 0**; no val metrics yet.
-Train curves and configs are under `plots/` and `configs/jepa_pe/`.
-Large `.pt` checkpoints stay on scratch (gitignored).
+Status snapshot (2026-09-24): `kvmatch112` / `kvrope112` still in **epoch 0**
+(no val yet). `kvprune_rope` (probe-blk0 prune FT) queued. Train curves and
+configs under `plots/` and `configs/jepa_pe/`. Large `.pt` ckpts stay on
+scratch (gitignored).
 
 ---
 
@@ -75,49 +77,86 @@ More notes: [`scripts/README_hdepic_action_anticipation.md`](../scripts/README_h
 
 ---
 
+## Design notes (RoPE + prune)
+
+Both signals live on **`Probe.blocks[0]` self-attn** (not encoder last-block,
+not a trained pruner):
+
+| Piece | Default |
+|---|---|
+| **Probe temporal RoPE** | `only_block0=True`, `rope_cross_attn_k=False` — rotate Q/K of block 0 only |
+| **Stream prune scores** | mean received mass from Probe block-0 self-attn; **recorded** after each probe pass and used on the **next** admit (`step(..., slot_scores=...)`) |
+| **Prune geometry** | cache 128f → drop lowest 34f (17 slots) → keep 94 + encode new 34 → packed 128 |
+
+Matched stream-KV train (`kvmatch*` / `kvrope112`) uses dense slot ids `0..S-1`
+inside the packed window. The prune FT arm (`kvprune_rope`) uses **abs**
+surviving frame/slot ids for RoPE (survivors keep original stream index).
+
+---
+
 ## Current runs (configs)
 
 | Job name | Encode window | Cache + chunk | Probe RoPE | Horizon | BS | Epochs |
 |---|---|---|---|---|---|---|
 | **kvmatch0** | **16f** (last 2s) | 0 + 16 | off | 2s | 2 | 8 |
 | **kvmatch112** | **128f** | 112 + 16 | off | 2s | 2 | 8 |
-| **kvrope112** | **128f** | 112 + 16 | **on** (1D temporal on AttentivePooler) | 2s | 2 | 8 |
+| **kvrope112** | **128f** | 112 + 16 | **on** (`only_block0`) | 2s | 2 | 8 |
+| **kvprune_rope** | stream 128→94+34 | prune by probe-blk0 | FT ± RoPE (`only_block0`) | MTP 2/4/6s | — | 8 |
 
-Shared settings:
+Shared settings (matched train):
 
 - Dataset: HD-EPIC **P01** `clip_split`
 - Backbone: ViT-L/16 @ 256, encoder LoRA (rank 8)
 - Dataloader: `frames_per_clip=128`, `frames_per_second=8` (~16s clip)
 - Protocol: newest-aligned **stream KV** (chunked encode; history under `no_grad`, train last chunk only)
-- Probe RoPE position = dense slot ids `0..S-1` inside the packed window (not absolute video frame id)
 
-Frozen copies of each run’s `config.yaml` + `protocol.json`:
+Frozen copies of each matched run’s `config.yaml` + `protocol.json`:
 
 - [`configs/jepa_pe/kvmatch0/`](../configs/jepa_pe/kvmatch0/)
 - [`configs/jepa_pe/kvmatch112/`](../configs/jepa_pe/kvmatch112/)
 - [`configs/jepa_pe/kvrope112/`](../configs/jepa_pe/kvrope112/)
 - Progress snapshot: [`configs/jepa_pe/status.json`](../configs/jepa_pe/status.json)
 
-### Submit (cluster)
+### Submit (cluster) — 3-partition race + low mem
+
+Always race **A100 / H100 / H200** (same `--job-name`); first to start
+`scancel`s siblings. Prefer **`--mem=96G --cpus-per-task=8`** (smaller mem
+queues faster; ~84G MaxRSS historically OK for matched train).
 
 ```bash
 SCR=scripts/submit_clip_stream_kv_matched_ll5914.slurm
 EXPORT_COMMON=HORIZON=2,BATCH_SIZE=2,NUM_WORKERS=2,VAL_NUM_WORKERS=1,PREFETCH_FACTOR=1
 
-# short context (cache=0 → encode last 16f of the 128f clip)
-sbatch --job-name=kvmatch0 --mem=128G --cpus-per-task=8 \
-  --export=CACHE_FRAMES=0,PROBE_ROPE=0,$EXPORT_COMMON "$SCR"
+race() {  # usage: race JOBNAME EXPORTS
+  local name="$1"; shift
+  for spec in 'a100_tandon|gpu:a100:1' 'h100_tandon|gpu:h100:1' 'h200_tandon|gpu:h200:1'; do
+    IFS='|' read -r part gres <<< "$spec"
+    sbatch --job-name="$name" --partition="$part" --gres="$gres" \
+      --mem=96G --cpus-per-task=8 --time=01:50:00 \
+      --export="$1" "$SCR"
+  done
+}
 
-# long context matched train/eval
-sbatch --job-name=kvmatch112 --mem=128G --cpus-per-task=8 \
-  --export=CACHE_FRAMES=112,PROBE_ROPE=0,$EXPORT_COMMON "$SCR"
-
-# same as kvmatch112 + probe temporal RoPE (warm-starts from kvmatch112 ckpt when present)
-sbatch --job-name=kvrope112 --mem=128G --cpus-per-task=8 \
-  --export=CACHE_FRAMES=112,PROBE_ROPE=1,$EXPORT_COMMON "$SCR"
+race kvmatch0   "CACHE_FRAMES=0,PROBE_ROPE=0,$EXPORT_COMMON"
+race kvmatch112 "CACHE_FRAMES=112,PROBE_ROPE=0,$EXPORT_COMMON"
+race kvrope112  "CACHE_FRAMES=112,PROBE_ROPE=1,$EXPORT_COMMON"
 ```
 
-Script supports a multi-partition race (A100/H100/H200): first job to start cancels same-name siblings.
+Probe-blk0 prune FT (± RoPE):
+
+```bash
+SCR=scripts/submit_stream_kv_prune_probe_rope_ll5914.slurm
+for spec in 'a100_tandon|gpu:a100:1' 'h100_tandon|gpu:h100:1' 'h200_tandon|gpu:h200:1'; do
+  IFS='|' read -r part gres <<< "$spec"
+  sbatch --job-name=kvprune_rope --partition="$part" --gres="$gres" \
+    --mem=96G --cpus-per-task=8 --time=01:50:00 "$SCR"
+done
+```
+
+Scratch outs:
+
+- matched: `/scratch/ll5914/experiments/clip_stream_kv_{matched,rope}_c*_h2s/`
+- prune FT: `/scratch/ll5914/experiments/stream_kv_probe_blk0_prune_ft_rope/`
 
 ---
 
@@ -128,6 +167,7 @@ Script supports a multi-partition race (A100/H100/H200): first job to start canc
 | kvmatch0 | 0 → ~760 | ~12.0 | ~25.7% | ~23.2% |
 | kvmatch112 | 0 → 510 | 11.25 | 18.4% | 12.9% |
 | kvrope112 | 0 → 230 | 13.69 | 19.5% | 11.7% |
+| kvprune_rope | — | — | — | pending |
 
 Overlap train comparison (itr 0–230): RoPE ≈ **−0.2** loss, **+1.4pp** action acc vs kvmatch112 — early / noisy; **no val yet**.
 
@@ -146,7 +186,9 @@ Earlier abs-frame RoPE ablation (prune survivors keep raw slot id; hurt @2s):
 
 | Piece | Path |
 |---|---|
-| Stream KV encode + probe RoPE helpers | `app/hdepic_lora_action_anticipation/stream_kvcache_attn_prune.py` |
+| Stream KV encode + probe-blk0 prune + RoPE helpers | `app/hdepic_lora_action_anticipation/stream_kvcache_attn_prune.py` |
 | Wire stream KV / probe RoPE into eval | `app/hdepic_lora_action_anticipation/eval.py` |
-| Train/eval launcher | `scripts/submit_clip_stream_kv_matched_ll5914.slurm` |
-| Abs-frame RoPE FT/eval script | `scripts/finetune_eval_probe_temporal_rope_abs_frame.py` |
+| Matched train/eval launcher | `scripts/submit_clip_stream_kv_matched_ll5914.slurm` |
+| Probe-blk0 prune FT ± RoPE | `scripts/finetune_stream_kv_prune_probe_rope.py` |
+| Prune FT launcher | `scripts/submit_stream_kv_prune_probe_rope_ll5914.slurm` |
+| Abs-frame RoPE FT/eval (legacy) | `scripts/finetune_eval_probe_temporal_rope_abs_frame.py` |

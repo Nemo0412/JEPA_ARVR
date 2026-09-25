@@ -5,8 +5,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:h100:1
-#SBATCH --cpus-per-task=24
-#SBATCH --mem=512GB
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=96G
 #SBATCH --time=01:50:00
 #SBATCH --signal=B:USR1@90
 #SBATCH --output=/scratch/ll5914/logs/kvmatch_%j.out
@@ -22,9 +22,16 @@ set -euo pipefail
 #
 # Expectation under matched train+eval: long ≥ short (more frames help).
 #
-# Submit:
-#   sbatch --job-name=kvmatch0   --export=CACHE_FRAMES=0,HORIZON=2   this
-#   sbatch --job-name=kvmatch112 --export=CACHE_FRAMES=112,HORIZON=2 this
+# Prefer low mem (96G) + 3-partition race (A100/H100/H200); first starter
+# cancels same-name siblings. Probe RoPE defaults to blocks[0] only.
+#
+# Submit example:
+#   EXPORT=CACHE_FRAMES=112,HORIZON=2,BATCH_SIZE=2,NUM_WORKERS=2,VAL_NUM_WORKERS=1,PREFETCH_FACTOR=1,PROBE_ROPE=0
+#   for spec in 'a100_tandon|gpu:a100:1' 'h100_tandon|gpu:h100:1' 'h200_tandon|gpu:h200:1'; do
+#     IFS='|' read -r part gres <<< "$spec"
+#     sbatch --job-name=kvmatch112 --partition="$part" --gres="$gres" \
+#       --mem=96G --cpus-per-task=8 --export="$EXPORT" this.slurm
+#   done
 
 CACHE_FRAMES="${CACHE_FRAMES:?Set CACHE_FRAMES=0|16|...|112}"
 HORIZON="${HORIZON:-2}"
@@ -120,8 +127,8 @@ request_resubmit() {
     --account="${SLURM_JOB_ACCOUNT:-torch_pr_111_tandon_advanced}" \
     --partition="${SLURM_JOB_PARTITION:-h100_tandon}" \
     --gres="${SLURM_JOB_GRES:-gpu:h100:1}" \
-    --mem="${SLURM_MEM_PER_NODE:-512G}" \
-    --cpus-per-task="${SLURM_CPUS_PER_TASK:-24}" \
+    --mem="${SLURM_MEM_PER_NODE:-96G}" \
+    --cpus-per-task="${SLURM_CPUS_PER_TASK:-8}" \
     --time="${SLURM_TIMELIMIT:-01:50:00}" \
     "${dep[@]}" \
     --export=CACHE_FRAMES="${CACHE_FRAMES}",HORIZON="${HORIZON}",CHUNK_FRAMES="${CHUNK_FRAMES}",BATCH_SIZE="${BATCH_SIZE}",NUM_WORKERS="${NUM_WORKERS}",VAL_NUM_WORKERS="${VAL_NUM_WORKERS}",PREFETCH_FACTOR="${PREFETCH_FACTOR}",PROBE_ROPE="${PROBE_ROPE}" \
@@ -269,7 +276,8 @@ lora = {
     },
     "probe_temporal_rope": {
         "enabled": probe_rope,
-        "rope_cross_attn_k": True,
+        "only_block0": True,
+        "rope_cross_attn_k": False,
         "grid_size": 16,
         "tubelet_size": 2,
     },

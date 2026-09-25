@@ -2329,7 +2329,8 @@ def _patch_for_probe_temporal_rope(base_eval, rope_cfg: dict, data_cfg: dict):
 
     Config (experiment.lora.probe_temporal_rope):
       enabled: true
-      rope_cross_attn_k: true
+      only_block0: true          # RoPE on Probe.blocks[0] self-attn only (default)
+      rope_cross_attn_k: false   # optional: also rotate cross-attn K
       grid_size: 16   # spatial patches per side (256/16)
     Frame ids are dense slot indices 0..S-1 within the current packed window
     (matches newest-aligned stream KV positions that restart at 0 each forward).
@@ -2339,7 +2340,8 @@ def _patch_for_probe_temporal_rope(base_eval, rope_cfg: dict, data_cfg: dict):
         token_frame_ids_from_slots,
     )
 
-    rope_cross = bool(rope_cfg.get("rope_cross_attn_k", True))
+    only_block0 = bool(rope_cfg.get("only_block0", True))
+    rope_cross = bool(rope_cfg.get("rope_cross_attn_k", False))
     resolution = int(data_cfg.get("resolution", 256) or 256)
     patch = int(rope_cfg.get("patch_size", 16) or 16)
     grid = int(rope_cfg.get("grid_size", resolution // patch) or (resolution // patch))
@@ -2352,7 +2354,9 @@ def _patch_for_probe_temporal_rope(base_eval, rope_cfg: dict, data_cfg: dict):
         if pooler is None:
             logger.warning("probe_temporal_rope: classifier has no pooler; skip")
             return clf
-        rope = ProbeTemporalRoPE(pooler, rope_cross_attn_k=rope_cross)
+        rope = ProbeTemporalRoPE(
+            pooler, rope_cross_attn_k=rope_cross, only_block0=only_block0
+        )
         orig_forward = clf.forward
 
         def forward_with_rope(x, *args, **kwargs):
@@ -2385,20 +2389,23 @@ def _patch_for_probe_temporal_rope(base_eval, rope_cfg: dict, data_cfg: dict):
         if isinstance(out, (list, tuple)):
             wrapped = [_wrap_classifier(c) for c in out]
             logger.info(
-                "Probe temporal RoPE ON: %d classifier(s) gp=%d grid=%d tubelet=%d cross_k=%s",
+                "Probe temporal RoPE ON: %d classifier(s) gp=%d grid=%d tubelet=%d "
+                "only_block0=%s cross_k=%s",
                 len(wrapped),
                 gp,
                 grid,
                 tubelet,
+                only_block0,
                 rope_cross,
             )
             return type(out)(wrapped) if isinstance(out, tuple) else wrapped
         wrapped = _wrap_classifier(out)
         logger.info(
-            "Probe temporal RoPE ON: gp=%d grid=%d tubelet=%d cross_k=%s",
+            "Probe temporal RoPE ON: gp=%d grid=%d tubelet=%d only_block0=%s cross_k=%s",
             gp,
             grid,
             tubelet,
+            only_block0,
             rope_cross,
         )
         return wrapped

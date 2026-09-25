@@ -1,19 +1,21 @@
 """Streaming Gaze+IMU encoder with 128-frame KV cache and attention prune.
 
-No predictor. Protocol:
+No predictor. Protocol (probe-blk0 prune, one-tick lag):
 
   * Cache holds 128 frames (64 tubelets). Each streaming step takes 34 new
-    frames (17 tubelets).
-  * After a 128-frame window is encoded, last-block received-attention is
-    mean-pooled to slots. The 17 lowest-score slots (34 frames) are recorded.
-  * When the next 34 frames arrive they **replace** those low-score slots:
-    kept 94-frame K/V stay in cache (original RoPE), new 34 attend to the
-    remaining keys, then the packed 94+34=128 is rescored for the next step.
-  * Gaze+pose enter through the 5ch BinaryMapInputAdapter on each chunk.
-  * IMU late CA is applied on the packed 64 video slots (aligned by slot id).
-  * Probe sees fused encoder tokens only.
+    frames (17 tubelets) ≈ 4.25s @ 8fps.
+  * After probe runs on the current 128 tokens, **Probe blocks[0] self-attn**
+    received mass is mean-pooled to slots and **recorded** (not trained).
+  * When the next 34 frames arrive, those recorded scores drop the 17 lowest
+    slots (34 frames). Kept 94-frame K/V stay in cache; new 34 encode against
+    the remaining keys; packed 94+34=128 goes back into the probe.
+  * That probe pass produces the prediction **and** the scores for the
+    following tick.
+  * Bootstrap (first prune): run probe once on the filled 128 to obtain scores
+    before the first ``step``.
 
-FIFO (drop oldest 34) is the same cache path without the attention ranking.
+Encoder last-block Q/K scoring remains available as ``mode="attn"`` without
+passing ``slot_scores`` (legacy). FIFO drops oldest 34.
 """
 
 from __future__ import annotations
@@ -76,6 +78,30 @@ def slot_importance_from_qk(
         imp += logits.softmax(dim=-1).sum(dim=2).sum(dim=1)
     n_slots = n // gp
     return imp.view(b, n_slots, gp).mean(dim=-1)
+
+
+def probe_blk0_qk(pooler: nn.Module, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """Q,K from AttentivePooler.blocks[0] self-attn (pre-SDPA). tokens: [B,N,C]."""
+    blocks = getattr(pooler, "blocks", None)
+    if blocks is None or len(blocks) < 1:
+        raise RuntimeError("probe_blk0_qk requires pooler.blocks[0] (probe depth > 1)")
+    blk = blocks[0]
+    attn = blk.attn
+    x = blk.norm1(tokens)
+    b, n, c = x.shape
+    qkv = attn.qkv(x).reshape(b, n, 3, attn.num_heads, c // attn.num_heads).permute(2, 0, 3, 1, 4)
+    return qkv[0], qkv[1], float(attn.scale)
+
+
+def probe_blk0_slot_scores(
+    pooler: nn.Module, tokens: torch.Tensor, gp: int, chunk: int = 256
+) -> torch.Tensor:
+    """Probe block-0 self-attn received mass → slot scores [B, n_slots].
+
+    Used as the prune signal for the *next* streaming tick (recorded, not trained).
+    """
+    q, k, scale = probe_blk0_qk(pooler, tokens)
+    return slot_importance_from_qk(q, k, scale, gp, chunk=chunk)
 
 
 def keep_and_drop_from_slots(
@@ -231,15 +257,23 @@ def apply_temporal_rope_qk(
 
 
 class ProbeTemporalRoPE:
-    """Patch AttentivePooler self-attn (+ optional cross-attn K) with 1D temporal RoPE.
+    """Patch AttentivePooler with 1D temporal RoPE on Q/K.
 
-    Position = original Frame/slot Index carried through prune (abs_stream).
-    Call ``set_frame_ids`` before each pooler forward. No new parameters.
+    Default: **only** ``pooler.blocks[0]`` self-attn (matches probe-blk0 prune
+    scoring). Optional: also rotate cross-attn K (``rope_cross_attn_k=True``).
+    Position = original Frame/slot Index (abs_stream). No new parameters.
     """
 
-    def __init__(self, pooler: nn.Module, *, rope_cross_attn_k: bool = True):
+    def __init__(
+        self,
+        pooler: nn.Module,
+        *,
+        rope_cross_attn_k: bool = False,
+        only_block0: bool = True,
+    ):
         self.pooler = pooler
         self.rope_cross_attn_k = bool(rope_cross_attn_k)
+        self.only_block0 = bool(only_block0)
         self._frame_ids: torch.Tensor | None = None
         self._hooks: list[tuple[nn.Module, object]] = []
         self._install()
@@ -262,8 +296,10 @@ class ProbeTemporalRoPE:
 
     def _install(self) -> None:
         pooler = self.pooler
-        if getattr(pooler, "blocks", None) is not None:
-            for blk in pooler.blocks:
+        blocks = getattr(pooler, "blocks", None)
+        if blocks is not None and len(blocks) > 0:
+            targets = [blocks[0]] if self.only_block0 else list(blocks)
+            for blk in targets:
                 self._patch_self_attn(blk.attn)
         if self.rope_cross_attn_k and getattr(pooler, "cross_attention_block", None) is not None:
             xblk = pooler.cross_attention_block
@@ -460,18 +496,40 @@ class StreamKVAttnPruneEncoder:
             next_slot=slot_start + self.n_slots,
         )
 
-    def _select(self, state: StreamKVState, mode: PruneMode) -> tuple[torch.Tensor, torch.Tensor]:
+    def _select(
+        self,
+        state: StreamKVState,
+        mode: PruneMode,
+        slot_scores: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         n_tok = state.tokens.size(1)
         drop_tok_n = self.drop_slots * self.gp
         if mode == "fifo":
             return fifo_keep_drop(n_tok, drop_tok_n, state.tokens.device, batch=state.tokens.size(0))
-        return keep_and_drop_from_slots(state.slot_scores, self.keep_slots, self.gp)
+        scores = state.slot_scores if slot_scores is None else slot_scores
+        if scores.shape != state.slot_ids.shape:
+            raise ValueError(
+                f"slot_scores {tuple(scores.shape)} != slot_ids {tuple(state.slot_ids.shape)}"
+            )
+        return keep_and_drop_from_slots(scores, self.keep_slots, self.gp)
 
-    def step(self, state: StreamKVState, clips_new: torch.Tensor, mode: PruneMode = "attn") -> StreamKVState:
+    def step(
+        self,
+        state: StreamKVState,
+        clips_new: torch.Tensor,
+        mode: PruneMode = "attn",
+        slot_scores: torch.Tensor | None = None,
+    ) -> StreamKVState:
+        """Admit ``new_frames``. If ``slot_scores`` is set (e.g. probe blk0 from the
+        previous probe pass), use them to drop 34 frames; else encoder last-block
+        scores on ``state`` (legacy). After encode, ``state.slot_scores`` is
+        refreshed with encoder scores — callers that want probe-lag should
+        overwrite with ``probe_blk0_slot_scores`` after the next probe.
+        """
         if clips_new.size(2) != self.new_frames:
             raise ValueError(f"step expects T={self.new_frames}, got {clips_new.size(2)}")
         b = clips_new.size(0)
-        keep_tok, _drop_tok = self._select(state, mode)
+        keep_tok, _drop_tok = self._select(state, mode, slot_scores=slot_scores)
         old_tok = gather_tokens(state.tokens, keep_tok)
         cache_k = gather_kv(state.cache_k, keep_tok)
         cache_v = gather_kv(state.cache_v, keep_tok)

@@ -1,7 +1,11 @@
 {
   "date": "2026-09-24",
   "status": "in_progress_epoch0",
-  "note": "No val epoch yet. Train metrics only. Checkpoints live on scratch (not in git).",
+  "note": "No val epoch yet for matched train. Probe RoPE = only_block0. kvprune_rope pending. Checkpoints on scratch.",
+  "design": {
+    "probe_temporal_rope": {"only_block0": true, "rope_cross_attn_k": false},
+    "prune": "Probe.blocks[0] self-attn received mass → next-tick drop 34f"
+  },
   "runs": {
     "kvmatch0": {
       "cache_frames": 0,
@@ -60,10 +64,12 @@
       "chunk_frames": 16,
       "window_encode": 128,
       "probe_rope": true,
+      "only_block0": true,
       "horizon_sec": 2,
       "frames_per_clip": 128,
       "bs": 2,
       "epochs": 8,
+      "note": "Job started before only_block0 default; resume after push picks up blk0-only.",
       "progress": {
         "n_logged": 24,
         "itr_first": 0,
@@ -81,6 +87,15 @@
       },
       "scratch": "/scratch/ll5914/experiments/clip_stream_kv_rope_c112_h2s/action_anticipation_frozen/clip-stream-kv-rope-c112-h2s-vitl16-256-8ep",
       "warm_start_from": "kvmatch112 mid-run ckpt"
+    },
+    "kvprune_rope": {
+      "protocol": "stream KV + probe-blk0 attn prune; probe FT ± RoPE",
+      "cache_frames": 128,
+      "new_frames": 34,
+      "keep_frames": 94,
+      "rope": "only_block0 abs frame ids",
+      "status": "queued",
+      "scratch": "/scratch/ll5914/experiments/stream_kv_probe_blk0_prune_ft_rope"
     }
   },
   "plots": [

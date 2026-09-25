@@ -1,8 +1,9 @@
 # JEPA_ARVR
 
-> **Jepa_PE (stream KV + probe temporal RoPE):** how to download HD-EPIC,
-> current run configs (`kvmatch0` / `kvmatch112` / `kvrope112`), and early
-> train curves → [`docs/JEPA_PE.md`](docs/JEPA_PE.md). Branch: `Jepa_PE`.
+> **Jepa_PE (stream KV + probe temporal RoPE):** HD-EPIC download, matched
+> stream-KV runs (`kvmatch0` / `kvmatch112` / `kvrope112`), probe-blk0 prune
+> FT (`kvprune_rope`), and RoPE-on-`Probe.blocks[0]` only →
+> [`docs/JEPA_PE.md`](docs/JEPA_PE.md). Branch: `Jepa_PE`.
 
 > **EGTEA streaming handoff:** agents working on the shared EGTEA
 > Vanilla/+gaze/RU-LSTM experiments must read
