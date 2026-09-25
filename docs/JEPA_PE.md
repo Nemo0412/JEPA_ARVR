@@ -179,7 +179,7 @@ Scratch outs:
 | kvmatch0 | 0 → ~760 | ~12.0 | ~25.7% | ~23.2% |
 | kvmatch112 | 0 → 510 | 11.25 | 18.4% | 12.9% |
 | kvrope112 | 0 → 230 | 13.69 | 19.5% | 11.7% |
-| kvprune_rope | — | — | — | pending |
+| kvprune_rope | — | — | — | pending (joint) |
 
 Overlap train comparison (itr 0–230): RoPE ≈ **−0.2** loss, **+1.4pp** action acc vs kvmatch112 — early / noisy; **no val yet**.
 
@@ -189,8 +189,8 @@ Plots:
 - [`plots/kvrope112_vs_kvmatch112_train_loss_smooth.png`](../plots/kvrope112_vs_kvmatch112_train_loss_smooth.png)
 - [`plots/kvrope112_vs_kvmatch112_train_curves_full.csv`](../plots/kvrope112_vs_kvmatch112_train_curves_full.csv)
 
-Earlier abs-frame RoPE ablation (prune survivors keep raw slot id; hurt @2s):  
-[`configs/jepa_pe/probe_temporal_rope_abs_frame_128kv.json`](../configs/jepa_pe/probe_temporal_rope_abs_frame_128kv.json)
+Abs-frame RoPE joint FT (queued): job `trope_j` →
+`/scratch/ll5914/experiments/probe_temporal_rope_abs_frame_joint_128kv/`
 
 ---
 
