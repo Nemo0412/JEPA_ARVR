@@ -259,9 +259,9 @@ def apply_temporal_rope_qk(
 class ProbeTemporalRoPE:
     """Patch AttentivePooler with 1D temporal RoPE on Q/K.
 
-    Default: **only** ``pooler.blocks[0]`` self-attn (matches probe-blk0 prune
-    scoring). Optional: also rotate cross-attn K (``rope_cross_attn_k=True``).
-    Position = original Frame/slot Index (abs_stream). No new parameters.
+    Default: **all** ``pooler.blocks[*]`` self-attn. Set ``only_block0=True`` to
+    restrict to block 0. Optional: also rotate cross-attn K
+    (``rope_cross_attn_k=True``). Position = Frame/slot Index. No new parameters.
     """
 
     def __init__(
@@ -269,7 +269,7 @@ class ProbeTemporalRoPE:
         pooler: nn.Module,
         *,
         rope_cross_attn_k: bool = False,
-        only_block0: bool = True,
+        only_block0: bool = False,
     ):
         self.pooler = pooler
         self.rope_cross_attn_k = bool(rope_cross_attn_k)

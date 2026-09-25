@@ -290,7 +290,7 @@ lora = {
     },
     "probe_temporal_rope": {
         "enabled": probe_rope,
-        "only_block0": True,
+        "only_block0": False,
         "rope_cross_attn_k": False,
         "grid_size": 16,
         "tubelet_size": 2,

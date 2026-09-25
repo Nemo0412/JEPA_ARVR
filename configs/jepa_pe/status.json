@@ -4,7 +4,7 @@
   "note": "All PE finetunes are joint encoder-LoRA + probe. Probe-only FT artifacts removed. No matched-train val epoch yet.",
   "design": {
     "train": "joint_encoder_lora_probe",
-    "probe_temporal_rope": {"only_block0": true, "rope_cross_attn_k": false},
+    "probe_temporal_rope": {"only_block0": false, "rope_cross_attn_k": false},
     "prune": "Probe.blocks[0] self-attn received mass → next-tick drop 34f (scores detached)"
   },
   "runs": {
@@ -30,25 +30,28 @@
       "chunk_frames": 16,
       "horizon_sec": 2,
       "probe_rope": true,
-      "only_block0": true,
+      "only_block0": false,
       "train": "joint_encoder_lora_probe",
-      "status": "running_ep0",
+      "status": "resubmitted_all_probe_blocks_rope",
       "scratch": "/scratch/ll5914/experiments/clip_stream_kv_rope_c112_h2s/action_anticipation_frozen/clip-stream-kv-rope-c112-h2s-vitl16-256-8ep"
     },
     "kvprune2j": {
-      "protocol": "stream KV + probe-blk0 prune; joint enc-LoRA + probe FT ± RoPE",
+      "protocol": "stream KV + probe-blk0 prune; joint enc-LoRA + probe FT ± RoPE on all probe blocks",
       "horizon_sec": 2,
+      "only_block0": false,
       "status": "queued",
       "scratch": "/scratch/ll5914/experiments/stream_kv_probe_blk0_prune_joint_ft_rope_h2s"
     },
     "kvprune6j": {
-      "protocol": "stream KV + probe-blk0 prune; joint enc-LoRA + probe FT ± RoPE",
+      "protocol": "stream KV + probe-blk0 prune; joint enc-LoRA + probe FT ± RoPE on all probe blocks",
       "horizon_sec": 6,
+      "only_block0": false,
       "status": "queued",
       "scratch": "/scratch/ll5914/experiments/stream_kv_probe_blk0_prune_joint_ft_rope_h6s"
     },
     "trope_j": {
-      "protocol": "abs-frame probe RoPE; joint enc-LoRA + probe FT",
+      "protocol": "abs-frame probe RoPE on all blocks; joint enc-LoRA + probe FT",
+      "only_block0": false,
       "status": "queued",
       "scratch": "/scratch/ll5914/experiments/probe_temporal_rope_abs_frame_joint_128kv"
     }

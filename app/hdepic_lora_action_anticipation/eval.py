@@ -2329,7 +2329,7 @@ def _patch_for_probe_temporal_rope(base_eval, rope_cfg: dict, data_cfg: dict):
 
     Config (experiment.lora.probe_temporal_rope):
       enabled: true
-      only_block0: true          # RoPE on Probe.blocks[0] self-attn only (default)
+      only_block0: false         # false = RoPE on all Probe.blocks[*] self-attn
       rope_cross_attn_k: false   # optional: also rotate cross-attn K
       grid_size: 16   # spatial patches per side (256/16)
     Frame ids are dense slot indices 0..S-1 within the current packed window
@@ -2340,7 +2340,7 @@ def _patch_for_probe_temporal_rope(base_eval, rope_cfg: dict, data_cfg: dict):
         token_frame_ids_from_slots,
     )
 
-    only_block0 = bool(rope_cfg.get("only_block0", True))
+    only_block0 = bool(rope_cfg.get("only_block0", False))
     rope_cross = bool(rope_cfg.get("rope_cross_attn_k", False))
     resolution = int(data_cfg.get("resolution", 256) or 256)
     patch = int(rope_cfg.get("patch_size", 16) or 16)

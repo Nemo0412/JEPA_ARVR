@@ -87,10 +87,10 @@ pruner) unless noted:
 
 | Piece | Default |
 |---|---|
-| **Probe temporal RoPE** | `only_block0=True`, `rope_cross_attn_k=False` — rotate Q/K of block 0 only |
+| **Probe temporal RoPE** | `only_block0=False` — rotate Q/K on **all** `Probe.blocks[*]` self-attn; `rope_cross_attn_k=False` |
 | **Stream prune scores** (`kvprune*`) | mean received mass from Probe block-0 self-attn; **detached** for keep/drop; used on the **next** admit |
 | **Prune geometry** | cache 128f → drop lowest 34f (17 slots) → keep 94 + encode new 34 → packed 128 |
-| **Matched stream KV** (`kvmatch*` / `kvrope*`) | already joint enc-LoRA + probe via `evals.main` |
+| **Matched stream KV** (`kvmatch*` / `kvrope*`) | joint enc-LoRA + probe via `evals.main` |
 
 Matched stream-KV train uses dense slot ids `0..S-1` inside the packed window.
 Prune / abs-frame RoPE FT arms use **abs** surviving frame/slot ids for RoPE.
@@ -103,8 +103,8 @@ Prune / abs-frame RoPE FT arms use **abs** surviving frame/slot ids for RoPE.
 |---|---|---|---|---|---|---|
 | **kvmatch0** | **16f** (last 2s) | 0 + 16 | off | 2s | 2 | 8 |
 | **kvmatch112** | **128f** | 112 + 16 | off | 2s | 2 | 8 |
-| **kvrope112** | **128f** | 112 + 16 | **on** (`only_block0`) | 2s | 2 | 8 |
-| **kvprune_rope** | stream 128→94+34 | prune by probe-blk0 | FT ± RoPE (`only_block0`) | **single** 2s or 6s | — | 8 |
+| **kvrope112** | **128f** | 112 + 16 | **on** (all probe blocks) | 2s | 2 | 8 |
+| **kvprune_rope** | stream 128→94+34 | prune by probe-blk0 | FT ± RoPE (**all** probe blocks) | **single** 2s or 6s | — | 8 |
 
 Shared settings (matched train):
 

@@ -454,8 +454,8 @@ def main():
         stream, mtp_clf, pooler, embed_dim, val_loader, device, ck_meta, rope=None,
         prefix="zs_no_rope", chunk=args.chunk, horizons=horizons,
     )
-    rope = ProbeTemporalRoPE(pooler, rope_cross_attn_k=False, only_block0=True)
-    logger.info("eval zs_rope")
+    rope = ProbeTemporalRoPE(pooler, rope_cross_attn_k=False, only_block0=False)
+    logger.info("eval zs_rope (RoPE on all probe self-attn blocks)")
     zs_rope, _ = eval_arm(
         stream, mtp_clf, pooler, embed_dim, val_loader, device, ck_meta, rope=rope,
         prefix="zs_rope", chunk=args.chunk, horizons=horizons,
@@ -495,8 +495,8 @@ def main():
     logger.info("ft_no_rope %s", json.dumps(ft_no))
 
     _reset_init()
-    rope = ProbeTemporalRoPE(pooler, rope_cross_attn_k=False, only_block0=True)
-    logger.info("joint finetune ft_rope (abs frame id; Probe.blocks[0] only)")
+    rope = ProbeTemporalRoPE(pooler, rope_cross_attn_k=False, only_block0=False)
+    logger.info("joint finetune ft_rope (abs frame id; all probe self-attn blocks)")
     t_rope, loss_rope = finetune_joint(
         model, mtp_clf, pooler, stream, embed_dim, train_loader,
         rope=rope, epochs=args.epochs, lr=args.lr, encoder_lr_mult=args.encoder_lr_mult,
@@ -507,7 +507,7 @@ def main():
         {
             "mtp_classifier": mtp_clf.state_dict(),
             "encoder_lora": encoder_lora_state_dict(model),
-            "rope": "temporal_1d_abs_frame_index_blk0_only",
+            "rope": "temporal_1d_abs_frame_index_all_probe_blocks",
             "prune": "probe_blk0",
             "train": "joint_encoder_lora_probe",
             "cache_frames": CACHE_FRAMES,
@@ -562,7 +562,7 @@ def main():
             "train": "joint_encoder_lora_probe",
             "encoder_lr_mult": args.encoder_lr_mult,
             "prune": "probe blocks[0] self-attn received mass → drop lowest 34 frames",
-            "rope": "1D temporal RoPE on Probe.blocks[0] self-attn Q/K only",
+            "rope": "1D temporal RoPE on all Probe.blocks[*] self-attn Q/K",
             "epochs": args.epochs,
             "lr": args.lr,
             "train_seconds_no_rope": t_no,

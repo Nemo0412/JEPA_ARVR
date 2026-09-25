@@ -4,7 +4,7 @@
 Protocol matches eval_probe_posenc_kvcache_128_34:
   encode 128f → stream +34f → attention-prune back to 128f → probe.
 
-RoPE (no new params): default **Probe.blocks[0]** self-attn only
+RoPE (no new params): default **all Probe.blocks[*]** self-attn
   Q'_p = R(p) Q_p,  K'_p = R(p) K_p,  θ_{p,m} = p · ω_m
 with p = original Frame/slot Index surviving prune (abs_stream).
 
@@ -390,8 +390,8 @@ def main():
     base_table, _ = eval_arm(stream, mtp_clf, embed_dim, val_loader, device, ck_meta, rope=None, prefix="baseline")
     logger.info("baseline %s", json.dumps(base_table))
 
-    rope = ProbeTemporalRoPE(pooler, rope_cross_attn_k=False, only_block0=True)
-    logger.info("eval rope_zeroshot")
+    rope = ProbeTemporalRoPE(pooler, rope_cross_attn_k=False, only_block0=False)
+    logger.info("eval rope_zeroshot (RoPE on all probe self-attn blocks)")
     zs_table, _ = eval_arm(stream, mtp_clf, embed_dim, val_loader, device, ck_meta, rope=rope, prefix="rope_zeroshot")
     logger.info("rope_zeroshot %s", json.dumps(zs_table))
 
@@ -417,7 +417,7 @@ def main():
                 "epochs": args.epochs,
                 "lr": args.lr,
                 "encoder_lr_mult": args.encoder_lr_mult,
-                "rope": "temporal_1d_abs_frame_index_blk0_only",
+                "rope": "temporal_1d_abs_frame_index_all_probe_blocks",
                 "train": "joint_encoder_lora_probe",
                 "cache_frames": CACHE_FRAMES,
                 "new_frames": NEW_FRAMES,
@@ -447,8 +447,8 @@ def main():
     payload = {
         "method": METHOD,
         "note": (
-            "Probe 1D temporal RoPE (blocks[0] only) with original Frame/slot Index "
-            "after 128+34 attn prune. Joint encoder-LoRA + probe FT."
+            "Probe 1D temporal RoPE on all probe self-attn blocks with original "
+            "Frame/slot Index after 128+34 attn prune. Joint encoder-LoRA + probe FT."
         ),
         "device": torch.cuda.get_device_name(0),
         "accuracy": {
@@ -461,7 +461,7 @@ def main():
             "cache_frames": CACHE_FRAMES,
             "new_frames": NEW_FRAMES,
             "prune": "encoder last-block slot attention, replace lowest 34 frames",
-            "rope": "1D temporal on Probe.blocks[0] Q/K; abs stream slot id",
+            "rope": "1D temporal on all Probe.blocks[*] Q/K; abs stream slot id",
             "train": "joint_encoder_lora_probe",
             "epochs": args.epochs,
             "lr": args.lr,
