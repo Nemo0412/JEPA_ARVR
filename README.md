@@ -1,8 +1,9 @@
 # JEPA_ARVR
 
-> **kvprune joint (stream KV + prune + Probe RoPE):** how we train, which
-> ckpt to start from (`vitl.pt`), 2s results, and **6s all-block RoPE**
-> recipe → [`docs/KVPRUNE_JOINT.md`](docs/KVPRUNE_JOINT.md).
+> **kvprune joint (stream KV + prune + Probe RoPE):** how we run it, `vitl.pt`
+> cold start, 2s **norope / rope_blk0 / rope_all** launches + best Top-5 →
+> [`docs/KVPRUNE_JOINT.md`](docs/KVPRUNE_JOINT.md). Curves:
+> `kvprune_joint_2s_loss_curves.png`.
 
 > **Jepa_PE (stream KV + probe temporal RoPE):** HD-EPIC download, matched
 > stream-KV runs (`kvmatch0` / `kvmatch112` / `kvrope112`), probe-blk0 prune
@@ -20,6 +21,22 @@ Upstream backbone lives in the `vjepa2` submodule / external V-JEPA2 tree. Proje
 ```text
 eval_name: app.hdepic_lora_action_anticipation
 ```
+
+### kvprune joint 2s — how we run it (summary)
+
+Stream **128-frame KV** + probe-blk0 prune (drop 34 / keep 94 / +new 34 → always
+**128** into the probe). Joint FT: encoder LoRA (last 12) + full probe; start from
+`/mnt/hdd/jepa/models/vjepa2-vitl/vitl.pt`. Script:
+`scripts/run_local_kvprune_joint_2s.py`.
+
+| Arm | Command gist | Best val Top-5 |
+|---|---|---:|
+| No RoPE | 2 GPU, `--rope 0` | **31.59%** @ep8 |
+| RoPE blk0 | 2 GPU, `--rope 1 --only-block0 1` | **31.44%** @ep7 |
+| RoPE all blocks | 4 GPU, `--rope 1 --only-block0 0` (after above) | running |
+
+Full paths, launch commands, and protocol → [`docs/KVPRUNE_JOINT.md`](docs/KVPRUNE_JOINT.md).
+Queue helper for the 4-GPU arm: `scripts/run_local_kvprune_joint_2s_rope_all.sh`.
 
 ---
 

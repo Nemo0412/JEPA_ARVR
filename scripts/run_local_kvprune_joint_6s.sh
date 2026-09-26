@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# DEFERRED: 6s cancelled for now — use run_local_kvprune_joint_2s_rope_all.sh instead.
 # Wait for in-flight kvprune joint 2s jobs, then launch 6s norope + rope_all.
 # RoPE covers all Probe self-attn blocks (--only-block0 0).
 # Start ckpt: /mnt/hdd/jepa/models/vjepa2-vitl/vitl.pt
