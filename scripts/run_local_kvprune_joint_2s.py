@@ -54,6 +54,7 @@ from app.hdepic_lora_action_anticipation.stream_kvcache_attn_prune import (  # n
     StreamKVAttnPruneEncoder,
     probe_blk0_slot_scores,
     token_frame_ids_from_slots,
+    topk_slot_ids_from_scores,
 )
 from app.hdepic_lora_action_anticipation.train_stream_mtp import (  # noqa: E402
     IMAGENET_MEAN,
@@ -177,19 +178,60 @@ def normalize_clip(clip_uint8: torch.Tensor, device) -> torch.Tensor:
     return clips.sub_(IMAGENET_MEAN.to(device)).div_(IMAGENET_STD.to(device))
 
 
-def encode_joint(stream: StreamKVAttnPruneEncoder, pooler: nn.Module, clips: torch.Tensor, embed_dim: int, chunk: int):
-    """Trainable encode with detached probe-blk0 prune scores (discrete topk)."""
+def encode_joint(
+    stream: StreamKVAttnPruneEncoder,
+    pooler: nn.Module,
+    clips: torch.Tensor,
+    embed_dim: int,
+    chunk: int,
+    *,
+    stream_steps: int = 1,
+    protect_hist: int = 0,
+    protect_k_frames: int = 34,
+):
+    """Trainable encode with detached probe-blk0 prune scores (discrete topk).
+
+    ``stream_steps`` admits that many ×34-frame chunks after the 128 fill
+    (``T = 128 + stream_steps*34``). When ``protect_hist>0``, each prune walks
+    scores low→high but skips slots that were Top-K (``protect_k_frames`` /
+    tubelet) in any of the previous ``protect_hist`` probe-score passes.
+    """
+    expected_t = CACHE_FRAMES + int(stream_steps) * NEW_FRAMES
+    if clips.size(2) != expected_t:
+        raise ValueError(f"encode_joint expects T={expected_t}, got {clips.size(2)}")
     hist = clips[:, :, :CACHE_FRAMES]
-    new = clips[:, :, CACHE_FRAMES:]
     # Skip encoder QK score refresh — probe scores drive prune; saves a huge softmax.
     state = stream.fill(hist, refresh_scores=False)
-    tok0 = state.tokens
-    if tok0.size(-1) != embed_dim:
-        tok0 = tok0[:, :, -embed_dim:]
-    # Discrete prune: do not backprop through score → index selection.
-    with torch.no_grad():
-        scores = probe_blk0_slot_scores(pooler, tok0.detach(), stream.gp, chunk=chunk)
-    state = stream.step(state, new, mode="attn", slot_scores=scores, refresh_scores=False)
+    tubelet = int(stream.tubelet_size)
+    protect_k_slots = max(0, int(protect_k_frames) // tubelet)
+    use_protect = int(protect_hist) > 0
+    mode = "attn_protect" if use_protect else "attn"
+    topk_hist: list[torch.Tensor] = []
+
+    for si in range(int(stream_steps)):
+        tok0 = state.tokens
+        if tok0.size(-1) != embed_dim:
+            tok0 = tok0[:, :, -embed_dim:]
+        with torch.no_grad():
+            scores = probe_blk0_slot_scores(pooler, tok0.detach(), stream.gp, chunk=chunk)
+            cur_topk = topk_slot_ids_from_scores(scores, state.slot_ids, protect_k_slots)
+            if use_protect and topk_hist:
+                protected_ids = torch.cat(topk_hist[-int(protect_hist) :], dim=1)
+            else:
+                protected_ids = None
+        s = CACHE_FRAMES + si * NEW_FRAMES
+        e = s + NEW_FRAMES
+        state = stream.step(
+            state,
+            clips[:, :, s:e],
+            mode=mode,
+            slot_scores=scores,
+            protected_ids=protected_ids,
+            refresh_scores=False,
+        )
+        if use_protect:
+            topk_hist.append(cur_topk)
+
     tok = state.tokens
     if tok.size(-1) != embed_dim:
         tok = tok[:, :, -embed_dim:]
@@ -200,11 +242,23 @@ def encode_joint(stream: StreamKVAttnPruneEncoder, pooler: nn.Module, clips: tor
 class JointBundle(nn.Module):
     """Wraps anticipative model (w/ encoder LoRA) + probe for DDP."""
 
-    def __init__(self, backbone: nn.Module, clf: AttentiveClassifier, chunk: int = 256):
+    def __init__(
+        self,
+        backbone: nn.Module,
+        clf: AttentiveClassifier,
+        chunk: int = 256,
+        *,
+        stream_steps: int = 1,
+        protect_hist: int = 0,
+        protect_k_frames: int = 34,
+    ):
         super().__init__()
         self.backbone = backbone
         self.clf = clf
         self.chunk = int(chunk)
+        self.stream_steps = int(stream_steps)
+        self.protect_hist = int(protect_hist)
+        self.protect_k_frames = int(protect_k_frames)
         self.stream = StreamKVAttnPruneEncoder(
             backbone.encoder,
             gp=int(backbone.grid_size) ** 2,
@@ -228,7 +282,14 @@ class JointBundle(nn.Module):
 
     def forward(self, clips: torch.Tensor):
         tok, frame_ids = encode_joint(
-            self.stream, self.clf.pooler, clips, int(self.backbone.embed_dim), self.chunk
+            self.stream,
+            self.clf.pooler,
+            clips,
+            int(self.backbone.embed_dim),
+            self.chunk,
+            stream_steps=self.stream_steps,
+            protect_hist=self.protect_hist,
+            protect_k_frames=self.protect_k_frames,
         )
         if self._rope is not None:
             self._rope.set_frame_ids(frame_ids)
@@ -312,6 +373,24 @@ def main():
         choices=[0, 1],
         help="1 = RoPE on Probe.blocks[0] only; 0 = all Probe self-attn blocks (default)",
     )
+    ap.add_argument(
+        "--stream-steps",
+        type=int,
+        default=1,
+        help="Number of 34-frame stream ticks after the 128 fill (T=128+steps*34)",
+    )
+    ap.add_argument(
+        "--protect-hist",
+        type=int,
+        default=0,
+        help="If >0: protect slots that were Top-K in any of the last N probe-score passes",
+    )
+    ap.add_argument(
+        "--protect-k",
+        type=int,
+        default=34,
+        help="Top-K size in frames for protect history (tubelet-aligned; default 34)",
+    )
     ap.add_argument("--max-train", type=int, default=0, help="0 = full train split")
     ap.add_argument("--max-val", type=int, default=0, help="0 = full val split")
     ap.add_argument("--epochs", type=int, default=8)
@@ -341,26 +420,42 @@ def main():
     device = torch.device(f"cuda:{local}")
     is_main = rank == 0
 
+    stream_steps = max(1, int(args.stream_steps))
+    protect_hist = max(0, int(args.protect_hist))
+    protect_k = max(0, int(args.protect_k))
+
     hz_tag = int(horizon) if horizon == int(horizon) else horizon
     tag = "rope" if args.rope else "norope"
     if args.rope and only_block0:
         tag = "rope_blk0"
     elif args.rope:
         tag = "rope_all"
+    if protect_hist > 0:
+        tag = f"{tag}_protectk{protect_k}_h{protect_hist}"
+    if stream_steps != 1:
+        tag = f"{tag}_s{stream_steps}"
     out_dir = args.out_dir / f"joint_{hz_tag}s_{tag}"
     if is_main:
         out_dir.mkdir(parents=True, exist_ok=True)
         logger.info(
-            "joint encoder-LoRA+probe  horizon=%.1fs rope=%s only_block0=%s world=%d out=%s",
-            horizon, bool(args.rope), only_block0, world, out_dir,
+            "joint encoder-LoRA+probe  horizon=%.1fs rope=%s only_block0=%s "
+            "stream_steps=%d protect_hist=%d protect_k=%d world=%d out=%s",
+            horizon, bool(args.rope), only_block0,
+            stream_steps, protect_hist, protect_k, world, out_dir,
         )
+        if protect_hist > 0 and stream_steps < 2:
+            logger.warning(
+                "protect_hist=%d with stream_steps=1: Top-K history is empty on "
+                "the only prune → drops match plain attn (same as rope_all)",
+                protect_hist,
+            )
 
     verb_map, noun_map, action_map = build_class_maps(args.train_csv)
     maps = (verb_map, noun_map, action_map)
     if is_main:
         logger.info("classes v=%d n=%d a=%d", len(verb_map), len(noun_map), len(action_map))
 
-    total_frames = CACHE_FRAMES + NEW_FRAMES
+    total_frames = CACHE_FRAMES + stream_steps * NEW_FRAMES
     backbone = build_model(
         device, total_frames, args.fps, args.img_size, str(args.checkpoint), no_predictor=True
     )
@@ -393,7 +488,14 @@ def main():
     for p in clf.parameters():
         p.requires_grad = True
 
-    bundle = JointBundle(backbone, clf, chunk=args.chunk).to(device)
+    bundle = JointBundle(
+        backbone,
+        clf,
+        chunk=args.chunk,
+        stream_steps=stream_steps,
+        protect_hist=protect_hist,
+        protect_k_frames=protect_k,
+    ).to(device)
     if args.rope:
         bundle.enable_rope(True, only_block0=only_block0)
         if is_main:
@@ -406,11 +508,11 @@ def main():
 
     train_ds = ClipAnticipationDataset(
         args.train_csv, args.video_root, horizon_sec=horizon, model_fps=args.fps,
-        img_size=args.img_size, max_samples=args.max_train,
+        img_size=args.img_size, n_model=total_frames, max_samples=args.max_train,
     )
     val_ds = ClipAnticipationDataset(
         args.val_csv, args.video_root, horizon_sec=horizon, model_fps=args.fps,
-        img_size=args.img_size, max_samples=args.max_val,
+        img_size=args.img_size, n_model=total_frames, max_samples=args.max_val,
     )
     train_samp = DistributedSampler(train_ds, num_replicas=world, rank=rank, shuffle=True)
     val_samp = DistributedSampler(val_ds, num_replicas=world, rank=rank, shuffle=False)
@@ -586,6 +688,13 @@ def main():
             "rope_scope": (
                 "probe_blocks[0]" if (args.rope and only_block0)
                 else ("probe_all_self_attn" if args.rope else "off")
+            ),
+            "stream_steps": stream_steps,
+            "protect_hist": protect_hist,
+            "protect_k_frames": protect_k,
+            "prune": (
+                f"attn_protect hist={protect_hist} k_frames={protect_k}"
+                if protect_hist > 0 else "attn"
             ),
             "backbone": "vit_large / ViT-L/16 @256",
             "checkpoint": str(args.checkpoint),

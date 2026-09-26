@@ -29,7 +29,7 @@ import torch.nn.functional as F
 
 from src.models.utils.modules import rotate_queries_or_keys
 
-PruneMode = Literal["attn", "fifo"]
+PruneMode = Literal["attn", "fifo", "attn_protect"]
 
 CACHE_FRAMES = 128
 NEW_FRAMES = 34
@@ -116,6 +116,81 @@ def keep_and_drop_from_slots(
     mask = torch.ones(b, n_tok, dtype=torch.bool, device=slot_scores.device)
     mask.scatter_(1, keep_tok, False)
     drop_tok = mask.nonzero(as_tuple=False)[:, 1].view(b, n_tok - keep_tok.size(1))
+    return keep_tok, drop_tok
+
+
+def topk_slot_ids_from_scores(
+    slot_scores: torch.Tensor, slot_ids: torch.Tensor, k_slots: int
+) -> torch.Tensor:
+    """Return absolute ``slot_ids`` of the top-``k_slots`` scored slots. [B, k]."""
+    k = min(int(k_slots), int(slot_scores.size(1)))
+    if k <= 0:
+        return slot_ids.new_zeros((slot_scores.size(0), 0))
+    idx = slot_scores.topk(k, dim=1).indices
+    return slot_ids.gather(1, idx)
+
+
+def keep_and_drop_with_topk_protect(
+    slot_scores: torch.Tensor,
+    slot_ids: torch.Tensor,
+    drop_slots: int,
+    gp: int,
+    protected_ids: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Drop ``drop_slots`` by ascending score, skipping Top-K history protect ids.
+
+    Walk score order (low → high). A slot whose absolute ``slot_id`` appears in
+    ``protected_ids`` [B, P] is skipped. Continue until ``drop_slots`` are chosen.
+    If protect covers too many slots, fall back to dropping the lowest remaining
+    (including protected) so the cache size stays exact.
+    """
+    b, n_slots = slot_scores.shape
+    drop_slots = int(drop_slots)
+    if drop_slots <= 0:
+        keep_s = torch.arange(n_slots, device=slot_scores.device).unsqueeze(0).expand(b, -1)
+        spatial = torch.arange(gp, device=slot_scores.device)
+        keep_tok = (keep_s.unsqueeze(-1) * gp + spatial).reshape(b, -1)
+        drop_tok = slot_scores.new_zeros((b, 0), dtype=torch.long)
+        return keep_tok, drop_tok
+    if drop_slots > n_slots:
+        raise ValueError(f"drop_slots={drop_slots} > n_slots={n_slots}")
+
+    # ascending score order (lowest importance first)
+    order = torch.argsort(slot_scores, dim=1, descending=False, stable=True)
+    protected = torch.zeros(b, n_slots, dtype=torch.bool, device=slot_scores.device)
+    if protected_ids is not None and protected_ids.numel() > 0:
+        # slot_ids[b,s] in protected_ids[b] → protect column s
+        prot = protected_ids.unsqueeze(1)  # [B,1,P]
+        protected = (slot_ids.unsqueeze(-1) == prot).any(dim=-1)  # [B,S]
+
+    drop_local = torch.empty(b, drop_slots, device=slot_scores.device, dtype=torch.long)
+    for bi in range(b):
+        chosen: list[int] = []
+        # pass 1: unprotected only
+        for j in order[bi].tolist():
+            if len(chosen) >= drop_slots:
+                break
+            if not bool(protected[bi, j]):
+                chosen.append(int(j))
+        # pass 2: if still short, take lowest remaining (may break protect)
+        if len(chosen) < drop_slots:
+            chosen_set = set(chosen)
+            for j in order[bi].tolist():
+                if len(chosen) >= drop_slots:
+                    break
+                jj = int(j)
+                if jj not in chosen_set:
+                    chosen.append(jj)
+                    chosen_set.add(jj)
+        drop_local[bi] = torch.tensor(chosen[:drop_slots], device=slot_scores.device, dtype=torch.long)
+
+    keep_mask = torch.ones(b, n_slots, dtype=torch.bool, device=slot_scores.device)
+    keep_mask.scatter_(1, drop_local, False)
+    keep_s = keep_mask.nonzero(as_tuple=False)[:, 1].view(b, n_slots - drop_slots)
+    keep_s = keep_s.sort(dim=1).values
+    spatial = torch.arange(gp, device=slot_scores.device)
+    keep_tok = (keep_s.unsqueeze(-1) * gp + spatial).reshape(b, -1)
+    drop_tok = (drop_local.unsqueeze(-1) * gp + spatial).reshape(b, -1)
     return keep_tok, drop_tok
 
 
@@ -562,6 +637,7 @@ class StreamKVAttnPruneEncoder:
         state: StreamKVState,
         mode: PruneMode,
         slot_scores: torch.Tensor | None = None,
+        protected_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         n_tok = state.tokens.size(1)
         drop_tok_n = self.drop_slots * self.gp
@@ -572,6 +648,14 @@ class StreamKVAttnPruneEncoder:
             raise ValueError(
                 f"slot_scores {tuple(scores.shape)} != slot_ids {tuple(state.slot_ids.shape)}"
             )
+        if mode == "attn_protect":
+            return keep_and_drop_with_topk_protect(
+                scores,
+                state.slot_ids,
+                self.drop_slots,
+                self.gp,
+                protected_ids=protected_ids,
+            )
         return keep_and_drop_from_slots(scores, self.keep_slots, self.gp)
 
     def step(
@@ -580,19 +664,24 @@ class StreamKVAttnPruneEncoder:
         clips_new: torch.Tensor,
         mode: PruneMode = "attn",
         slot_scores: torch.Tensor | None = None,
+        protected_ids: torch.Tensor | None = None,
         *,
         refresh_scores: bool = True,
     ) -> StreamKVState:
         """Admit ``new_frames``. If ``slot_scores`` is set (e.g. probe blk0 from the
         previous probe pass), use them to drop 34 frames; else encoder last-block
-        scores on ``state`` (legacy). After encode, ``state.slot_scores`` is
-        refreshed with encoder scores unless ``refresh_scores=False`` (joint /
-        probe-score path — avoids a large QK softmax on the packed window).
+        scores on ``state`` (legacy). ``mode="attn_protect"`` skips slots whose
+        absolute ids appear in ``protected_ids`` (Top-K history) while walking
+        scores low→high until ``drop_slots`` are filled. After encode,
+        ``state.slot_scores`` is refreshed with encoder scores unless
+        ``refresh_scores=False`` (joint / probe-score path).
         """
         if clips_new.size(2) != self.new_frames:
             raise ValueError(f"step expects T={self.new_frames}, got {clips_new.size(2)}")
         b = clips_new.size(0)
-        keep_tok, _drop_tok = self._select(state, mode, slot_scores=slot_scores)
+        keep_tok, _drop_tok = self._select(
+            state, mode, slot_scores=slot_scores, protected_ids=protected_ids
+        )
         old_tok = gather_tokens(state.tokens, keep_tok)
         cache_k = gather_kv(state.cache_k, keep_tok)
         cache_v = gather_kv(state.cache_v, keep_tok)

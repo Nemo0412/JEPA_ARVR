@@ -122,6 +122,25 @@ Compare arms by **epoch** (or align step × `global_batch/2`).
 - Early encoder blocks: forward under `no_grad` (memory)
 - No predictor / no encoder QK score refresh (probe scores drive prune)
 
+## Next: rope_all + Top-K history protect prune
+
+On top of **rope_all**, change the drop rule only:
+
+1. Each tick: score probe-blk0 importance on the packed **128**, sort, record Top-K
+   absolute slot ids (`K=34` frames → 17 slots).
+2. Next tick: drop 34 frames by walking scores low→high, **skipping** ids that were
+   Top-K in either of the **previous 2** score passes (`protect_hist=2`).
+
+Running recipe: `--stream-steps 3 --protect-hist 2 --protect-k 34`
+(`T=128+3×34=230`; probe always sees 128). Cold start `vitl.pt`. Compare to
+`joint_2s_rope_all/` (best **35.59%** @ep7).
+
+```bash
+bash scripts/run_local_kvprune_joint_2s_rope_all_protect.sh
+# out: .../joint_2s_rope_all_protectk34_h2_s3/
+# log: .../logs/kvprune_joint_2s_rope_all_protect.log
+```
+
 ## CLI cheat sheet
 
 ```bash
@@ -130,11 +149,15 @@ scripts/run_local_kvprune_joint_2s.py \
   --horizon {2|6} \
   --rope {0|1} \
   --only-block0 {0|1} \   # 0 = all probe blocks (default); 1 = blocks[0] only
+  --stream-steps N \      # T=128+N*34; default 1 (same as rope_all)
+  --protect-hist H \      # 0=off; >0 enable Top-K history protect
+  --protect-k 34 \        # Top-K size in frames
   --out-dir /mnt/hdd/datasets/HD-EPIC/experiments/kvprune_joint_{H}s \
   --epochs 8 --batch-size 1
 ```
 
-Tag → out subdir: `joint_{H}s_norope` / `joint_{H}s_rope` / `joint_{H}s_rope_all`.
+Tag → out subdir: `joint_{H}s_norope` / `joint_{H}s_rope` / `joint_{H}s_rope_all` /
+`joint_{H}s_rope_all_protectk34_h2_s3`.
 
 ## Deferred: 6s
 

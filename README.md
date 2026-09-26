@@ -33,10 +33,12 @@ Stream **128-frame KV** + probe-blk0 prune (drop 34 / keep 94 / +new 34 → alwa
 |---|---|---:|
 | No RoPE | 2 GPU, `--rope 0` | **31.59%** @ep8 |
 | RoPE blk0 | 2 GPU, `--rope 1 --only-block0 1` | **31.44%** @ep7 |
-| RoPE all blocks | 4 GPU, `--rope 1 --only-block0 0` (after above) | running |
+| RoPE all blocks | 4 GPU, `--rope 1 --only-block0 0` (after above) | **35.59%** @ep7 |
+| RoPE all + protect prune | 4 GPU, `--protect-hist 2 --protect-k 34 --stream-steps 3` | running |
 
 Full paths, launch commands, and protocol → [`docs/KVPRUNE_JOINT.md`](docs/KVPRUNE_JOINT.md).
 Queue helper for the 4-GPU arm: `scripts/run_local_kvprune_joint_2s_rope_all.sh`.
+Protect-prune arm: `scripts/run_local_kvprune_joint_2s_rope_all_protect.sh`.
 
 ---
 
