@@ -26,6 +26,7 @@ import csv
 import json
 import logging
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -36,7 +37,51 @@ import torch.distributed as dist
 import torch.nn as nn
 from decord import VideoReader, cpu
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
+
+
+class _IndicesSampler(Sampler[int]):
+    """Fixed index list (used to skip already-finished iters within an epoch)."""
+
+    def __init__(self, indices: list[int]):
+        self.indices = list(indices)
+
+    def __iter__(self):
+        return iter(self.indices)
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+
+def _last_csv_iter(path: Path) -> int | None:
+    """Best-effort next-iter hint from loss_steps.csv.
+
+    Prefer max(iter)+1 over the final row: a short failed relaunch can append a
+    low-iter tail after a long mid-epoch run.
+    """
+    if not path.is_file():
+        return None
+    try:
+        max_it = -1
+        last_it = -1
+        with path.open("r", newline="") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames or "iter" not in reader.fieldnames:
+                return None
+            for row in reader:
+                try:
+                    it = int(float(row["iter"]))
+                except (TypeError, ValueError, KeyError):
+                    continue
+                last_it = it
+                if it > max_it:
+                    max_it = it
+        if max_it < 0:
+            return None
+        # If the file ends in a restarted prefix, use the historical high-water mark.
+        return max_it if (last_it >= 0 and last_it + 500 < max_it) else last_it
+    except Exception:
+        return None
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 VJEPA_ROOT = Path(os.environ.get("VJEPA_ROOT", str(PROJECT_ROOT / "vjepa2")))
@@ -178,6 +223,16 @@ def normalize_clip(clip_uint8: torch.Tensor, device) -> torch.Tensor:
     return clips.sub_(IMAGENET_MEAN.to(device)).div_(IMAGENET_STD.to(device))
 
 
+def encode_clip(encoder: nn.Module, clips: torch.Tensor, embed_dim: int) -> torch.Tensor:
+    """Full-attention encode. All tokens go to the probe; no stream KV cache."""
+    tok = encoder(clips)
+    if isinstance(tok, (tuple, list)):
+        tok = tok[0]
+    if tok.size(-1) != embed_dim:
+        tok = tok[:, :, -embed_dim:]
+    return tok
+
+
 def encode_joint(
     stream: StreamKVAttnPruneEncoder,
     pooler: nn.Module,
@@ -188,6 +243,7 @@ def encode_joint(
     stream_steps: int = 1,
     protect_hist: int = 0,
     protect_k_frames: int = 34,
+    self_only: bool = False,
 ):
     """Trainable encode with detached probe-blk0 prune scores (discrete topk).
 
@@ -195,6 +251,9 @@ def encode_joint(
     (``T = 128 + stream_steps*34``). When ``protect_hist>0``, each prune walks
     scores low→high but skips slots that were Top-K (``protect_k_frames`` /
     tubelet) in any of the previous ``protect_hist`` probe-score passes.
+
+    self_only: the new 34 frames attend only to themselves. Their tokens are
+    concatenated with the kept 94 and that pack is what the probe sees.
     """
     expected_t = CACHE_FRAMES + int(stream_steps) * NEW_FRAMES
     if clips.size(2) != expected_t:
@@ -228,6 +287,7 @@ def encode_joint(
             slot_scores=scores,
             protected_ids=protected_ids,
             refresh_scores=False,
+            self_only=self_only,
         )
         if use_protect:
             topk_hist.append(cur_topk)
@@ -237,6 +297,16 @@ def encode_joint(
         tok = tok[:, :, -embed_dim:]
     frame_ids = token_frame_ids_from_slots(state.slot_ids, stream.gp)
     return tok, frame_ids
+
+
+def positions_rel_to_pred(frame_ids: torch.Tensor, horizon_slots: float) -> torch.Tensor:
+    """Slots from each token until the labeled action.
+
+    newest observed slot is horizon_slots before the label. Cross-attn queries
+    stay at position 0 (unrotated), so their offset to a frame is this value.
+    """
+    newest = frame_ids.amax(dim=1, keepdim=True)
+    return (newest - frame_ids) + float(horizon_slots)
 
 
 class JointBundle(nn.Module):
@@ -251,6 +321,8 @@ class JointBundle(nn.Module):
         stream_steps: int = 1,
         protect_hist: int = 0,
         protect_k_frames: int = 34,
+        no_kv: bool = False,
+        self_only: bool = False,
     ):
         super().__init__()
         self.backbone = backbone
@@ -259,38 +331,53 @@ class JointBundle(nn.Module):
         self.stream_steps = int(stream_steps)
         self.protect_hist = int(protect_hist)
         self.protect_k_frames = int(protect_k_frames)
-        self.stream = StreamKVAttnPruneEncoder(
-            backbone.encoder,
-            gp=int(backbone.grid_size) ** 2,
-            tubelet_size=2,
-            cache_frames=CACHE_FRAMES,
-            new_frames=NEW_FRAMES,
-            chunk=self.chunk,
-        )
+        self.no_kv = bool(no_kv)
+        self.self_only = bool(self_only)
+        self.stream = None
+        if not self.no_kv:
+            self.stream = StreamKVAttnPruneEncoder(
+                backbone.encoder,
+                gp=int(backbone.grid_size) ** 2,
+                tubelet_size=2,
+                cache_frames=CACHE_FRAMES,
+                new_frames=NEW_FRAMES,
+                chunk=self.chunk,
+            )
         self._rope: ProbeTemporalRoPE | None = None
 
-    def enable_rope(self, enabled: bool, *, only_block0: bool = False):
+    def enable_rope(self, enabled: bool, *, only_block0: bool = False, cross_attn_k: bool = False):
         if self._rope is not None:
             self._rope.remove()
             self._rope = None
         if enabled:
             self._rope = ProbeTemporalRoPE(
                 self.clf.pooler,
-                rope_cross_attn_k=False,
+                rope_cross_attn_k=bool(cross_attn_k),
                 only_block0=bool(only_block0),
             )
 
     def forward(self, clips: torch.Tensor):
-        tok, frame_ids = encode_joint(
-            self.stream,
-            self.clf.pooler,
-            clips,
-            int(self.backbone.embed_dim),
-            self.chunk,
-            stream_steps=self.stream_steps,
-            protect_hist=self.protect_hist,
-            protect_k_frames=self.protect_k_frames,
-        )
+        if self.no_kv:
+            tok = encode_clip(self.backbone.encoder, clips, int(self.backbone.embed_dim))
+            frame_ids = None
+        else:
+            tok, frame_ids = encode_joint(
+                self.stream,
+                self.clf.pooler,
+                clips,
+                int(self.backbone.embed_dim),
+                self.chunk,
+                stream_steps=self.stream_steps,
+                protect_hist=self.protect_hist,
+                protect_k_frames=self.protect_k_frames,
+                self_only=self.self_only,
+            )
+        if self._rope is not None and self.rope_time == "relpred":
+            if self.stream is None:
+                raise RuntimeError("relpred RoPE needs stream slot ids")
+            tubelet = float(self.stream.tubelet_size)
+            horizon_slots = float(self.horizon_sec) * float(self.model_fps) / tubelet
+            frame_ids = positions_rel_to_pred(frame_ids, horizon_slots)
         if self._rope is not None:
             self._rope.set_frame_ids(frame_ids)
         try:
@@ -365,6 +452,26 @@ def main():
         help="Defaults to .../experiments/kvprune_joint_{horizon}s",
     )
     ap.add_argument("--horizon", type=float, default=2.0, help="Anticipation horizon in seconds")
+    ap.add_argument(
+        "--no-kv",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="1 = full-attention encode of --frames, tokens go straight to the probe",
+    )
+    ap.add_argument(
+        "--frames",
+        type=int,
+        default=0,
+        help="Input frames when --no-kv 1 (must be a multiple of tubelet size 2)",
+    )
+    ap.add_argument(
+        "--new-self-only",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="1 = new 34 frames self-attend only, then concat with the kept 94 for the probe",
+    )
     ap.add_argument("--rope", type=int, default=1, choices=[0, 1])
     ap.add_argument(
         "--only-block0",
@@ -391,6 +498,13 @@ def main():
         default=34,
         help="Top-K size in frames for protect history (tubelet-aligned; default 34)",
     )
+    ap.add_argument(
+        "--rope-time",
+        choices=("abs", "relpred"),
+        default="abs",
+        help="abs = slot index in the observed stream. "
+        "relpred = slots until the labeled action; cross-attn K uses that distance, query stays at 0.",
+    )
     ap.add_argument("--max-train", type=int, default=0, help="0 = full train split")
     ap.add_argument("--max-val", type=int, default=0, help="0 = full val split")
     ap.add_argument("--epochs", type=int, default=8)
@@ -398,6 +512,12 @@ def main():
     ap.add_argument("--lora-lr-mult", type=float, default=0.5)
     ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument(
+        "--val-num-workers",
+        type=int,
+        default=-1,
+        help="Val DataLoader workers; -1 = same as --num-workers (was num_workers//2)",
+    )
     ap.add_argument("--img-size", type=int, default=256)
     ap.add_argument("--fps", type=int, default=8)
     ap.add_argument("--chunk", type=int, default=256)
@@ -406,10 +526,30 @@ def main():
     ap.add_argument("--lora-rank", type=int, default=8)
     ap.add_argument("--lora-alpha", type=float, default=16.0)
     ap.add_argument("--log-every", type=int, default=20)
+    ap.add_argument(
+        "--ckpt-every",
+        type=int,
+        default=2000,
+        help="Save latest.pt every N optimizer steps (0 = epoch-end / signal only)",
+    )
     ap.add_argument("--val-every-epochs", type=int, default=1)
     ap.add_argument("--patience", type=int, default=3)
+    ap.add_argument(
+        "--resume",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="1 = resume from out_dir/latest.pt when present (weights + epoch)",
+    )
     args = ap.parse_args()
 
+    if args.no_kv and args.new_self_only:
+        raise SystemExit("--new-self-only is the KV prune path, not --no-kv")
+    if args.no_kv:
+        if args.frames <= 0 or args.frames % 2 != 0:
+            raise SystemExit("--no-kv 1 requires --frames > 0 and a multiple of 2")
+        if args.rope:
+            raise SystemExit("--no-kv does not combine with --rope 1")
     horizon = float(args.horizon)
     only_block0 = bool(args.only_block0)
     if args.out_dir is None:
@@ -425,24 +565,35 @@ def main():
     protect_k = max(0, int(args.protect_k))
 
     hz_tag = int(horizon) if horizon == int(horizon) else horizon
-    tag = "rope" if args.rope else "norope"
-    if args.rope and only_block0:
-        tag = "rope_blk0"
-    elif args.rope:
-        tag = "rope_all"
-    if protect_hist > 0:
-        tag = f"{tag}_protectk{protect_k}_h{protect_hist}"
-    if stream_steps != 1:
-        tag = f"{tag}_s{stream_steps}"
-    out_dir = args.out_dir / f"joint_{hz_tag}s_{tag}"
+    if args.no_kv or args.new_self_only:
+        # --out-dir is already the run root (nokv clip, or self-only 34+94).
+        tag = f"nokv_f{int(args.frames)}" if args.no_kv else "self34"
+        out_dir = args.out_dir
+    else:
+        tag = "rope" if args.rope else "norope"
+        if args.rope and only_block0:
+            tag = "rope_blk0"
+        elif args.rope:
+            tag = "rope_all"
+        if args.rope and args.rope_time == "relpred":
+            tag = f"{tag}_relpred"
+        if protect_hist > 0:
+            tag = f"{tag}_protectk{protect_k}_h{protect_hist}"
+        if stream_steps != 1:
+            tag = f"{tag}_s{stream_steps}"
+        out_dir = args.out_dir / f"joint_{hz_tag}s_{tag}"
     if is_main:
         out_dir.mkdir(parents=True, exist_ok=True)
         logger.info(
-            "joint encoder-LoRA+probe  horizon=%.1fs rope=%s only_block0=%s "
-            "stream_steps=%d protect_hist=%d protect_k=%d world=%d out=%s",
-            horizon, bool(args.rope), only_block0,
+            "%s encoder-LoRA+probe  horizon=%.1fs probe_rope=%s only_block0=%s no_kv=%s self_only=%s "
+            "frames=%s stream_steps=%d protect_hist=%d protect_k=%d world=%d out=%s",
+            "nokv clip" if args.no_kv else ("self34" if args.new_self_only else "joint"),
+            horizon, bool(args.rope), only_block0, bool(args.no_kv), bool(args.new_self_only),
+            int(args.frames) if args.no_kv else CACHE_FRAMES + stream_steps * NEW_FRAMES,
             stream_steps, protect_hist, protect_k, world, out_dir,
         )
+        if args.new_self_only:
+            logger.info("new 34 frames: encoder self-attn only; concat kept 94 → probe")
         if protect_hist > 0 and stream_steps < 2:
             logger.warning(
                 "protect_hist=%d with stream_steps=1: Top-K history is empty on "
@@ -455,7 +606,7 @@ def main():
     if is_main:
         logger.info("classes v=%d n=%d a=%d", len(verb_map), len(noun_map), len(action_map))
 
-    total_frames = CACHE_FRAMES + stream_steps * NEW_FRAMES
+    total_frames = int(args.frames) if args.no_kv else CACHE_FRAMES + stream_steps * NEW_FRAMES
     backbone = build_model(
         device, total_frames, args.fps, args.img_size, str(args.checkpoint), no_predictor=True
     )
@@ -495,14 +646,23 @@ def main():
         stream_steps=stream_steps,
         protect_hist=protect_hist,
         protect_k_frames=protect_k,
+        no_kv=bool(args.no_kv),
+        self_only=bool(args.new_self_only),
     ).to(device)
+    bundle.rope_time = str(args.rope_time)
+    bundle.horizon_sec = float(horizon)
+    bundle.model_fps = float(args.fps)
     if args.rope:
-        bundle.enable_rope(True, only_block0=only_block0)
+        relpred = args.rope_time == "relpred"
+        bundle.enable_rope(True, only_block0=only_block0, cross_attn_k=relpred)
         if is_main:
             logger.info(
-                "Probe temporal RoPE ON  scope=%s",
+                "Probe temporal RoPE ON  scope=%s time=%s",
                 "blocks[0] only" if only_block0 else "all self-attn blocks",
+                args.rope_time,
             )
+    elif is_main:
+        logger.info("Probe temporal RoPE OFF")
     bundle = DDP(bundle, device_ids=[local], find_unused_parameters=True)
     raw = bundle.module
 
@@ -520,9 +680,10 @@ def main():
         train_ds, batch_size=args.batch_size, sampler=train_samp,
         num_workers=args.num_workers, collate_fn=collate, pin_memory=False,
     )
+    val_workers = args.num_workers if args.val_num_workers < 0 else args.val_num_workers
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, sampler=val_samp,
-        num_workers=max(1, args.num_workers // 2), collate_fn=collate, pin_memory=False,
+        num_workers=max(1, val_workers), collate_fn=collate, pin_memory=False,
     )
 
     lora_params = [p for n, p in raw.backbone.named_parameters() if p.requires_grad]
@@ -542,13 +703,81 @@ def main():
     history = []
     t_run = time.time()
     global_step = 0
+    start_ep = 0
+    start_iter = 0
+    partial_resume = False
+    resume_loss_meter = 0.0
+    resume_n_step = 0
     loss_steps_path = out_dir / "loss_steps.csv"
     loss_epoch_path = out_dir / "loss_epoch.csv"
+    latest_path = out_dir / "latest.pt"
     loss_steps_f = None
     loss_steps_w = None
-    loss_epoch_w = None
+
+    resume_ck = None
+    if args.resume:
+        for cand in (latest_path, out_dir / "best.pt"):
+            if cand.is_file():
+                resume_ck = cand
+                break
+    if resume_ck is not None:
+        ck = torch.load(resume_ck, map_location="cpu", weights_only=False)
+        raw.clf.load_state_dict(ck["probe"], strict=False)
+        raw.backbone.load_state_dict(ck["backbone"], strict=False)
+        if ck.get("opt") is not None:
+            try:
+                opt.load_state_dict(ck["opt"])
+            except Exception as exc:
+                if is_main:
+                    logger.warning("opt state not loaded (%s); fresh AdamW", exc)
+        if ck.get("scaler") is not None:
+            try:
+                scaler.load_state_dict(ck["scaler"])
+            except Exception:
+                pass
+        # epoch = next start_ep (completed epochs if saved at epoch end; in-progress ep if mid-save)
+        start_ep = int(ck.get("epoch", 0))
+        best_top5 = float(ck.get("best_top5", -1.0))
+        global_step = int(ck.get("global_step", 0))
+        history = list(ck.get("history", []))
+        partial_resume = bool(ck.get("partial", False))
+        start_iter = int(ck.get("resume_iter", 0)) if partial_resume else 0
+        resume_loss_meter = float(ck.get("loss_meter", 0.0)) if partial_resume else 0.0
+        resume_n_step = int(ck.get("n_step", 0)) if partial_resume else 0
+        ck_world = int(ck.get("world_size", 0) or 0)
+        # Old ckpts lack resume_iter: infer next iter from CSV so we don't rescan from 0.
+        if partial_resume and start_iter <= 0:
+            inferred = 0
+            if is_main:
+                last_it = _last_csv_iter(loss_steps_path)
+                if last_it is not None:
+                    inferred = int(last_it) + 1
+                    logger.info("inferred resume_iter=%d from %s", inferred, loss_steps_path.name)
+            t_inf = torch.tensor([inferred], device=device, dtype=torch.long)
+            dist.broadcast(t_inf, src=0)
+            start_iter = int(t_inf.item())
+        # DDP shard changes with world size — old resume_iter is not transferable.
+        if partial_resume and ck_world and ck_world != world and start_iter > 0:
+            if is_main:
+                logger.warning(
+                    "world_size %d→%d: dropping resume_iter=%d (restart this epoch data; weights kept)",
+                    ck_world, world, start_iter,
+                )
+            start_iter = 0
+            resume_loss_meter = 0.0
+            resume_n_step = 0
+        if is_main:
+            logger.info(
+                "resumed %s start_ep=%d/%d start_iter=%d best_top5=%.2f step=%d partial=%s world=%d",
+                resume_ck, start_ep, args.epochs, start_iter, best_top5, global_step,
+                partial_resume, world,
+            )
+
     if is_main:
-        loss_steps_f = loss_steps_path.open("w", newline="")
+        # Append whenever we resume so mid-epoch wall hits don't wipe curves.
+        steps_mode = "a" if (resume_ck is not None and loss_steps_path.is_file()) else "w"
+        epoch_mode = "a" if (resume_ck is not None and loss_epoch_path.is_file()) else "w"
+        loss_steps_f = loss_steps_path.open(steps_mode, newline="")
         loss_steps_w = csv.DictWriter(
             loss_steps_f,
             fieldnames=[
@@ -556,26 +785,120 @@ def main():
                 "valid", "wall_sec",
             ],
         )
-        loss_steps_w.writeheader()
-        loss_steps_f.flush()
-        with loss_epoch_path.open("w", newline="") as ef:
-            loss_epoch_w = csv.DictWriter(
-                ef,
-                fieldnames=[
-                    "epoch", "train_loss", "val_top5", "val_top1", "val_n", "ep_sec", "wall_sec",
-                ],
-            )
-            loss_epoch_w.writeheader()
-        logger.info("loss curves → %s  %s", loss_steps_path, loss_epoch_path)
+        if steps_mode == "w":
+            loss_steps_w.writeheader()
+            loss_steps_f.flush()
+        if epoch_mode == "w":
+            with loss_epoch_path.open("w", newline="") as ef:
+                csv.DictWriter(
+                    ef,
+                    fieldnames=[
+                        "epoch", "train_loss", "val_top5", "val_top1", "val_n", "ep_sec", "wall_sec",
+                    ],
+                ).writeheader()
+        logger.info(
+            "loss curves → %s  %s start_ep=%d start_iter=%d ckpt_every=%d",
+            loss_steps_path, loss_epoch_path, start_ep, start_iter, args.ckpt_every,
+        )
 
+    def _trainable_sd(module: nn.Module) -> dict:
+        # Full backbone ~600MB; trainable LoRA+probe is tiny — keeps wall-save cheap.
+        return {n: p.detach().cpu() for n, p in module.named_parameters() if p.requires_grad}
+
+    def _save_ckpt(
+        resume_epoch: int,
+        *,
+        is_best: bool = False,
+        partial: bool = False,
+        resume_iter: int = 0,
+        loss_meter_v: float = 0.0,
+        n_step_v: int = 0,
+    ):
+        """Write latest.pt. resume_epoch/iter are where the next launch should continue."""
+        if not is_main:
+            return
+        payload = {
+            "epoch": resume_epoch,
+            "partial": partial,
+            "resume_iter": int(resume_iter) if partial else 0,
+            "loss_meter": float(loss_meter_v) if partial else 0.0,
+            "n_step": int(n_step_v) if partial else 0,
+            "world_size": int(world),
+            "probe": _trainable_sd(raw.clf),
+            "backbone": _trainable_sd(raw.backbone),
+            "opt": opt.state_dict(),
+            "scaler": scaler.state_dict(),
+            "best_top5": best_top5,
+            "global_step": global_step,
+            "history": history,
+            "rope": bool(args.rope),
+            "horizon": horizon,
+            "only_block0": only_block0,
+            "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+        }
+        tmp = latest_path.with_suffix(".pt.tmp")
+        torch.save(payload, tmp)
+        os.replace(tmp, latest_path)
+        if is_best:
+            tmp_b = out_dir / "best.pt.tmp"
+            torch.save(payload, tmp_b)
+            os.replace(tmp_b, out_dir / "best.pt")
+        logger.info(
+            "saved %s ep=%d iter=%d step=%d partial=%s best=%s",
+            latest_path.name, resume_epoch, int(resume_iter) if partial else 0,
+            global_step, partial, is_best,
+        )
+
+    stop_flag = {"stop": False}
+
+    def _on_signal(signum, _frame):
+        if not stop_flag["stop"] and is_main:
+            logger.warning("signal %s — checkpoint after this step then exit", signum)
+        stop_flag["stop"] = True
+
+    # Slurm USR1@120 → bash TERM on torchrun; also catch INT for manual stops.
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+
+    early_stop = False
     try:
-        for ep in range(args.epochs):
+        for ep in range(start_ep, args.epochs):
+            if stop_flag["stop"]:
+                break
             train_samp.set_epoch(ep)
+            # Materialize this epoch's shuffle once, then drop already-done prefix.
+            ep_indices = list(train_samp)
+            skip = int(start_iter) if ep == start_ep else 0
+            if skip < 0:
+                skip = 0
+            if skip > len(ep_indices):
+                skip = len(ep_indices)
+            if ep == start_ep:
+                start_iter = 0  # consume; later epochs start at 0
+            if skip and is_main:
+                logger.info(
+                    "ep%d: skipping first %d/%d iters (resume mid-epoch, no data replay)",
+                    ep, skip, len(ep_indices),
+                )
+            ep_loader = DataLoader(
+                train_ds,
+                batch_size=args.batch_size,
+                sampler=_IndicesSampler(ep_indices[skip:]),
+                num_workers=args.num_workers,
+                collate_fn=collate,
+                pin_memory=False,
+            )
             bundle.train()
-            loss_meter = 0.0
-            n_step = 0
+            if ep == start_ep and partial_resume:
+                loss_meter = float(resume_loss_meter)
+                n_step = int(resume_n_step)
+                partial_resume = False
+            else:
+                loss_meter = 0.0
+                n_step = 0
             t_ep = time.time()
-            for it, batch in enumerate(train_loader):
+            for local_i, batch in enumerate(ep_loader):
+                it = skip + local_i
                 clips = normalize_clip(batch["clip"], device)
                 opt.zero_grad(set_to_none=True)
                 with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -625,6 +948,37 @@ def main():
                             ep, it, global_step,
                             loss_val if valid else float("nan"), avg,
                         )
+
+                do_periodic = (
+                    is_main
+                    and args.ckpt_every > 0
+                    and global_step > 0
+                    and global_step % args.ckpt_every == 0
+                )
+                if do_periodic:
+                    # Next launch continues at it+1 (same ep shuffle via set_epoch).
+                    _save_ckpt(
+                        ep, is_best=False, partial=True, resume_iter=it + 1,
+                        loss_meter_v=loss_meter, n_step_v=n_step,
+                    )
+                    loss_steps_f.flush()
+
+                if stop_flag["stop"]:
+                    if is_main:
+                        _save_ckpt(
+                            ep, is_best=False, partial=True, resume_iter=it + 1,
+                            loss_meter_v=loss_meter, n_step_v=n_step,
+                        )
+                        loss_steps_f.flush()
+                        logger.warning(
+                            "exiting after signal save @ ep=%d iter=%d step=%d",
+                            ep, it + 1, global_step,
+                        )
+                    break
+
+            if stop_flag["stop"]:
+                break
+
             stats = torch.tensor([loss_meter, float(n_step)], device=device)
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
             avg_loss = float(stats[0] / max(1.0, float(stats[1])))
@@ -651,30 +1005,35 @@ def main():
                     history.append(row)
                     with loss_epoch_path.open("a", newline="") as ef:
                         csv.DictWriter(ef, fieldnames=list(row.keys())).writerow(row)
-                    if metrics["top5"] > best_top5:
+                    is_best = metrics["top5"] > best_top5
+                    if is_best:
                         best_top5 = metrics["top5"]
                         bad = 0
-                        ckpt = {
-                            "epoch": ep + 1,
-                            "probe": raw.clf.state_dict(),
-                            "backbone": raw.backbone.state_dict(),
-                            "best_top5": best_top5,
-                            "rope": bool(args.rope),
-                            "horizon": horizon,
-                            "only_block0": only_block0,
-                            "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
-                        }
-                        torch.save(ckpt, out_dir / "best.pt")
-                        logger.info("saved best.pt top5=%.2f", best_top5)
+                        logger.info("new best top5=%.2f", best_top5)
                     else:
                         bad += 1
-                        if bad >= args.patience:
-                            logger.info("early stop patience=%d", args.patience)
-                            break
+                    # Epoch finished → next launch starts at ep+1.
+                    _save_ckpt(ep + 1, is_best=is_best, partial=False)
+                    if args.patience > 0 and bad >= args.patience:
+                        logger.info("early stop patience=%d", args.patience)
+                        early_stop = True
+                        break
+            elif is_main:
+                # Still checkpoint even if val is skipped this epoch.
+                _save_ckpt(ep + 1, is_best=False, partial=False)
+
+            if early_stop:
+                break
     finally:
         if loss_steps_f is not None:
             loss_steps_f.flush()
             loss_steps_f.close()
+
+    if stop_flag["stop"]:
+        # Non-zero so slurm wrapper resubmits; weights already in latest.pt.
+        if dist.is_initialized():
+            dist.barrier()
+        raise SystemExit(75)
 
     if raw._rope is not None:
         raw._rope.remove()
@@ -682,7 +1041,13 @@ def main():
 
     if is_main:
         payload = {
-            "method": f"kvprune_joint_{hz_tag}s",
+            "method": (
+                f"nokv_f{int(args.frames)}_h{hz_tag}s" if args.no_kv
+                else (f"kv_self34_h{hz_tag}s" if args.new_self_only else f"kvprune_joint_{hz_tag}s")
+            ),
+            "no_kv": bool(args.no_kv),
+            "new_self_only": bool(args.new_self_only),
+            "frames": int(args.frames) if args.no_kv else CACHE_FRAMES + NEW_FRAMES,
             "rope": bool(args.rope),
             "only_block0": only_block0 if args.rope else None,
             "rope_scope": (
@@ -696,6 +1061,7 @@ def main():
                 f"attn_protect hist={protect_hist} k_frames={protect_k}"
                 if protect_hist > 0 else "attn"
             ),
+            "rope_time": args.rope_time if args.rope else "off",
             "backbone": "vit_large / ViT-L/16 @256",
             "checkpoint": str(args.checkpoint),
             "trainable": "encoder LoRA last-12 (qkv+proj) + full probe",

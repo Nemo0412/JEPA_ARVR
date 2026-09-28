@@ -557,6 +557,8 @@ class StreamKVAttnPruneEncoder:
         cache_k: list[torch.Tensor],
         cache_v: list[torch.Tensor],
         pos: torch.Tensor,
+        *,
+        use_cache: bool = True,
     ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], torch.Tensor, torch.Tensor]:
         encoder = self.encoder
         gh, gw = self._patch_hw(clips)
@@ -571,16 +573,18 @@ class StreamKVAttnPruneEncoder:
                 if not x.requires_grad:
                     x = x.detach().requires_grad_(True)
                 entered_trainable = True
+            ck = cache_k[li] if use_cache else None
+            cv = cache_v[li] if use_cache else None
             if trainable:
                 x, k, v, q_out, k_out = self._run_block(
                     blk, x, pos, gh, gw,
-                    cache_k_i=cache_k[li], cache_v_i=cache_v[li],
+                    cache_k_i=ck, cache_v_i=cv,
                 )
             else:
                 with torch.no_grad():
                     x, k, v, q_out, k_out = self._run_block(
                         blk, x, pos, gh, gw,
-                        cache_k_i=cache_k[li], cache_v_i=cache_v[li],
+                        cache_k_i=ck, cache_v_i=cv,
                     )
                 k = k.detach()
                 v = v.detach()
@@ -667,6 +671,7 @@ class StreamKVAttnPruneEncoder:
         protected_ids: torch.Tensor | None = None,
         *,
         refresh_scores: bool = True,
+        self_only: bool = False,
     ) -> StreamKVState:
         """Admit ``new_frames``. If ``slot_scores`` is set (e.g. probe blk0 from the
         previous probe pass), use them to drop 34 frames; else encoder last-block
@@ -698,7 +703,7 @@ class StreamKVAttnPruneEncoder:
             device=clips_new.device,
         ).unsqueeze(0).expand(b, -1)
         new_tok, new_k, new_v, last_q_new, last_k_new = self._encode_new(
-            clips_new, cache_k, cache_v, pos_new
+            clips_new, cache_k, cache_v, pos_new, use_cache=not self_only,
         )
         slot_new = torch.arange(
             state.next_slot, state.next_slot + self.drop_slots, device=clips_new.device
