@@ -31,7 +31,7 @@ HORIZON="${HORIZON:-2}"
 case "${HORIZON}" in 2|6) ;; *) echo "ERROR: HORIZON must be 2 or 6" >&2; exit 2 ;; esac
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
-PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
+PROJECT_ROOT="/home/ll5914/Jepa/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
 export VJEPA_ROOT PYTHONUNBUFFERED=1
 export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/scripts:${VJEPA_ROOT}:${PYTHONPATH:-}"

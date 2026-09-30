@@ -27,7 +27,7 @@ set -euo pipefail
 # Warm from concat+CA v2 best 43.92%. Freeze encoder LoRA.
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
-PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
+PROJECT_ROOT="/home/ll5914/Jepa/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
 SCRIPT_PATH="${PROJECT_ROOT}/scripts/submit_b12_concat_plus_cross_attn_v2_jitter_1xh100.slurm"
 

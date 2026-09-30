@@ -30,7 +30,7 @@ set -euo pipefail
 # Train: fusion + predictor LoRA + heads.  Freeze: encoder LoRA + pooler.
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
-PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
+PROJECT_ROOT="/home/ll5914/Jepa/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
 SCRIPT_PATH="${PROJECT_ROOT}/scripts/submit_b12_tri_modal_jointB_deep_keepaux_1xh100.slurm"
 

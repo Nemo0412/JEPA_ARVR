@@ -17,7 +17,7 @@ set -euo pipefail
 # Stage-1 dir must contain best.pt, encoder_lora_best.pt, binary_input_adapter_best.pt.
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
-PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
+PROJECT_ROOT="/home/ll5914/Jepa/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
 EGTEA_ROOT="/scratch/ll5914/datasets/EGTEA"
 # Default to ep5 recovery ckpt (job 12986096 peak). The old gaze_fixed/best.pt was

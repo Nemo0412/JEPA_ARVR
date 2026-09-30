@@ -50,7 +50,7 @@ PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 export MID_EPOCH_SAVE_EVERY="${MID_EPOCH_SAVE_EVERY:-50}"
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
-PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
+PROJECT_ROOT="/home/ll5914/Jepa/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
 SCRIPT_PATH="${PROJECT_ROOT}/scripts/submit_clip_stream_kv_matched_ll5914.slurm"
 export VJEPA_ROOT PYTHONPATH="${PROJECT_ROOT}:${VJEPA_ROOT}:${PYTHONPATH:-}"

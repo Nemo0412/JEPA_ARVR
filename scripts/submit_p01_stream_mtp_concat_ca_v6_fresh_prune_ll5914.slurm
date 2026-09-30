@@ -27,7 +27,7 @@ set -euo pipefail
 # Target: beat video-only 25.88%@2s (v3 was 25.08%).
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
-PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
+PROJECT_ROOT="/home/ll5914/Jepa/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
 SCRIPT_PATH="${PROJECT_ROOT}/scripts/submit_p01_stream_mtp_concat_ca_v6_fresh_prune_ll5914.slurm"
 export VJEPA_ROOT

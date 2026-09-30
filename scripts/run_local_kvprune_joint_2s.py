@@ -175,6 +175,32 @@ class ClipAnticipationDataset(Dataset):
     def __len__(self):
         return len(self.rows)
 
+    def _video_reader(self, path: Path):
+        """Reuse demuxers inside one DataLoader worker.
+
+        Opening a new VideoReader every sample is most of the CPU time after the
+        clips are on node-local disk. Keep only the last two: holding every file
+        open grew until the job was OOM-killed.
+        """
+        cache = getattr(self, "_vr_cache", None)
+        if cache is None:
+            cache = {}
+            self._vr_cache = cache
+            self._vr_order = []
+        key = str(path)
+        vr = cache.get(key)
+        if vr is not None:
+            return vr
+        threads = max(1, int(os.environ.get("DECORD_THREADS", "2")))
+        vr = VideoReader(
+            key, ctx=cpu(0), num_threads=threads, width=self.img_size, height=self.img_size,
+        )
+        cache[key] = vr
+        self._vr_order.append(key)
+        while len(self._vr_order) > 2:
+            cache.pop(self._vr_order.pop(0), None)
+        return vr
+
     def __getitem__(self, idx: int):
         r = self.rows[idx]
         video_id = r["video_id"]
@@ -182,12 +208,9 @@ class ClipAnticipationDataset(Dataset):
         path = self.video_root / pid / f"{video_id}.MP4"
         if not path.is_file():
             path = self.video_root / pid / f"{video_id}.mp4"
-        vr = VideoReader(str(path), ctx=cpu(0), num_threads=1, width=self.img_size, height=self.img_size)
-        try:
-            fi = np.clip(r["frame_idx"], 0, len(vr) - 1)
-            frames = vr.get_batch(fi.tolist()).asnumpy()
-        finally:
-            del vr
+        vr = self._video_reader(path)
+        fi = np.clip(r["frame_idx"], 0, len(vr) - 1)
+        frames = vr.get_batch(fi.tolist()).asnumpy()
         clip = torch.from_numpy(np.ascontiguousarray(frames)).permute(3, 0, 1, 2).contiguous()
         return {
             "clip": clip,
@@ -219,8 +242,21 @@ def build_class_maps(train_csv: Path):
 
 
 def normalize_clip(clip_uint8: torch.Tensor, device) -> torch.Tensor:
-    clips = clip_uint8.to(device, non_blocking=True).float().div_(255.0)
+    non_blocking = clip_uint8.is_pinned()
+    clips = clip_uint8.to(device, non_blocking=non_blocking).float().div_(255.0)
     return clips.sub_(IMAGENET_MEAN.to(device)).div_(IMAGENET_STD.to(device))
+
+
+def loader_kwargs(num_workers: int) -> dict:
+    """Keep decoded batches queued so the GPU is not idle between steps."""
+    kw = {
+        "num_workers": int(num_workers),
+        "collate_fn": collate,
+        "pin_memory": False,
+    }
+    if num_workers > 0:
+        kw["prefetch_factor"] = 2
+    return kw
 
 
 def encode_clip(encoder: nn.Module, clips: torch.Tensor, embed_dim: int) -> torch.Tensor:
@@ -678,13 +714,18 @@ def main():
     val_samp = DistributedSampler(val_ds, num_replicas=world, rank=rank, shuffle=False)
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, sampler=train_samp,
-        num_workers=args.num_workers, collate_fn=collate, pin_memory=False,
+        **loader_kwargs(args.num_workers),
     )
     val_workers = args.num_workers if args.val_num_workers < 0 else args.val_num_workers
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, sampler=val_samp,
-        num_workers=max(1, val_workers), collate_fn=collate, pin_memory=False,
+        **loader_kwargs(max(1, val_workers)),
     )
+    if is_main:
+        logger.info(
+            "dataloader workers=%d prefetch=2 pin_memory=0 decord_threads=%s",
+            args.num_workers, os.environ.get("DECORD_THREADS", "2"),
+        )
 
     lora_params = [p for n, p in raw.backbone.named_parameters() if p.requires_grad]
     probe_params = [p for p in raw.clf.parameters() if p.requires_grad]
@@ -884,9 +925,7 @@ def main():
                 train_ds,
                 batch_size=args.batch_size,
                 sampler=_IndicesSampler(ep_indices[skip:]),
-                num_workers=args.num_workers,
-                collate_fn=collate,
-                pin_memory=False,
+                **loader_kwargs(args.num_workers),
             )
             bundle.train()
             if ep == start_ep and partial_resume:

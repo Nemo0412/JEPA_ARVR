@@ -19,7 +19,7 @@ set -euo pipefail
 # and resubmit the failed RGB+6s job once the dump is complete.
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
-PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
+PROJECT_ROOT="/home/ll5914/Jepa/JEPA_ARVR"
 DOWNLOADER="/scratch/ll5914/datasets/HD-EPIC/hd-epic-downloader"
 DATA_PARENT="/scratch/ll5914/datasets/HD-EPIC"
 HD_EPIC_ROOT="${DATA_PARENT}/HD-EPIC"

@@ -477,7 +477,7 @@ def main():
     out_path = Path(args.out) if args.out else Path(__file__).resolve().parent / "profile_stream_motivation.json"
     # if script under opencl_kernels, parent is opencl; put next to it in scripts/
     if out_path.name == "profile_stream_motivation.json" and "opencl" in str(out_path):
-        out_path = Path("/home/ll5914/Jepa_yifan/JEPA_ARVR/scripts/profile_stream_motivation.json")
+        out_path = Path("/home/ll5914/Jepa/JEPA_ARVR/scripts/profile_stream_motivation.json")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(out, indent=2))
     print(f"wrote {out_path}")

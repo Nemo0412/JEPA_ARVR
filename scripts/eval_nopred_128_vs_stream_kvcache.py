@@ -160,7 +160,7 @@ def main():
         "/scratch/ll5914/experiments/nopred_128_vs_stream_kvcache_10clips"
     ))
     ap.add_argument("--copy-json", type=Path, default=Path(
-        "/home/ll5914/Jepa_yifan/nopred_128_vs_stream_kvcache_10clips.json"
+        "/home/ll5914/Jepa/nopred_128_vs_stream_kvcache_10clips.json"
     ))
     ap.add_argument("--context-sec", type=float, default=16.0)
     ap.add_argument("--require-ctx-sec", type=float, default=10.0)

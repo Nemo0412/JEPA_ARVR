@@ -184,7 +184,7 @@ request_resubmit() {
     cpus="${cpus_min}"
   fi
   # Prefer same GPU count on each partition.
-  for spec in "a100_tandon|gpu:a100:${ng}" "h100_tandon|gpu:h100:${ng}" "h200_tandon|gpu:h200:${ng}"; do
+  for spec in "h100_tandon|gpu:h100:${ng}" "h200_tandon|gpu:h200:${ng}"; do
     IFS='|' read -r part gres <<< "$spec"
     out="$(sbatch --job-name="${SLURM_JOB_NAME:-kvprune}" \
       --account="${SLURM_JOB_ACCOUNT:-torch_pr_111_tandon_advanced}" \
@@ -248,6 +248,16 @@ cd "$PROJECT_ROOT"
   app/hdepic_lora_action_anticipation/stream_kvcache_attn_prune.py \
   scripts/run_local_kvprune_joint_2s.py
 
+# 16 CPUs shared by all ranks. One thread per worker left the GPU waiting on
+# MP4 decode even after videos were staged locally. Give each decoder 2 threads
+# and keep total threads within the CPU allocation.
+export DECORD_THREADS="${DECORD_THREADS:-2}"
+_cpus="${SLURM_CPUS_PER_TASK:-16}"
+_nw=$(( _cpus / DECORD_THREADS / NGPUS ))
+if (( _nw < 2 )); then _nw=2; fi
+if (( _nw > 8 )); then _nw=8; fi
+echo "dataloader workers/rank=${_nw} DECORD_THREADS=${DECORD_THREADS} cpus=${_cpus}"
+
 # Multi-GPU DDP via torchrun (NGPUS from sbatch --gres / --export).
 "$PYTHON" -m torch.distributed.run --standalone --nproc_per_node="${NGPUS}" \
   scripts/run_local_kvprune_joint_2s.py \
@@ -267,8 +277,8 @@ cd "$PROJECT_ROOT"
   --epochs "${EPOCHS:-10}" \
   --patience "${PATIENCE:-0}" \
   --batch-size 1 \
-  --num-workers 8 \
-  --val-num-workers 8 \
+  --num-workers "${_nw}" \
+  --val-num-workers "${_nw}" \
   --lr 2e-5 \
   --lora-lr-mult 0.5 \
   --ckpt-every "${CKPT_EVERY:-2000}" \

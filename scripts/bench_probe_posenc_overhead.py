@@ -67,7 +67,7 @@ def main():
     ap.add_argument("--checkpoint", type=Path, default=Path("/scratch/ll5914/models/vjepa2/vitl.pt"))
     ap.add_argument("--nopred-ckpt", type=Path, default=P.NOPRED_CKPT)
     ap.add_argument("--out-dir", type=Path, default=Path("/scratch/ll5914/experiments/probe_posenc_kvcache_128_34"))
-    ap.add_argument("--copy-json", type=Path, default=Path("/home/ll5914/Jepa_yifan/probe_posenc_latency.json"))
+    ap.add_argument("--copy-json", type=Path, default=Path("/home/ll5914/Jepa/probe_posenc_latency.json"))
     ap.add_argument("--fps", type=int, default=8)
     ap.add_argument("--img-size", type=int, default=256)
     ap.add_argument("--warmup", type=int, default=10)

@@ -16,7 +16,7 @@ set -euo pipefail
 # EGTEA split1: video-only, no gaze. Train probe (full) + encoder LoRA. 2x H100.
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
-PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
+PROJECT_ROOT="/home/ll5914/Jepa/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
 EGTEA_ROOT="/scratch/ll5914/datasets/EGTEA"
 DONE_MARKER="/scratch/ll5914/logs/egtea_raw_videos.done"

@@ -16,7 +16,7 @@ set -euo pipefail
 # Stage 2 (video-only): predictor LoRA on top of stage-1 encoder+probe ckpt.
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
-PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
+PROJECT_ROOT="/home/ll5914/Jepa/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
 EGTEA_ROOT="/scratch/ll5914/datasets/EGTEA"
 STAGE1_DIR="${STAGE1_DIR:-/scratch/ll5914/experiments/egtea_split1_video_enc_fixed/action_anticipation_frozen/egtea-split1-video-enc-fixed-vitl16-256-10ep}"

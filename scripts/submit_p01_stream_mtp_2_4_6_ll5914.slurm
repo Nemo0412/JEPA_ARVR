@@ -26,7 +26,7 @@ set -euo pipefail
 #   4) save-every=200 train steps (~5–7 min) so kills never lose a whole epoch
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
-PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
+PROJECT_ROOT="/home/ll5914/Jepa/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
 SCRIPT_PATH="${PROJECT_ROOT}/scripts/submit_p01_stream_mtp_2_4_6_ll5914.slurm"
 export VJEPA_ROOT

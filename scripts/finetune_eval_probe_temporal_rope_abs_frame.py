@@ -327,10 +327,10 @@ def main():
         "/scratch/ll5914/experiments/probe_temporal_rope_abs_frame_joint_128kv"
     ))
     ap.add_argument("--copy-json", type=Path, default=Path(
-        "/home/ll5914/Jepa_yifan/JEPA_ARVR/configs/jepa_pe/probe_temporal_rope_abs_frame_joint_128kv.json"
+        "/home/ll5914/Jepa/JEPA_ARVR/configs/jepa_pe/probe_temporal_rope_abs_frame_joint_128kv.json"
     ))
     ap.add_argument("--copy-png", type=Path, default=Path(
-        "/home/ll5914/Jepa_yifan/JEPA_ARVR/plots/probe_temporal_rope_abs_frame_joint_128kv.png"
+        "/home/ll5914/Jepa/JEPA_ARVR/plots/probe_temporal_rope_abs_frame_joint_128kv.png"
     ))
     ap.add_argument("--fps", type=int, default=8)
     ap.add_argument("--img-size", type=int, default=256)

@@ -18,7 +18,7 @@ set -euo pipefail
 # Tri-modal projected cross-attention fusion: separate video / gaze / IMU encoders
 # with fusion between frozen V-JEPA encoder output and predictor input.
 
-PROJECT_ROOT="${PROJECT_ROOT:-/home/ll5914/Jepa_yifan/JEPA_ARVR}"
+PROJECT_ROOT="${PROJECT_ROOT:-/home/ll5914/Jepa/JEPA_ARVR}"
 CHECKPOINT="${CHECKPOINT:-/scratch/ll5914/models/vjepa2/vitl.pt}"
 
 export PROJECT_ROOT

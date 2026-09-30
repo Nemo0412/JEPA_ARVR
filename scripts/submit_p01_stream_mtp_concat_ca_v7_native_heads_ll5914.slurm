@@ -35,7 +35,7 @@ set -euo pipefail
 #   7) slightly higher head LR (heads from scratch)
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
-PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
+PROJECT_ROOT="/home/ll5914/Jepa/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
 SCRIPT_PATH="${PROJECT_ROOT}/scripts/submit_p01_stream_mtp_concat_ca_v7_native_heads_ll5914.slurm"
 export VJEPA_ROOT

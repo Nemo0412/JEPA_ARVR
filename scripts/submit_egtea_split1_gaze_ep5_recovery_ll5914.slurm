@@ -19,7 +19,7 @@ set -euo pipefail
 # weights were not preserved in any archive.
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
-PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
+PROJECT_ROOT="/home/ll5914/Jepa/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
 EGTEA_ROOT="/scratch/ll5914/datasets/EGTEA"
 

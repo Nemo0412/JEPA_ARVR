@@ -4,7 +4,7 @@ set -euo pipefail
 # Smoke test for tri-modal projected cross-attention fusion (video + gaze + IMU proxy).
 # Uses legacy split with train_only class space (same constraint as other legacy runs).
 
-PROJECT_ROOT="${PROJECT_ROOT:-/home/ll5914/Jepa_yifan/JEPA_ARVR}"
+PROJECT_ROOT="${PROJECT_ROOT:-/home/ll5914/Jepa/JEPA_ARVR}"
 RUN_SCRIPT="${PROJECT_ROOT}/scripts/run_hdepic_tri_modal_fusion_train.slurm"
 TAG="${LORA_TAG:-hdepic-tri-modal-fusion-1s-smoke-vitl-fp32-bs4}"
 CONFIG_PATH="${CONFIG_PATH:-${PROJECT_ROOT}/configs/generated/hdepic_tri_modal_fusion_1s_smoke.yaml}"

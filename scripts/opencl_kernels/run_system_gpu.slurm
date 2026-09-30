@@ -13,7 +13,7 @@
 
 set -euo pipefail
 PY=/scratch/ll5914/conda_envs/jepa_opencl/bin/python
-D=/home/ll5914/Jepa_yifan/JEPA_ARVR/scripts/opencl_kernels
+D=/home/ll5914/Jepa/JEPA_ARVR/scripts/opencl_kernels
 echo "=== $(hostname) ==="; nvidia-smi -L || true
 echo "=== tri-modal smoke Nv=64 Ng=16 Ni=8 ==="
 $PY $D/profile_system_pipeline.py --Nv 64 --Ng 16 --Ni 8 --D 64 --H 4 --layers 1 \

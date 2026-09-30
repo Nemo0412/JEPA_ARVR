@@ -371,10 +371,10 @@ def main():
         "/scratch/ll5914/experiments/stream_kv_probe_blk0_prune_joint_ft_rope"
     ))
     ap.add_argument("--copy-json", type=Path, default=Path(
-        "/home/ll5914/Jepa_yifan/JEPA_ARVR/configs/jepa_pe/stream_kv_probe_blk0_prune_joint_ft_rope.json"
+        "/home/ll5914/Jepa/JEPA_ARVR/configs/jepa_pe/stream_kv_probe_blk0_prune_joint_ft_rope.json"
     ))
     ap.add_argument("--copy-png", type=Path, default=Path(
-        "/home/ll5914/Jepa_yifan/JEPA_ARVR/plots/stream_kv_probe_blk0_prune_joint_ft_rope.png"
+        "/home/ll5914/Jepa/JEPA_ARVR/plots/stream_kv_probe_blk0_prune_joint_ft_rope.png"
     ))
     ap.add_argument("--fps", type=int, default=8)
     ap.add_argument("--img-size", type=int, default=256)

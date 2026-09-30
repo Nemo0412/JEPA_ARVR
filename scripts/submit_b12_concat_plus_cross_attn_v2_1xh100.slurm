@@ -24,7 +24,7 @@ set -euo pipefail
 # fusion + adapter (light) + predictor LoRA + heads.
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
-PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
+PROJECT_ROOT="/home/ll5914/Jepa/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
 SCRIPT_PATH="${PROJECT_ROOT}/scripts/submit_b12_concat_plus_cross_attn_v2_1xh100.slurm"
 

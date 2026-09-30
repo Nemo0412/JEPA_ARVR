@@ -35,7 +35,7 @@ set -euo pipefail
 #   sbatch scripts/submit_prefill_p01_clip_frame_cache.slurm
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
-PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
+PROJECT_ROOT="/home/ll5914/Jepa/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
 SCRIPT_PATH="${PROJECT_ROOT}/scripts/submit_b12_tri_modal_s2_from_p01video_jointv2_1xh100.slurm"
 FRAME_CACHE_ROOT="${TRI_MODAL_FRAME_CACHE:-/scratch/ll5914/datasets/HD-EPIC/_clip_frame_cache/p01_f32_at1}"

@@ -188,10 +188,10 @@ def main():
         "/scratch/ll5914/experiments/nopred_kvcache_size_sweep"
     ))
     ap.add_argument("--copy-json", type=Path, default=Path(
-        "/home/ll5914/Jepa_yifan/nopred_kvcache_size_sweep.json"
+        "/home/ll5914/Jepa/nopred_kvcache_size_sweep.json"
     ))
     ap.add_argument("--copy-png", type=Path, default=Path(
-        "/home/ll5914/Jepa_yifan/nopred_kvcache_size_sweep.png"
+        "/home/ll5914/Jepa/nopred_kvcache_size_sweep.png"
     ))
     ap.add_argument("--context-sec", type=float, default=16.0)
     ap.add_argument("--require-ctx-sec", type=float, default=10.0)

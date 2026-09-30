@@ -13,7 +13,7 @@
 
 set -euo pipefail
 PYTHON=/scratch/ll5914/conda_envs/jepa_opencl/bin/python
-ROOT=/home/ll5914/Jepa_yifan/JEPA_ARVR
+ROOT=/home/ll5914/Jepa/JEPA_ARVR
 OUTDIR=$ROOT/scripts/opencl_kernels
 
 echo "=== host $(hostname) ==="

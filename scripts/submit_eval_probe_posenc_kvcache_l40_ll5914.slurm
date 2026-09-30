@@ -16,7 +16,7 @@ export TMPDIR=/scratch/ll5914/tmp
 mkdir -p "$TMPDIR" /scratch/ll5914/logs
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
-PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
+PROJECT_ROOT="/home/ll5914/Jepa/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
 export VJEPA_ROOT PYTHONUNBUFFERED=1
 export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/scripts:${VJEPA_ROOT}:${PYTHONPATH:-}"
@@ -36,8 +36,8 @@ cd "$PROJECT_ROOT"
 
 "$PYTHON" scripts/eval_probe_posenc_kvcache_128_34.py \
   --out-dir "$OUT" \
-  --copy-json /home/ll5914/Jepa_yifan/probe_posenc_kvcache_128_34.json \
-  --copy-png /home/ll5914/Jepa_yifan/probe_posenc_kvcache_128_34.png \
+  --copy-json /home/ll5914/Jepa/probe_posenc_kvcache_128_34.json \
+  --copy-png /home/ll5914/Jepa/probe_posenc_kvcache_128_34.png \
   --max-samples 108 \
   --clips-per-video 4 \
   --log-every 5
@@ -52,4 +52,4 @@ if "accuracy" in d:
     print("accuracy", json.dumps(d["accuracy"]["table_action_top5"], indent=2))
     print("delta_pp", json.dumps(d["accuracy"]["delta_pp"], indent=2))
 PY
-ls -lh "$OUT"/probe_posenc_kvcache_128_34.png /home/ll5914/Jepa_yifan/probe_posenc_kvcache_128_34.png
+ls -lh "$OUT"/probe_posenc_kvcache_128_34.png /home/ll5914/Jepa/probe_posenc_kvcache_128_34.png

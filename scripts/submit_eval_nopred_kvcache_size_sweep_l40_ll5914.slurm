@@ -16,7 +16,7 @@ export TMPDIR=/scratch/ll5914/tmp
 mkdir -p "$TMPDIR" /scratch/ll5914/logs
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
-PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
+PROJECT_ROOT="/home/ll5914/Jepa/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
 export VJEPA_ROOT PYTHONUNBUFFERED=1
 export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/scripts:${VJEPA_ROOT}:${PYTHONPATH:-}"
@@ -31,12 +31,12 @@ nvidia-smi -L || true
 cd "$PROJECT_ROOT"
 "$PYTHON" scripts/eval_nopred_kvcache_size_sweep.py \
   --out-dir "$OUT" \
-  --copy-json /home/ll5914/Jepa_yifan/nopred_kvcache_size_sweep.json \
-  --copy-png /home/ll5914/Jepa_yifan/nopred_kvcache_size_sweep.png \
+  --copy-json /home/ll5914/Jepa/nopred_kvcache_size_sweep.json \
+  --copy-png /home/ll5914/Jepa/nopred_kvcache_size_sweep.png \
   --max-samples 108 \
   --clips-per-video 4 \
   --log-every 5
 
 echo "Done $(date)"
 cat "$OUT/metrics.json"
-ls -lh "$OUT"/kvcache_size_vs_top5.png /home/ll5914/Jepa_yifan/nopred_kvcache_size_sweep.png
+ls -lh "$OUT"/kvcache_size_vs_top5.png /home/ll5914/Jepa/nopred_kvcache_size_sweep.png

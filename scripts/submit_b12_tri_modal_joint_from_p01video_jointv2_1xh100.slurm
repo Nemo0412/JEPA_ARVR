@@ -30,7 +30,7 @@ set -euo pipefail
 #   frame cache, slim prefetch, 1:50 auto-resubmit, best_metric_floor=40.44
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
-PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
+PROJECT_ROOT="/home/ll5914/Jepa/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
 SCRIPT_PATH="${PROJECT_ROOT}/scripts/submit_b12_tri_modal_joint_from_p01video_jointv2_1xh100.slurm"
 FRAME_CACHE_ROOT="${TRI_MODAL_FRAME_CACHE:-/scratch/ll5914/datasets/HD-EPIC/_clip_frame_cache/p01_f32_at1}"

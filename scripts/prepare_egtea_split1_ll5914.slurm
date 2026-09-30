@@ -14,7 +14,7 @@
 set -euo pipefail
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
-SCRIPT="/home/ll5914/Jepa_yifan/JEPA_ARVR/scripts/prepare_egtea_split1.py"
+SCRIPT="/home/ll5914/Jepa/JEPA_ARVR/scripts/prepare_egtea_split1.py"
 
 echo "Preparing EGTEA split1: $(date)"
 "${PYTHON}" "${SCRIPT}" --egtea-root /scratch/ll5914/datasets/EGTEA

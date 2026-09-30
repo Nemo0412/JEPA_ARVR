@@ -19,7 +19,7 @@ set -euo pipefail
 # Already-downloaded P01 files are skipped by md5.
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
-PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
+PROJECT_ROOT="/home/ll5914/Jepa/JEPA_ARVR"
 DOWNLOADER="/scratch/ll5914/datasets/HD-EPIC/hd-epic-downloader"
 DATA_PARENT="/scratch/ll5914/datasets/HD-EPIC"
 HD_EPIC_ROOT="${DATA_PARENT}/HD-EPIC"

@@ -16,7 +16,7 @@ export TMPDIR=/scratch/ll5914/tmp
 mkdir -p "$TMPDIR" /scratch/ll5914/logs
 
 PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
-PROJECT_ROOT="/home/ll5914/Jepa_yifan/JEPA_ARVR"
+PROJECT_ROOT="/home/ll5914/Jepa/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
 export VJEPA_ROOT PYTHONUNBUFFERED=1
 export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/scripts:${VJEPA_ROOT}:${PYTHONPATH:-}"
@@ -37,7 +37,7 @@ cd "$PROJECT_ROOT"
 
 "$PYTHON" scripts/bench_probe_posenc_overhead.py \
   --out-dir "$OUT" \
-  --copy-json /home/ll5914/Jepa_yifan/probe_posenc_latency.json \
+  --copy-json /home/ll5914/Jepa/probe_posenc_latency.json \
   --warmup 10 \
   --repeats 30
 

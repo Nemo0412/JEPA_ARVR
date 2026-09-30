@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Full training: tri-modal projected cross-attention fusion @ 1s anticipation.
 
-PROJECT_ROOT="${PROJECT_ROOT:-/home/ll5914/Jepa_yifan/JEPA_ARVR}"
+PROJECT_ROOT="${PROJECT_ROOT:-/home/ll5914/Jepa/JEPA_ARVR}"
 RUN_SCRIPT="${PROJECT_ROOT}/scripts/run_hdepic_tri_modal_fusion_train.slurm"
 TAG="${LORA_TAG:-hdepic-tri-modal-fusion-1s-fulltrain-vitl-fp32-bs4-10ep}"
 CONFIG_PATH="${CONFIG_PATH:-${PROJECT_ROOT}/configs/generated/hdepic_tri_modal_fusion_1s_fulltrain.yaml}"
