@@ -130,6 +130,33 @@ def topk_slot_ids_from_scores(
     return slot_ids.gather(1, idx)
 
 
+def max_abs_slot_scores(
+    slot_ids: torch.Tensor,
+    current_scores: torch.Tensor,
+    history: list[tuple[torch.Tensor, torch.Tensor]],
+    hist_n: int,
+) -> torch.Tensor:
+    """Max |score| of each current slot over this pass and up to ``hist_n-1`` older passes.
+
+    ``history`` is oldest-first ``(slot_ids, scores)`` from earlier probe passes.
+    A slot that was not in an older cache keeps the max of the passes where it was.
+    Magnitude is used instead of rank: a frame stays if its attention was large,
+    not because it happened to sit in a Top-K list.
+    """
+    acc = current_scores.detach().abs()
+    n_prev = int(hist_n) - 1
+    if n_prev <= 0 or not history:
+        return acc
+    for prev_ids, prev_scores in history[-n_prev:]:
+        match = slot_ids.unsqueeze(-1) == prev_ids.unsqueeze(1)
+        mag = prev_scores.detach().abs().unsqueeze(1).expand_as(match)
+        mag = mag.masked_fill(~match, 0)
+        peak = mag.amax(dim=-1)
+        hit = match.any(dim=-1)
+        acc = torch.where(hit, torch.maximum(acc, peak), acc)
+    return acc
+
+
 def keep_and_drop_with_topk_protect(
     slot_scores: torch.Tensor,
     slot_ids: torch.Tensor,

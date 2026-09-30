@@ -97,6 +97,7 @@ from app.hdepic_lora_action_anticipation.stream_kvcache_attn_prune import (  # n
     NEW_FRAMES,
     ProbeTemporalRoPE,
     StreamKVAttnPruneEncoder,
+    max_abs_slot_scores,
     probe_blk0_slot_scores,
     token_frame_ids_from_slots,
     topk_slot_ids_from_scores,
@@ -175,32 +176,6 @@ class ClipAnticipationDataset(Dataset):
     def __len__(self):
         return len(self.rows)
 
-    def _video_reader(self, path: Path):
-        """Reuse demuxers inside one DataLoader worker.
-
-        Opening a new VideoReader every sample is most of the CPU time after the
-        clips are on node-local disk. Keep only the last two: holding every file
-        open grew until the job was OOM-killed.
-        """
-        cache = getattr(self, "_vr_cache", None)
-        if cache is None:
-            cache = {}
-            self._vr_cache = cache
-            self._vr_order = []
-        key = str(path)
-        vr = cache.get(key)
-        if vr is not None:
-            return vr
-        threads = max(1, int(os.environ.get("DECORD_THREADS", "2")))
-        vr = VideoReader(
-            key, ctx=cpu(0), num_threads=threads, width=self.img_size, height=self.img_size,
-        )
-        cache[key] = vr
-        self._vr_order.append(key)
-        while len(self._vr_order) > 2:
-            cache.pop(self._vr_order.pop(0), None)
-        return vr
-
     def __getitem__(self, idx: int):
         r = self.rows[idx]
         video_id = r["video_id"]
@@ -208,9 +183,13 @@ class ClipAnticipationDataset(Dataset):
         path = self.video_root / pid / f"{video_id}.MP4"
         if not path.is_file():
             path = self.video_root / pid / f"{video_id}.mp4"
-        vr = self._video_reader(path)
-        fi = np.clip(r["frame_idx"], 0, len(vr) - 1)
-        frames = vr.get_batch(fi.tolist()).asnumpy()
+        # A reused VideoReader segfaults inside decord after a few thousand seeks.
+        vr = VideoReader(str(path), ctx=cpu(0), num_threads=1, width=self.img_size, height=self.img_size)
+        try:
+            fi = np.clip(r["frame_idx"], 0, len(vr) - 1)
+            frames = vr.get_batch(fi.tolist()).asnumpy()
+        finally:
+            del vr
         clip = torch.from_numpy(np.ascontiguousarray(frames)).permute(3, 0, 1, 2).contiguous()
         return {
             "clip": clip,
@@ -280,13 +259,20 @@ def encode_joint(
     protect_hist: int = 0,
     protect_k_frames: int = 34,
     self_only: bool = False,
+    prune_mode: str = "last",
+    score_hist: int = 3,
 ):
     """Trainable encode with detached probe-blk0 prune scores (discrete topk).
 
     ``stream_steps`` admits that many ×34-frame chunks after the 128 fill
-    (``T = 128 + stream_steps*34``). When ``protect_hist>0``, each prune walks
-    scores low→high but skips slots that were Top-K (``protect_k_frames`` /
-    tubelet) in any of the previous ``protect_hist`` probe-score passes.
+    (``T = 128 + stream_steps*34``). ``prune_mode``:
+
+    * ``last`` — drop the 34 frames with the lowest score from this probe pass.
+    * ``rank`` — same drop order, but skip slots that were Top-K
+      (``protect_k_frames`` / tubelet) in any of the previous ``protect_hist``
+      passes.
+    * ``abs`` — ignore rank. Over this pass and the previous ``score_hist-1``
+      passes, each frame keeps its max |score|; drop the 34 smallest of those.
 
     self_only: the new 34 frames attend only to themselves. Their tokens are
     concatenated with the kept 94 and that pack is what the probe sees.
@@ -294,14 +280,16 @@ def encode_joint(
     expected_t = CACHE_FRAMES + int(stream_steps) * NEW_FRAMES
     if clips.size(2) != expected_t:
         raise ValueError(f"encode_joint expects T={expected_t}, got {clips.size(2)}")
+    if prune_mode not in ("last", "rank", "abs"):
+        raise ValueError(f"unknown prune_mode {prune_mode}")
     hist = clips[:, :, :CACHE_FRAMES]
     # Skip encoder QK score refresh — probe scores drive prune; saves a huge softmax.
     state = stream.fill(hist, refresh_scores=False)
     tubelet = int(stream.tubelet_size)
     protect_k_slots = max(0, int(protect_k_frames) // tubelet)
-    use_protect = int(protect_hist) > 0
-    mode = "attn_protect" if use_protect else "attn"
+    mode = "attn_protect" if prune_mode == "rank" else "attn"
     topk_hist: list[torch.Tensor] = []
+    score_hist_maps: list[tuple[torch.Tensor, torch.Tensor]] = []
 
     for si in range(int(stream_steps)):
         tok0 = state.tokens
@@ -309,24 +297,34 @@ def encode_joint(
             tok0 = tok0[:, :, -embed_dim:]
         with torch.no_grad():
             scores = probe_blk0_slot_scores(pooler, tok0.detach(), stream.gp, chunk=chunk)
-            cur_topk = topk_slot_ids_from_scores(scores, state.slot_ids, protect_k_slots)
-            if use_protect and topk_hist:
-                protected_ids = torch.cat(topk_hist[-int(protect_hist) :], dim=1)
-            else:
-                protected_ids = None
+            protected_ids = None
+            slot_scores = scores
+            if prune_mode == "rank":
+                cur_topk = topk_slot_ids_from_scores(scores, state.slot_ids, protect_k_slots)
+                if topk_hist:
+                    protected_ids = torch.cat(topk_hist[-int(protect_hist) :], dim=1)
+            elif prune_mode == "abs":
+                slot_scores = max_abs_slot_scores(
+                    state.slot_ids, scores, score_hist_maps, int(score_hist)
+                )
+        scored_ids = state.slot_ids
         s = CACHE_FRAMES + si * NEW_FRAMES
         e = s + NEW_FRAMES
         state = stream.step(
             state,
             clips[:, :, s:e],
             mode=mode,
-            slot_scores=scores,
+            slot_scores=slot_scores,
             protected_ids=protected_ids,
             refresh_scores=False,
             self_only=self_only,
         )
-        if use_protect:
+        if prune_mode == "rank":
             topk_hist.append(cur_topk)
+        elif prune_mode == "abs":
+            score_hist_maps.append((scored_ids, scores))
+            if len(score_hist_maps) > int(score_hist):
+                score_hist_maps = score_hist_maps[-int(score_hist) :]
 
     tok = state.tokens
     if tok.size(-1) != embed_dim:
@@ -359,6 +357,8 @@ class JointBundle(nn.Module):
         protect_k_frames: int = 34,
         no_kv: bool = False,
         self_only: bool = False,
+        prune_mode: str = "last",
+        score_hist: int = 3,
     ):
         super().__init__()
         self.backbone = backbone
@@ -369,6 +369,8 @@ class JointBundle(nn.Module):
         self.protect_k_frames = int(protect_k_frames)
         self.no_kv = bool(no_kv)
         self.self_only = bool(self_only)
+        self.prune_mode = str(prune_mode)
+        self.score_hist = int(score_hist)
         self.stream = None
         if not self.no_kv:
             self.stream = StreamKVAttnPruneEncoder(
@@ -407,6 +409,8 @@ class JointBundle(nn.Module):
                 protect_hist=self.protect_hist,
                 protect_k_frames=self.protect_k_frames,
                 self_only=self.self_only,
+                prune_mode=self.prune_mode,
+                score_hist=self.score_hist,
             )
         if self._rope is not None and self.rope_time == "relpred":
             if self.stream is None:
@@ -535,6 +539,21 @@ def main():
         help="Top-K size in frames for protect history (tubelet-aligned; default 34)",
     )
     ap.add_argument(
+        "--prune-mode",
+        choices=("last", "rank", "abs"),
+        default=None,
+        help="last = drop by the latest probe scores. "
+        "rank = also protect Top-K slots from the previous --protect-hist passes. "
+        "abs = keep frames with the largest max |score| over --score-hist passes. "
+        "Default: rank if --protect-hist>0, else last.",
+    )
+    ap.add_argument(
+        "--score-hist",
+        type=int,
+        default=3,
+        help="Abs prune window, including the current probe pass (default 3)",
+    )
+    ap.add_argument(
         "--rope-time",
         choices=("abs", "relpred"),
         default="abs",
@@ -599,6 +618,13 @@ def main():
     stream_steps = max(1, int(args.stream_steps))
     protect_hist = max(0, int(args.protect_hist))
     protect_k = max(0, int(args.protect_k))
+    score_hist = max(1, int(args.score_hist))
+    if args.prune_mode is None:
+        prune_mode = "rank" if protect_hist > 0 else "last"
+    else:
+        prune_mode = str(args.prune_mode)
+    if prune_mode == "rank" and protect_hist <= 0:
+        protect_hist = score_hist
 
     hz_tag = int(horizon) if horizon == int(horizon) else horizon
     if args.no_kv or args.new_self_only:
@@ -613,8 +639,10 @@ def main():
             tag = "rope_all"
         if args.rope and args.rope_time == "relpred":
             tag = f"{tag}_relpred"
-        if protect_hist > 0:
+        if prune_mode == "rank":
             tag = f"{tag}_protectk{protect_k}_h{protect_hist}"
+        elif prune_mode == "abs":
+            tag = f"{tag}_abs_h{score_hist}"
         if stream_steps != 1:
             tag = f"{tag}_s{stream_steps}"
         out_dir = args.out_dir / f"joint_{hz_tag}s_{tag}"
@@ -622,15 +650,21 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
         logger.info(
             "%s encoder-LoRA+probe  horizon=%.1fs probe_rope=%s only_block0=%s no_kv=%s self_only=%s "
-            "frames=%s stream_steps=%d protect_hist=%d protect_k=%d world=%d out=%s",
+            "frames=%s stream_steps=%d prune=%s protect_hist=%d protect_k=%d score_hist=%d world=%d out=%s",
             "nokv clip" if args.no_kv else ("self34" if args.new_self_only else "joint"),
             horizon, bool(args.rope), only_block0, bool(args.no_kv), bool(args.new_self_only),
             int(args.frames) if args.no_kv else CACHE_FRAMES + stream_steps * NEW_FRAMES,
-            stream_steps, protect_hist, protect_k, world, out_dir,
+            stream_steps, prune_mode, protect_hist, protect_k, score_hist, world, out_dir,
         )
         if args.new_self_only:
             logger.info("new 34 frames: encoder self-attn only; concat kept 94 → probe")
-        if protect_hist > 0 and stream_steps < 2:
+        if prune_mode == "abs":
+            logger.info(
+                "abs prune: keep the 94 frames with the largest max |probe-blk0 score| "
+                "over %d passes (this pass + %d previous); drop 34",
+                score_hist, max(0, score_hist - 1),
+            )
+        if prune_mode == "rank" and stream_steps < 2:
             logger.warning(
                 "protect_hist=%d with stream_steps=1: Top-K history is empty on "
                 "the only prune → drops match plain attn (same as rope_all)",
@@ -684,6 +718,8 @@ def main():
         protect_k_frames=protect_k,
         no_kv=bool(args.no_kv),
         self_only=bool(args.new_self_only),
+        prune_mode=prune_mode,
+        score_hist=score_hist,
     ).to(device)
     bundle.rope_time = str(args.rope_time)
     bundle.horizon_sec = float(horizon)
@@ -1094,11 +1130,18 @@ def main():
                 else ("probe_all_self_attn" if args.rope else "off")
             ),
             "stream_steps": stream_steps,
-            "protect_hist": protect_hist,
-            "protect_k_frames": protect_k,
+            "prune_mode": prune_mode,
+            "score_hist": score_hist if prune_mode == "abs" else 0,
+            "protect_hist": protect_hist if prune_mode == "rank" else 0,
+            "protect_k_frames": protect_k if prune_mode == "rank" else 0,
             "prune": (
-                f"attn_protect hist={protect_hist} k_frames={protect_k}"
-                if protect_hist > 0 else "attn"
+                f"abs max|score| over {score_hist} passes"
+                if prune_mode == "abs"
+                else (
+                    f"attn_protect hist={protect_hist} k_frames={protect_k}"
+                    if prune_mode == "rank"
+                    else "attn_last"
+                )
             ),
             "rope_time": args.rope_time if args.rope else "off",
             "backbone": "vit_large / ViT-L/16 @256",
