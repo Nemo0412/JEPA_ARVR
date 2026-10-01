@@ -53,33 +53,35 @@ class _IndicesSampler(Sampler[int]):
         return len(self.indices)
 
 
-def _last_csv_iter(path: Path) -> int | None:
-    """Best-effort next-iter hint from loss_steps.csv.
+def _csv_epoch_max_iter(path: Path, epoch: int) -> int | None:
+    """Furthest ``iter`` already logged for ``epoch``.
 
-    Prefer max(iter)+1 over the final row: a short failed relaunch can append a
-    low-iter tail after a long mid-epoch run.
+    A killed job can append a second pass that starts again at iter 0. The
+    high-water mark is the clip to continue from; the last row is not.
     """
     if not path.is_file():
         return None
     try:
         max_it = -1
-        last_it = -1
         with path.open("r", newline="") as f:
             reader = csv.DictReader(f)
             if not reader.fieldnames or "iter" not in reader.fieldnames:
                 return None
+            has_epoch = "epoch" in reader.fieldnames
             for row in reader:
+                if has_epoch:
+                    try:
+                        if int(float(row["epoch"])) != int(epoch):
+                            continue
+                    except (TypeError, ValueError, KeyError):
+                        continue
                 try:
                     it = int(float(row["iter"]))
                 except (TypeError, ValueError, KeyError):
                     continue
-                last_it = it
                 if it > max_it:
                     max_it = it
-        if max_it < 0:
-            return None
-        # If the file ends in a restarted prefix, use the historical high-water mark.
-        return max_it if (last_it >= 0 and last_it + 500 < max_it) else last_it
+        return max_it if max_it >= 0 else None
     except Exception:
         return None
 
@@ -792,6 +794,8 @@ def main():
     loss_steps_w = None
 
     resume_ck = None
+    resume_orders = None
+    resume_done_ids: set[int] = set()
     if args.resume:
         for cand in (latest_path, out_dir / "best.pt"):
             if cand.is_file():
@@ -826,28 +830,56 @@ def main():
         if partial_resume and start_iter <= 0:
             inferred = 0
             if is_main:
-                last_it = _last_csv_iter(loss_steps_path)
+                last_it = _csv_epoch_max_iter(loss_steps_path, start_ep)
                 if last_it is not None:
                     inferred = int(last_it) + 1
-                    logger.info("inferred resume_iter=%d from %s", inferred, loss_steps_path.name)
+                    logger.info(
+                        "inferred resume_iter=%d from %s epoch=%d (high-water, not a replay from 0)",
+                        inferred, loss_steps_path.name, start_ep,
+                    )
             t_inf = torch.tensor([inferred], device=device, dtype=torch.long)
             dist.broadcast(t_inf, src=0)
             start_iter = int(t_inf.item())
-        # DDP shard changes with world size — old resume_iter is not transferable.
-        if partial_resume and ck_world and ck_world != world and start_iter > 0:
+        # Exact remaining clips for this rank. Do not rebuild the shuffle and
+        # do not restart at iter 0: that replays the epoch on the new weights.
+        saved_orders = ck.get("ep_indices_by_rank")
+        resume_orders = None
+        resume_done_ids: set[int] = set()
+        if partial_resume and isinstance(saved_orders, (list, tuple)) and len(saved_orders) > 0:
+            if ck_world == world and rank < len(saved_orders) and saved_orders[rank]:
+                resume_orders = [[int(i) for i in shard] for shard in saved_orders]
+            elif ck_world and ck_world != world:
+                done: list[int] = []
+                for shard in saved_orders:
+                    done.extend(int(i) for i in list(shard)[:start_iter])
+                resume_done_ids = set(done)
+                if is_main:
+                    logger.warning(
+                        "world_size %d→%d: keeping weights, skipping %d clips already "
+                        "finished in this epoch (not restarting at the first video)",
+                        ck_world, world, len(resume_done_ids),
+                    )
+                start_iter = 0
+                resume_loss_meter = 0.0
+                resume_n_step = 0
+        elif partial_resume and ck_world and ck_world != world and start_iter > 0:
+            # No stored clip ids (older ckpt). A different GPU count would map
+            # resume_iter onto the wrong videos, so do not pretend it still lines up.
             if is_main:
                 logger.warning(
-                    "world_size %d→%d: dropping resume_iter=%d (restart this epoch data; weights kept)",
-                    ck_world, world, start_iter,
+                    "world_size %d→%d and checkpoint has no clip order; "
+                    "cannot place the cursor. Restarting this epoch's data; weights kept.",
+                    ck_world, world,
                 )
             start_iter = 0
             resume_loss_meter = 0.0
             resume_n_step = 0
         if is_main:
             logger.info(
-                "resumed %s start_ep=%d/%d start_iter=%d best_top5=%.2f step=%d partial=%s world=%d",
+                "resumed %s start_ep=%d/%d start_iter=%d best_top5=%.2f step=%d partial=%s "
+                "world=%d stored_order=%s",
                 resume_ck, start_ep, args.epochs, start_iter, best_top5, global_step,
-                partial_resume, world,
+                partial_resume, world, resume_orders is not None,
             )
 
     if is_main:
@@ -882,6 +914,11 @@ def main():
         # Full backbone ~600MB; trainable LoRA+probe is tiny — keeps wall-save cheap.
         return {n: p.detach().cpu() for n, p in module.named_parameters() if p.requires_grad}
 
+    # Full shuffle for the in-progress epoch (this rank). Saved into latest.pt
+    # so a resubmit continues at the same clip instead of regenerating and
+    # starting at video 0.
+    clip_order = {"indices": []}
+
     def _save_ckpt(
         resume_epoch: int,
         *,
@@ -890,6 +927,7 @@ def main():
         resume_iter: int = 0,
         loss_meter_v: float = 0.0,
         n_step_v: int = 0,
+        ep_indices_by_rank: list | None = None,
     ):
         """Write latest.pt. resume_epoch/iter are where the next launch should continue."""
         if not is_main:
@@ -913,6 +951,10 @@ def main():
             "only_block0": only_block0,
             "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
         }
+        if partial and ep_indices_by_rank is not None:
+            payload["ep_indices_by_rank"] = ep_indices_by_rank
+            if ep_indices_by_rank and int(resume_iter) < len(ep_indices_by_rank[0]):
+                payload["next_index"] = int(ep_indices_by_rank[0][int(resume_iter)])
         tmp = latest_path.with_suffix(".pt.tmp")
         torch.save(payload, tmp)
         os.replace(tmp, latest_path)
@@ -920,11 +962,30 @@ def main():
             tmp_b = out_dir / "best.pt.tmp"
             torch.save(payload, tmp_b)
             os.replace(tmp_b, out_dir / "best.pt")
+        nxt = payload.get("next_index")
         logger.info(
-            "saved %s ep=%d iter=%d step=%d partial=%s best=%s",
+            "saved %s ep=%d iter=%d step=%d partial=%s best=%s next_index=%s",
             latest_path.name, resume_epoch, int(resume_iter) if partial else 0,
-            global_step, partial, is_best,
+            global_step, partial, is_best, nxt if nxt is not None else "-",
         )
+
+    def _save_partial_all_ranks(resume_epoch: int, resume_iter: int, loss_meter_v: float, n_step_v: int):
+        """All ranks enter. Rank 0 writes latest.pt with every rank's clip order."""
+        gathered: list = [None] * world
+        dist.all_gather_object(gathered, list(clip_order["indices"]))
+        if not is_main:
+            return
+        _save_ckpt(
+            resume_epoch,
+            is_best=False,
+            partial=True,
+            resume_iter=resume_iter,
+            loss_meter_v=loss_meter_v,
+            n_step_v=n_step_v,
+            ep_indices_by_rank=gathered,
+        )
+        if loss_steps_f is not None:
+            loss_steps_f.flush()
 
     stop_flag = {"stop": False}
 
@@ -944,7 +1005,42 @@ def main():
                 break
             train_samp.set_epoch(ep)
             # Materialize this epoch's shuffle once, then drop already-done prefix.
-            ep_indices = list(train_samp)
+            # A mid-epoch resume uses the order stored in latest.pt so the next
+            # clip is the one after the last finished step, not video 0.
+            if ep == start_ep and resume_orders is not None:
+                ep_indices = list(resume_orders[rank])
+                resume_orders = None
+                if is_main:
+                    logger.info(
+                        "ep%d: using clip order stored in the checkpoint (%d clips)",
+                        ep, len(ep_indices),
+                    )
+            else:
+                ep_indices = list(train_samp)
+                if ep == start_ep and resume_done_ids:
+                    before = len(ep_indices)
+                    ep_indices = [i for i in ep_indices if i not in resume_done_ids]
+                    kept = len(ep_indices)
+                    # DDP needs every rank to take the same number of steps.
+                    n_local = torch.tensor([kept], device=device, dtype=torch.long)
+                    n_max = n_local.clone()
+                    dist.all_reduce(n_max, op=dist.ReduceOp.MAX)
+                    target = int(n_max.item())
+                    if target > len(ep_indices):
+                        if ep_indices:
+                            ep_indices = ep_indices + [
+                                ep_indices[i % len(ep_indices)]
+                                for i in range(target - len(ep_indices))
+                            ]
+                        else:
+                            ep_indices = list(train_samp)[:target]
+                    if is_main:
+                        logger.info(
+                            "ep%d: skipped %d clips already finished before world-size change",
+                            ep, before - kept,
+                        )
+                    resume_done_ids = set()
+            clip_order["indices"] = list(ep_indices)
             skip = int(start_iter) if ep == start_ep else 0
             if skip < 0:
                 skip = 0
@@ -953,9 +1049,10 @@ def main():
             if ep == start_ep:
                 start_iter = 0  # consume; later epochs start at 0
             if skip and is_main:
+                nxt = ep_indices[skip] if skip < len(ep_indices) else None
                 logger.info(
-                    "ep%d: skipping first %d/%d iters (resume mid-epoch, no data replay)",
-                    ep, skip, len(ep_indices),
+                    "ep%d: skipping first %d/%d iters (resume mid-epoch, no data replay) next_index=%s",
+                    ep, skip, len(ep_indices), nxt,
                 )
             ep_loader = DataLoader(
                 train_ds,
@@ -1004,8 +1101,8 @@ def main():
                 if keep:
                     loss_meter += loss_val
                     n_step += 1
+                global_step += 1
                 if is_main:
-                    global_step += 1
                     avg = loss_meter / max(1, n_step)
                     loss_steps_w.writerow({
                         "global_step": global_step,
@@ -1025,30 +1122,29 @@ def main():
                         )
 
                 do_periodic = (
-                    is_main
-                    and args.ckpt_every > 0
+                    args.ckpt_every > 0
                     and global_step > 0
                     and global_step % args.ckpt_every == 0
                 )
-                if do_periodic:
-                    # Next launch continues at it+1 (same ep shuffle via set_epoch).
-                    _save_ckpt(
-                        ep, is_best=False, partial=True, resume_iter=it + 1,
-                        loss_meter_v=loss_meter, n_step_v=n_step,
+                # One rank may receive SIGTERM first. Agree before the collective save.
+                stop_t = torch.tensor(
+                    [1 if stop_flag["stop"] else 0], device=device, dtype=torch.int32,
+                )
+                dist.all_reduce(stop_t, op=dist.ReduceOp.MAX)
+                stopping = int(stop_t.item()) > 0
+                if do_periodic or stopping:
+                    # it+1 is the next clip in the stored order (ep_indices[it+1]).
+                    _save_partial_all_ranks(
+                        ep, it + 1, float(loss_meter), int(n_step),
                     )
-                    loss_steps_f.flush()
-
-                if stop_flag["stop"]:
-                    if is_main:
-                        _save_ckpt(
-                            ep, is_best=False, partial=True, resume_iter=it + 1,
-                            loss_meter_v=loss_meter, n_step_v=n_step,
-                        )
-                        loss_steps_f.flush()
+                    if stopping and is_main:
                         logger.warning(
-                            "exiting after signal save @ ep=%d iter=%d step=%d",
+                            "exiting after signal save @ ep=%d iter=%d step=%d next_index=%s",
                             ep, it + 1, global_step,
+                            ep_indices[it + 1] if it + 1 < len(ep_indices) else "-",
                         )
+                if stopping:
+                    stop_flag["stop"] = True
                     break
 
             if stop_flag["stop"]:
