@@ -10,5 +10,7 @@ dist/
 build/
 .cursor/
 outputs/
+slurm-*.out
+slurm-*.err
 *.pt
 *.pth

@@ -1,0 +1,46 @@
+task: egtea-action-anticipation
+task_document: docs/SCALANT_EGTEA_PROTOCOL.md
+baseline: ScalAnt-CLAM
+protocols:
+  official-split1-stream4s-ticks-h2h6-recall5-v1:
+    official_split: 1
+    train_entrypoint: app.scalant_baseline.official_stream_train
+    dataset_loader: app/scalant_baseline/official_stream_data.py
+    metric_implementation: app/scalant_baseline/stream_eval.py
+    source_audit: app.scalant_baseline.official_stream_audit
+    launcher: scripts/egtea/scalant_official_train_gpu.slurm
+  official-split2-stream4s-ticks-h2h6-recall5-v1:
+    official_split: 2
+    train_entrypoint: app.scalant_baseline.official_stream_train
+    dataset_loader: app/scalant_baseline/official_stream_data.py
+    metric_implementation: app/scalant_baseline/stream_eval.py
+    source_audit: app.scalant_baseline.official_three_split_audit
+    launcher: scripts/egtea/scalant_official_train_gpu.slurm
+  official-split3-stream4s-ticks-h2h6-recall5-v1:
+    official_split: 3
+    train_entrypoint: app.scalant_baseline.official_stream_train
+    dataset_loader: app/scalant_baseline/official_stream_data.py
+    metric_implementation: app/scalant_baseline/stream_eval.py
+    source_audit: app.scalant_baseline.official_three_split_audit
+    launcher: scripts/egtea/scalant_official_train_gpu.slurm
+  official-split1-stream4s-selected-full-heads-v1:
+    official_split: 1
+    gpu_dump: app.scalant_baseline.official_stream_full_eval_gpu
+    official_sequence_audit: app.scalant_baseline.official_stream_full_eval_cpu
+    gpu_top5_tie_replay: app.scalant_baseline.official_stream_full_eval_topk_gpu
+    cpu_evidence_verification: app.scalant_baseline.official_stream_full_eval_verify_cpu
+  official-split2-stream4s-selected-full-heads-v1:
+    official_split: 2
+    official_evaluation: app.scalant_baseline.official_s23_selected_eval
+  official-split3-stream4s-selected-full-heads-v1:
+    official_split: 3
+    official_evaluation: app.scalant_baseline.official_s23_selected_eval
+required_gates:
+  - pinned upstream model and official annotation identities
+  - official action membership and class map
+  - complete chronological causal traversal from video time zero
+  - exact processed/scored tick populations
+  - no missing or malformed required TSN features
+  - finite logits and correct future target UID
+  - checkpoint protocol, horizon, source and selection identity
+  - retained GPU hit/tie evidence for backend-dependent Top-5 ties
