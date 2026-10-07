@@ -23,9 +23,13 @@ CKPT="${CKPT:-/mnt/hdd/jepa/models/vjepa2-vitl/vitl.pt}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 MASTER_PORT="${MASTER_PORT:-29961}"
 mkdir -p "$OUT" "$(dirname "$LOG")"
+extra=()
+[[ -n "${TRAIN_CSV:-}" ]] && extra+=(--train-csv "$TRAIN_CSV")
+[[ -n "${VAL_CSV:-}" ]] && extra+=(--val-csv "$VAL_CSV")
+[[ -n "${VIDEO_ROOT:-}" ]] && extra+=(--video-root "$VIDEO_ROOT")
 
 echo "[$(date -Is)] stream rope_all (last) gpu=$CUDA_VISIBLE_DEVICES out=$OUT"
-exec "$PY" -m torch.distributed.run --standalone --nproc_per_node=1 \
+exec "$PY" -m torch.distributed.run --standalone --nproc_per_node="${NGPUS:-1}" \
   --master_port="$MASTER_PORT" \
   scripts/run_local_kvprune_6s_stream.py \
   --horizon 6 --rope 1 --only-block0 0 --rope-time abs \
@@ -33,4 +37,5 @@ exec "$PY" -m torch.distributed.run --standalone --nproc_per_node=1 \
   --participant P01 \
   --checkpoint "$CKPT" --out-dir "$OUT" \
   --epochs 8 --patience 0 --resume 1 \
+  "${extra[@]}" \
   >>"$LOG" 2>&1

@@ -17,7 +17,8 @@ Train loss uses train-split labels only. Val metrics use val-split labels only.
 The cache still walks the whole video, including frames that belong to the
 other split, because every P01 video appears in both splits.
 
-One GPU. Videos have different lengths; a multi-rank DDP step loop would hang.
+One GPU walks every video. Two GPUs split videos and average the supervised
+gradients at each label so unequal video lengths do not hang.
 Truncated BPTT: each supervised step is one forward/backward, then the stream
 state is detached.
 """
@@ -26,15 +27,18 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import queue
 import random
 import signal
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from decord import VideoReader, cpu
 
@@ -70,6 +74,10 @@ from scripts.run_local_kvprune_joint_2s import (  # noqa: E402
 )
 
 VIDEO_FPS = float(VIDEO_FPS)
+
+
+def _decord_threads() -> int:
+    return max(1, int(os.environ.get("DECORD_THREADS", "6")))
 
 
 def model_to_native(model_frame: int, video_fps: float, model_fps: float) -> int:
@@ -191,7 +199,10 @@ def build_video_jobs(
         if path is None:
             logger.warning("missing video %s", vid)
             continue
-        vr = VideoReader(str(path), ctx=cpu(0), num_threads=1, width=img_size, height=img_size)
+        vr = VideoReader(
+            str(path), ctx=cpu(0), num_threads=_decord_threads(),
+            width=img_size, height=img_size,
+        )
         try:
             n_native = len(vr)
         finally:
@@ -221,6 +232,25 @@ def detach_state(state):
     state.last_k = state.last_k.detach()
     state.slot_scores = state.slot_scores.detach()
     return state
+
+
+def _decode_worker(path, img_size, req_q, out_q, n_native, video_fps, model_fps):
+    """Decode the next span while the GPU runs the current one."""
+    vr = VideoReader(
+        str(path), ctx=cpu(0), num_threads=_decord_threads(),
+        width=img_size, height=img_size,
+    )
+    try:
+        while True:
+            item = req_q.get()
+            if item is None:
+                return
+            try:
+                out_q.put(decode_span(vr, item[0], item[1], n_native, video_fps, model_fps))
+            except Exception as exc:
+                out_q.put(exc)
+    finally:
+        del vr
 
 
 def decode_span(vr: VideoReader, m0: int, m1: int, n_native: int, video_fps: float, model_fps: float):
@@ -322,6 +352,8 @@ def run_video(
     maps,
     opt,
     scaler,
+    defer_step: bool = False,
+    warmup_steps: int = 0,
 ):
     """Walk one video. Yields (stream_step, loss_float, n_labels) for supervised steps.
 
@@ -331,30 +363,47 @@ def run_video(
     """
     labels = job.labels(split)
     _reset_hist(raw)
-    vr = VideoReader(
-        str(job.path), ctx=cpu(0), num_threads=1, width=img_size, height=img_size
+    req_q: queue.Queue = queue.Queue(maxsize=1)
+    out_q: queue.Queue = queue.Queue(maxsize=1)
+    decoder = threading.Thread(
+        target=_decode_worker,
+        args=(job.path, img_size, req_q, out_q, job.n_native, video_fps, model_fps),
+        daemon=True,
     )
+    decoder.start()
     hits5 = 0
     hits1 = 0
     n_eval = 0
+
+    def _take():
+        clip = out_q.get()
+        if isinstance(clip, Exception):
+            raise clip
+        return clip
+
     try:
-        fill = decode_span(vr, 0, CACHE_FRAMES, job.n_native, video_fps, model_fps)
+        req_q.put((0, CACHE_FRAMES))
+        fill = _take()
+        if job.n_steps > 0:
+            req_q.put((CACHE_FRAMES, CACHE_FRAMES + NEW_FRAMES))
         with torch.no_grad():
             state = raw.stream.fill(normalize_clip(fill, device), refresh_scores=False)
         state = detach_state(state)
         del fill
         for step in range(job.n_steps):
-            m0 = CACHE_FRAMES + step * NEW_FRAMES
-            m1 = m0 + NEW_FRAMES
             pairs = labels.get(step) or []
+            new = _take()
+            nxt = step + 1
+            if nxt < job.n_steps:
+                n0 = CACHE_FRAMES + nxt * NEW_FRAMES
+                req_q.put((n0, n0 + NEW_FRAMES))
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 scores = _score_pack(raw, state, chunk)
                 mode, slot_scores, protected_ids, cur_topk = _prune_inputs(raw, state, scores)
                 scored_ids = state.slot_ids
-                new = decode_span(vr, m0, m1, job.n_native, video_fps, model_fps)
                 clips_new = normalize_clip(new, device)
                 del new
-                supervised = bool(train and pairs)
+                supervised = bool(train and pairs and step >= int(warmup_steps))
                 if supervised:
                     state = raw.stream.step(
                         state,
@@ -385,7 +434,9 @@ def run_video(
                 if not torch.isfinite(loss.detach()):
                     loss = out["action"].sum() * 0.0
                     n_lab = 0
-                if n_lab > 0:
+                if n_lab > 0 and defer_step:
+                    step_yield = (step, loss, n_lab)
+                elif n_lab > 0:
                     scaler.scale(loss).backward()
                     scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(
@@ -394,8 +445,9 @@ def run_video(
                     scaler.step(opt)
                     scaler.update()
                     step_yield = (step, float(loss.detach()), n_lab)
-                opt.zero_grad(set_to_none=True)
-                del loss, out
+                if step_yield is None or not defer_step:
+                    opt.zero_grad(set_to_none=True)
+                    del loss, out
             elif pairs and not train:
                 v = torch.tensor([p[0] for p in pairs], dtype=torch.long)
                 n = torch.tensor([p[1] for p in pairs], dtype=torch.long)
@@ -411,8 +463,16 @@ def run_video(
             state = detach_state(state)
             if step_yield is not None:
                 yield step_yield
+                if defer_step:
+                    opt.zero_grad(set_to_none=True)
+                    del loss, out
+            elif defer_step:
+                yield (step, None, 0)
     finally:
-        del vr
+        try:
+            req_q.put_nowait(None)
+        except queue.Full:
+            pass
     run_video.last_hits = (hits5, hits1, n_eval)
 
 
@@ -433,6 +493,48 @@ def _truncate_steps(path: Path, keep_step: int):
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         w.writerows(kept)
+
+
+def _rank_queues(order: list[int], jobs: list, world: int) -> list[list[int]]:
+    """Give each rank its own videos. Totals are balanced by stream length."""
+    if world <= 1:
+        return [list(order)]
+    remaining = sorted(order, key=lambda i: (jobs[i].n_steps, i), reverse=True)
+    queues: list[list[int]] = [[] for _ in range(world)]
+    load = [0] * world
+    for jidx in remaining:
+        rank_i = min(range(world), key=lambda i: (load[i], i))
+        queues[rank_i].append(jidx)
+        load[rank_i] += int(jobs[jidx].n_steps)
+    return queues
+
+
+def _sync_supervised(raw, opt, scaler, loss, n_lab, device):
+    """Average gradients over ranks that have a label, then take one optimizer step."""
+    trainable = [p for p in raw.parameters() if p.requires_grad]
+    active = torch.zeros((), device=device)
+    if loss is not None and n_lab > 0:
+        scaler.scale(loss).backward()
+        active.fill_(1)
+    else:
+        opt.zero_grad(set_to_none=True)
+        for p in trainable:
+            p.grad = torch.zeros_like(p)
+        scaler.scale(trainable[0].reshape(-1)[:1].sum() * 0).backward()
+    dist.all_reduce(active, op=dist.ReduceOp.SUM)
+    n_act = float(active.item())
+    for p in trainable:
+        if p.grad is None:
+            p.grad = torch.zeros_like(p)
+        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+        if n_act > 0:
+            p.grad.div_(n_act)
+    scaler.unscale_(opt)
+    if n_act > 0:
+        torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+        scaler.step(opt)
+    scaler.update()
+    opt.zero_grad(set_to_none=True)
 
 
 def main():
@@ -505,11 +607,6 @@ def main():
             return
 
     rank, world, local = setup_ddp()
-    if world != 1:
-        raise SystemExit(
-            "whole-video stream is 1 GPU (videos differ in length; "
-            "multi-rank DDP would hang). Launch one script per GPU."
-        )
     device = torch.device(f"cuda:{local}")
     is_main = rank == 0
     out_dir = args.out_dir
@@ -518,10 +615,11 @@ def main():
         logger.info(
             "stream-video participant=%s horizon=%.1fs rope=%s only_block0=%s time=%s "
             "prune=%s protect_hist=%d protect_k=%d score_hist=%d videos=%d "
-            "train_labels=%d val_labels=%d steps=%d out=%s",
+            "train_labels=%d val_labels=%d steps=%d world=%d ckpt=%s out=%s",
             args.participant, args.horizon, bool(args.rope), bool(args.only_block0),
             args.rope_time, args.prune_mode, args.protect_hist, args.protect_k,
-            args.score_hist, len(jobs), n_train, n_val, sum(j.n_steps for j in jobs), out_dir,
+            args.score_hist, len(jobs), n_train, n_val, sum(j.n_steps for j in jobs),
+            world, args.checkpoint, out_dir,
         )
 
     verb_map, noun_map, action_map = build_class_maps(args.train_csv)
@@ -596,6 +694,7 @@ def main():
     start_video = 0
     loss_meter = 0.0
     n_step = 0
+    rank_cursors_box = {"cur": None}
     loss_steps_path = out_dir / "loss_steps.csv"
     loss_epoch_path = out_dir / "loss_epoch.csv"
     latest_path = out_dir / "latest.pt"
@@ -613,6 +712,8 @@ def main():
         start_video = int(ck.get("next_video", 0))
         loss_meter = float(ck.get("loss_meter", 0.0))
         n_step = int(ck.get("n_step", 0))
+        if ck.get("rank_cursors"):
+            rank_cursors_box["cur"] = [[int(a), int(b)] for a, b in ck["rank_cursors"]]
         if is_main:
             _truncate_steps(loss_steps_path, global_step)
             logger.info(
@@ -649,7 +750,8 @@ def main():
             "partial": next_video > 0,
             "loss_meter": float(loss_meter),
             "n_step": int(n_step),
-            "world_size": 1,
+            "world_size": int(world),
+            "rank_cursors": rank_cursors_box["cur"],
             "probe": _trainable_sd(raw.clf),
             "backbone": _trainable_sd(raw.backbone),
             "opt": opt.state_dict(),
@@ -693,51 +795,161 @@ def main():
                 n_step = 0
             bundle.train()
             t_ep = time.time()
-            for vi, jidx in enumerate(order):
-                if vi < skip or stop["flag"]:
-                    continue
-                job = jobs[jidx]
+            if world == 1:
+                for vi, jidx in enumerate(order):
+                    if vi < skip or stop["flag"]:
+                        continue
+                    job = jobs[jidx]
+                    if is_main:
+                        logger.info(
+                            "ep%d video %d/%d %s steps=%d train_labels=%d",
+                            ep, vi + 1, len(order), job.video_id, job.n_steps,
+                            sum(len(v) for v in job.train_at.values()),
+                        )
+                    for stream_step, loss_val, n_lab in run_video(
+                        raw, job, split="train", device=device, model_fps=float(args.fps),
+                        video_fps=VIDEO_FPS, img_size=args.img_size, chunk=args.chunk,
+                        train=True, crit=crit, maps=maps, opt=opt, scaler=scaler,
+                    ):
+                        loss_meter += loss_val
+                        n_step += 1
+                        global_step += 1
+                        if is_main:
+                            avg = loss_meter / max(1, n_step)
+                            loss_steps_w.writerow({
+                                "global_step": global_step,
+                                "epoch": ep,
+                                "video_index": vi,
+                                "video_id": job.video_id,
+                                "stream_step": stream_step,
+                                "loss": f"{loss_val:.6f}",
+                                "avg_loss": f"{avg:.6f}",
+                                "n_labels": n_lab,
+                                "wall_sec": f"{time.time() - t_run:.1f}",
+                            })
+                            if global_step % args.log_every == 0:
+                                loss_steps_f.flush()
+                                logger.info(
+                                    "[ep%d step%d] loss=%.4f avg=%.4f video=%s stream_step=%d",
+                                    ep, global_step, loss_val, avg, job.video_id, stream_step,
+                                )
+                    save_ckpt(ep, vi + 1)
+                    if is_main and loss_steps_f is not None:
+                        loss_steps_f.flush()
+            else:
+                queues = _rank_queues(order, jobs, world)
+                my_q = queues[rank]
+                if ep == start_ep and rank_cursors_box["cur"]:
+                    qpos, next_step = rank_cursors_box["cur"][rank]
+                else:
+                    qpos, next_step = 0, 0
                 if is_main:
+                    loads = [sum(jobs[j].n_steps for j in q) for q in queues]
+                    logger.info("ep%d per-rank steps %s", ep, loads)
+
+                def _open(pos, warm):
+                    if pos >= len(my_q):
+                        return None, None
+                    j = jobs[my_q[pos]]
                     logger.info(
-                        "ep%d video %d/%d %s steps=%d train_labels=%d",
-                        ep, vi + 1, len(order), job.video_id, job.n_steps,
-                        sum(len(v) for v in job.train_at.values()),
+                        "ep%d rank%d video %d/%d %s warmup=%d",
+                        ep, rank, pos + 1, len(my_q), j.video_id, warm,
                     )
-                for stream_step, loss_val, n_lab in run_video(
-                    raw, job, split="train", device=device, model_fps=float(args.fps),
-                    video_fps=VIDEO_FPS, img_size=args.img_size, chunk=args.chunk,
-                    train=True, crit=crit, maps=maps, opt=opt, scaler=scaler,
-                ):
-                    loss_meter += loss_val
-                    n_step += 1
+                    return iter(run_video(
+                        raw, j, split="train", device=device, model_fps=float(args.fps),
+                        video_fps=VIDEO_FPS, img_size=args.img_size, chunk=args.chunk,
+                        train=True, crit=crit, maps=maps, opt=opt, scaler=scaler,
+                        defer_step=True, warmup_steps=warm,
+                    )), j
+
+                gen, job = _open(qpos, int(next_step))
+                while True:
+                    halt = torch.tensor([1.0 if stop["flag"] else 0.0], device=device)
+                    dist.all_reduce(halt, op=dist.ReduceOp.MAX)
+                    if float(halt.item()) > 0:
+                        stop["flag"] = True
+                        save_ckpt(ep, qpos)
+                        break
+                    loss, n_lab, stream_step, has = None, 0, -1, False
+                    if gen is not None:
+                        try:
+                            stream_step, loss, n_lab = next(gen)
+                            has = True
+                            next_step = int(stream_step) + 1
+                        except StopIteration:
+                            qpos += 1
+                            next_step = 0
+                            gen, job = _open(qpos, 0)
+                            while gen is not None and not has:
+                                try:
+                                    stream_step, loss, n_lab = next(gen)
+                                    has = True
+                                    next_step = int(stream_step) + 1
+                                except StopIteration:
+                                    qpos += 1
+                                    next_step = 0
+                                    gen, job = _open(qpos, 0)
+                    alive = torch.tensor([1.0 if has else 0.0], device=device)
+                    dist.all_reduce(alive, op=dist.ReduceOp.SUM)
+                    local_cur = torch.tensor([int(qpos), int(next_step)], dtype=torch.long, device=device)
+                    gathered = [torch.zeros(2, dtype=torch.long, device=device) for _ in range(world)]
+                    dist.all_gather(gathered, local_cur)
+                    rank_cursors_box["cur"] = [g.tolist() for g in gathered]
+                    if float(alive.item()) <= 0:
+                        save_ckpt(ep, qpos)
+                        break
+                    has_loss = loss is not None and int(n_lab) > 0
+                    loss_flag = torch.tensor([1.0 if has_loss else 0.0], device=device)
+                    dist.all_reduce(loss_flag, op=dist.ReduceOp.SUM)
+                    if float(loss_flag.item()) <= 0:
+                        continue
+                    _sync_supervised(
+                        raw, opt, scaler,
+                        loss if has_loss else None,
+                        int(n_lab) if has_loss else 0,
+                        device,
+                    )
+                    packed = torch.zeros(3, device=device)
+                    if has_loss:
+                        packed[0] = float(loss.detach())
+                        packed[1] = 1.0
+                        packed[2] = float(n_lab)
+                    dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+                    if float(packed[1].item()) <= 0:
+                        continue
                     global_step += 1
+                    step_loss = float(packed[0].item()) / float(packed[1].item())
+                    loss_meter += step_loss
+                    n_step += 1
                     if is_main:
                         avg = loss_meter / max(1, n_step)
+                        vid = job.video_id if job is not None else "-"
                         loss_steps_w.writerow({
                             "global_step": global_step,
                             "epoch": ep,
-                            "video_index": vi,
-                            "video_id": job.video_id,
-                            "stream_step": stream_step,
-                            "loss": f"{loss_val:.6f}",
+                            "video_index": qpos,
+                            "video_id": vid,
+                            "stream_step": stream_step if has else -1,
+                            "loss": f"{step_loss:.6f}",
                             "avg_loss": f"{avg:.6f}",
-                            "n_labels": n_lab,
+                            "n_labels": int(packed[2].item()),
                             "wall_sec": f"{time.time() - t_run:.1f}",
                         })
                         if global_step % args.log_every == 0:
                             loss_steps_f.flush()
                             logger.info(
-                                "[ep%d step%d] loss=%.4f avg=%.4f video=%s stream_step=%d",
-                                ep, global_step, loss_val, avg, job.video_id, stream_step,
+                                "[ep%d step%d] loss=%.4f avg=%.4f video=%s",
+                                ep, global_step, step_loss, avg, vid,
                             )
-                save_ckpt(ep, vi + 1)
-                if is_main and loss_steps_f is not None:
-                    loss_steps_f.flush()
+                        if global_step % 200 == 0:
+                            save_ckpt(ep, qpos)
             if stop["flag"]:
                 break
             bundle.eval()
             hits5 = hits1 = n_eval = 0
-            for job in jobs:
+            for j_i, job in enumerate(jobs):
+                if world > 1 and (j_i % world) != rank:
+                    continue
                 for _step, _loss, _n in run_video(
                     raw, job, split="val", device=device, model_fps=float(args.fps),
                     video_fps=VIDEO_FPS, img_size=args.img_size, chunk=args.chunk,
@@ -748,8 +960,17 @@ def main():
                 hits5 += h5
                 hits1 += h1
                 n_eval += n
-            top5 = 100.0 * hits5 / max(1, n_eval)
-            top1 = 100.0 * hits1 / max(1, n_eval)
+            tally = torch.tensor(
+                [float(hits5), float(hits1), float(n_eval), float(loss_meter), float(n_step)],
+                device=device, dtype=torch.float64,
+            )
+            if world > 1:
+                hits = tally[:3].contiguous()
+                dist.all_reduce(hits, op=dist.ReduceOp.SUM)
+                tally[:3] = hits
+            top5 = 100.0 * float(tally[0].item()) / max(1.0, float(tally[2].item()))
+            top1 = 100.0 * float(tally[1].item()) / max(1.0, float(tally[2].item()))
+            n_eval = int(tally[2].item())
             train_loss = loss_meter / max(1, n_step)
             ep_sec = time.time() - t_ep
             row = {

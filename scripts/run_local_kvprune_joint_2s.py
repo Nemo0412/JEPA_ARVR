@@ -100,6 +100,7 @@ from app.hdepic_lora_action_anticipation.stream_kvcache_attn_prune import (  # n
     ProbeTemporalRoPE,
     StreamKVAttnPruneEncoder,
     max_abs_slot_scores,
+    pack_imu_by_slots,
     probe_blk0_slot_scores,
     token_frame_ids_from_slots,
     topk_slot_ids_from_scores,
@@ -108,6 +109,7 @@ from app.hdepic_lora_action_anticipation.train_stream_mtp import (  # noqa: E402
     IMAGENET_MEAN,
     IMAGENET_STD,
     build_model,
+    load_lora_sidecars,
     map_labels,
     topk_acc,
 )
@@ -200,12 +202,83 @@ class ClipAnticipationDataset(Dataset):
         }
 
 
+class GazeImuClipDataset(ClipAnticipationDataset):
+    """Same 128+34 clip window as RoPE all, plus the Gaze+IMU best aux inputs.
+
+    2-channel gaze+pose map and IMU trajectories. Builders are created lazily
+    inside each worker so the DataLoader can spawn.
+    """
+
+    def __init__(self, *args, gaze_cfg: dict, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gaze_cfg = dict(gaze_cfg)
+        self._map_builder = None
+        self._imu_loader = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_map_builder"] = None
+        state["_imu_loader"] = None
+        return state
+
+    def _ensure_aux(self):
+        if self._map_builder is not None and self._imu_loader is not None:
+            return
+        from app.hdepic_lora_action_anticipation.gaze import GazeTokenGate
+        from app.hdepic_lora_action_anticipation.pose_map_builder import GazePoseInputMapBuilder
+        from app.hdepic_lora_action_anticipation.tri_modal_fusion import ImuTrajectoryLoader
+
+        gate = GazeTokenGate({**self.gaze_cfg, "mode": "token_gate", "learnable_gate": False})
+        self._map_builder = GazePoseInputMapBuilder(self.gaze_cfg, gate=gate)
+        self._imu_loader = ImuTrajectoryLoader(self.gaze_cfg, gate=gate)
+
+    def __getitem__(self, idx: int):
+        sample = super().__getitem__(idx)
+        self._ensure_aux()
+        r = self.rows[idx]
+        frame_idx = np.asarray(r["frame_idx"], dtype=np.int64)
+        t = int(sample["clip"].shape[1])
+        h = int(sample["clip"].shape[2])
+        w = int(sample["clip"].shape[3])
+        meta = {
+            "video_id": r["video_id"],
+            "frame_indices": frame_idx,
+            "vfps": float(self.video_fps),
+            "start_frame": int(frame_idx[0]),
+        }
+        aux = self._map_builder.build_cpu([meta], t, h, w)[0]
+        imu = self._imu_loader.load_batch([meta], torch.device("cpu"))
+        sample["aux_map"] = aux.float()
+        if imu is None:
+            sample["imu"] = torch.zeros(t, 128, 6)
+            sample["imu_len"] = torch.ones(t, dtype=torch.long)
+        else:
+            sample["imu"] = imu[0][0]
+            sample["imu_len"] = imu[1][0]
+        return sample
+
+
 def collate(batch):
-    return {
+    out = {
         "clip": torch.stack([b["clip"] for b in batch], dim=0),
         "verb": torch.stack([b["verb"] for b in batch], dim=0),
         "noun": torch.stack([b["noun"] for b in batch], dim=0),
     }
+    if "aux_map" in batch[0]:
+        out["aux_map"] = torch.stack([b["aux_map"] for b in batch], dim=0)
+        out["imu"] = torch.stack([b["imu"] for b in batch], dim=0)
+        out["imu_len"] = torch.stack([b["imu_len"] for b in batch], dim=0)
+    return out
+
+
+def _batch_aux(batch, device):
+    if "aux_map" not in batch:
+        return None, None, None
+    return (
+        batch["aux_map"].to(device, non_blocking=True).float(),
+        batch["imu"].to(device, non_blocking=True).float(),
+        batch["imu_len"].to(device, non_blocking=True),
+    )
 
 
 def build_class_maps(train_csv: Path):
@@ -361,9 +434,13 @@ class JointBundle(nn.Module):
         self_only: bool = False,
         prune_mode: str = "last",
         score_hist: int = 3,
+        gaze_model: nn.Module | None = None,
     ):
         super().__init__()
-        self.backbone = backbone
+        # Gaze model already owns the video backbone. Registering it twice errors.
+        self.gaze_model = gaze_model
+        if gaze_model is None:
+            self.backbone = backbone
         self.clf = clf
         self.chunk = int(chunk)
         self.stream_steps = int(stream_steps)
@@ -396,16 +473,26 @@ class JointBundle(nn.Module):
                 only_block0=bool(only_block0),
             )
 
-    def forward(self, clips: torch.Tensor):
+    def video_backbone(self):
+        if self.gaze_model is not None:
+            return self.gaze_model.base_model
+        return self.backbone
+
+    def forward(self, clips: torch.Tensor, aux_map=None, imu=None, imu_len=None):
+        bb = self.video_backbone()
+        if self.gaze_model is not None:
+            if aux_map is None:
+                raise RuntimeError("gaze+imu forward requires aux_map")
+            clips = self.gaze_model.input_adapter(clips, aux_map)
         if self.no_kv:
-            tok = encode_clip(self.backbone.encoder, clips, int(self.backbone.embed_dim))
+            tok = encode_clip(bb.encoder, clips, int(bb.embed_dim))
             frame_ids = None
         else:
             tok, frame_ids = encode_joint(
                 self.stream,
                 self.clf.pooler,
                 clips,
-                int(self.backbone.embed_dim),
+                int(bb.embed_dim),
                 self.chunk,
                 stream_steps=self.stream_steps,
                 protect_hist=self.protect_hist,
@@ -414,6 +501,32 @@ class JointBundle(nn.Module):
                 prune_mode=self.prune_mode,
                 score_hist=self.score_hist,
             )
+        if self.gaze_model is not None and imu is not None and frame_ids is not None:
+            slot_ids = frame_ids[:, :: self.stream.gp]
+            imu_p, len_p = pack_imu_by_slots(imu, imu_len, slot_ids, self.stream.tubelet_size)
+            tri = self.gaze_model.tri
+            # Fusion counts time from gaze_map frames, then divides by tubelet.
+            # Packed IMU is already one tubelet pair per kept slot, so pass that
+            # frame count. Omitting the map makes it divide the slot count again.
+            n_frames = int(slot_ids.size(1) * self.stream.tubelet_size)
+            gaze_time = tok.new_zeros(tok.size(0), 1, n_frames, 1, 1)
+            tok = tri._fuse_for_predictor(tok, gaze_map=gaze_time, imu_batch=(imu_p, len_p))
+            n_aux = int(getattr(tri, "_n_aux_context_tokens", 0) or 0)
+            if n_aux:
+                # Prefix is slot-major, n_imu tokens per kept slot. Give those
+                # tokens that slot's time so probe RoPE matches RoPE-all on the
+                # video tokens and does not pin the whole IMU prefix at t=0.
+                n_imu = int(getattr(tri, "n_imu_tokens", 0) or 0)
+                n_slots = int(slot_ids.size(1))
+                if n_imu <= 0 or n_aux != n_slots * n_imu:
+                    raise RuntimeError(
+                        f"IMU prefix length {n_aux} != slots {n_slots} * n_imu {n_imu}"
+                    )
+                aux_ids = slot_ids.repeat_interleave(n_imu, dim=1)
+                frame_ids = torch.cat([aux_ids, frame_ids], dim=1)
+            embed_dim = int(bb.embed_dim)
+            if tok.size(-1) != embed_dim:
+                tok = tok[:, :, -embed_dim:]
         if self._rope is not None and self.rope_time == "relpred":
             if self.stream is None:
                 raise RuntimeError("relpred RoPE needs stream slot ids")
@@ -431,7 +544,73 @@ class JointBundle(nn.Module):
 
     @property
     def encoder(self):
-        return self.backbone.encoder
+        return self.video_backbone().encoder
+
+
+def _build_gaze_imu(backbone: nn.Module, device, args) -> nn.Module:
+    """Gaze+IMU best: 5ch adapter, IMU cross-attn L=3, keep-aux, soft-gate."""
+    del device
+    from app.hdepic_lora_action_anticipation.binary_input_adapter import BinaryMapInputAdapter
+    from app.hdepic_lora_action_anticipation.concat_plus_cross_attn import (
+        ConcatPlusCrossAttnAdaptedModel,
+    )
+    from app.hdepic_lora_action_anticipation.train_stream_mtp_concat_ca import _load_adapter_ckpt
+    from app.hdepic_lora_action_anticipation.tri_modal_fusion import (
+        ImuTemporalEncoder,
+        ProjectedTriModalCrossAttention,
+        compute_token_budgets,
+        load_tri_modal_fusion_checkpoint,
+    )
+
+    embed_dim = int(backbone.embed_dim)
+    grid = int(backbone.grid_size)
+    _n_v, _n_g, n_i = compute_token_budgets(
+        grid * grid, gaze_grid_size=10, gaze_token_ratio=0.5, imu_token_ratio=0.1,
+    )
+    adapter = BinaryMapInputAdapter(
+        hidden_dim=8, scale=1.0, temporal_kernel=3, binary_center=0.0,
+        residual_clamp=1.0, in_channels=5,
+    )
+    _load_adapter_ckpt(adapter, str(args.adapter_ckpt))
+    for p in adapter.parameters():
+        p.requires_grad = True
+    fusion_cfg = {
+        "use_gaze_branch": False,
+        "use_imu_branch": True,
+        "keep_aux_tokens_in_predictor": True,
+        "gaze_grid_size": 10,
+        "gaze_token_ratio": 0.5,
+        "imu_token_ratio": 0.1,
+        "imu_encoder_type": "gru",
+        "imu_hidden_dim": 128,
+        "imu_num_layers": 1,
+        "imu_dropout": 0.1,
+        "fusion_num_heads": 4,
+        "fusion_num_layers": 3,
+        "use_gated_residual": True,
+        "gate_bias_init": -2.0,
+        "dropout": 0.0,
+        "video_query_side": "video",
+        "use_ffn": False,
+        "ffn_mult": 4,
+    }
+    fusion = ProjectedTriModalCrossAttention(
+        embed_dim=embed_dim, attn_dim=embed_dim, num_heads=4, num_layers=3,
+        dropout=0.0, use_gated_residual=True, use_gaze_branch=False, use_imu_branch=True,
+        gate_bias_init=-2.0, video_query_side="video", use_ffn=False, ffn_mult=4,
+    )
+    imu_encoder = ImuTemporalEncoder(
+        embed_dim=embed_dim, input_dim=6, hidden_dim=128, num_imu_tokens=n_i,
+        encoder_type="gru", num_layers=1, dropout=0.1,
+    )
+    wrapped = ConcatPlusCrossAttnAdaptedModel(
+        backbone, input_adapter=adapter, fusion=fusion, imu_encoder=imu_encoder,
+        gaze_encoder=None, fusion_cfg=fusion_cfg, ca_aux="imu",
+    )
+    load_tri_modal_fusion_checkpoint(wrapped, str(args.fusion_ckpt))
+    for p in list(wrapped.fusion.parameters()) + list(wrapped.imu_encoder.parameters()):
+        p.requires_grad = True
+    return wrapped
 
 
 def setup_ddp():
@@ -456,8 +635,9 @@ def evaluate(bundle_mod, loader, device, maps, chunk, rank):
     top5_sum = top1_sum = n = 0.0
     for batch in loader:
         clips = normalize_clip(batch["clip"], device)
+        aux, imu, imu_len = _batch_aux(batch, device)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            out, _ = bundle_mod(clips)
+            out, _ = bundle_mod(clips, aux, imu, imu_len)
         v_lab, n_lab, a_lab, keep = map_labels(
             batch["verb"].to(device), batch["noun"].to(device), verb_map, noun_map, action_map, device
         )
@@ -565,6 +745,12 @@ def main():
     ap.add_argument("--max-train", type=int, default=0, help="0 = full train split")
     ap.add_argument("--max-val", type=int, default=0, help="0 = full val split")
     ap.add_argument("--epochs", type=int, default=8)
+    ap.add_argument(
+        "--max-steps",
+        type=int,
+        default=0,
+        help="Stop after this many optimizer steps and keep latest.pt (0 = run all epochs)",
+    )
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--lora-lr-mult", type=float, default=0.5)
     ap.add_argument("--batch-size", type=int, default=1)
@@ -591,6 +777,35 @@ def main():
     )
     ap.add_argument("--val-every-epochs", type=int, default=1)
     ap.add_argument("--patience", type=int, default=3)
+    ap.add_argument(
+        "--gaze-imu",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="1 = Gaze+IMU best path (5ch adapter, IMU CA L3, keep-aux) on the RoPE-all probe",
+    )
+    _ca = Path(
+        "/scratch/ll5914/experiments/concat_plus_cross_attn_v2/action_anticipation_frozen/"
+        "concat-plus-ca-v2-L3-keepaux-softgate-vitl16-256-12ep-1xh100"
+    )
+    ap.add_argument("--encoder-lora", type=Path, default=_ca / "encoder_lora_best.pt")
+    ap.add_argument("--adapter-ckpt", type=Path, default=_ca / "binary_input_adapter_best.pt")
+    ap.add_argument("--fusion-ckpt", type=Path, default=_ca / "tri_modal_fusion_best.pt")
+    ap.add_argument("--gaze-root", type=Path, default=Path("/scratch/ll5914/datasets/HD-EPIC/SLAM-and-Gaze"))
+    ap.add_argument("--gaze-extract-root", type=Path, default=Path("/scratch/ll5914/datasets/HD-EPIC/_gaze_extract"))
+    ap.add_argument("--gaze-sync-root", type=Path, default=Path("/scratch/ll5914/datasets/HD-EPIC/HD-EPIC/Videos"))
+    ap.add_argument(
+        "--pose-slam-root",
+        type=Path,
+        default=Path("/scratch/ll5914/datasets/HD-EPIC/SLAM-and-Gaze/P01/SLAM/multi"),
+    )
+    ap.add_argument(
+        "--pose-mapping-json",
+        type=Path,
+        default=Path("/scratch/ll5914/datasets/HD-EPIC/SLAM-and-Gaze/P01/SLAM/multi/vrs_to_multi_slam.json"),
+    )
+    ap.add_argument("--adapter-lr-mult", type=float, default=0.25)
+    ap.add_argument("--fusion-lr-mult", type=float, default=2.0)
     ap.add_argument(
         "--resume",
         type=int,
@@ -639,6 +854,8 @@ def main():
             tag = "rope_blk0"
         elif args.rope:
             tag = "rope_all"
+        if int(args.gaze_imu):
+            tag = f"{tag}_gaze_imu_slotrope"
         if args.rope and args.rope_time == "relpred":
             tag = f"{tag}_relpred"
         if prune_mode == "rank":
@@ -686,17 +903,37 @@ def main():
     # for 128+34 joint stream encode; early blocks run under no_grad).
     for p in backbone.parameters():
         p.requires_grad = False
-    n_lora = inject_encoder_lora(
-        backbone,
-        rank=args.lora_rank,
-        alpha=args.lora_alpha,
-        dropout=0.0,
-        last_n_blocks=12,
-        target_suffixes=("attn.qkv", "attn.proj"),
-    )
-    set_encoder_lora_trainable(backbone, trainable=True)
-    if is_main:
-        logger.info("injected encoder LoRA modules≈%s", n_lora)
+    gaze_model = None
+    if int(args.gaze_imu):
+        for need in (args.encoder_lora, args.adapter_ckpt, args.fusion_ckpt):
+            if not Path(need).is_file():
+                raise SystemExit(f"missing Gaze+IMU checkpoint: {need}")
+        # Gaze+IMU best LoRA covers every encoder block (dropout 0.05). Load that,
+        # then keep it trainable the way RoPE all trains encoder LoRA.
+        load_lora_sidecars(
+            backbone, str(args.encoder_lora), None,
+            encoder_trainable=True, predictor_trainable=False,
+        )
+        gaze_model = _build_gaze_imu(backbone, device, args)
+        if is_main:
+            logger.info(
+                "Gaze+IMU on: adapter=%s fusion=%s encoder_lora=%s "
+                "L=3 keep_aux soft-gate  adapter_lr=%.2fx fusion_lr=%.2fx",
+                args.adapter_ckpt, args.fusion_ckpt, args.encoder_lora,
+                args.adapter_lr_mult, args.fusion_lr_mult,
+            )
+    else:
+        n_lora = inject_encoder_lora(
+            backbone,
+            rank=args.lora_rank,
+            alpha=args.lora_alpha,
+            dropout=0.0,
+            last_n_blocks=12,
+            target_suffixes=("attn.qkv", "attn.proj"),
+        )
+        set_encoder_lora_trainable(backbone, trainable=True)
+        if is_main:
+            logger.info("injected encoder LoRA modules≈%s", n_lora)
 
     clf = AttentiveClassifier(
         verb_classes=verb_map,
@@ -722,6 +959,7 @@ def main():
         self_only=bool(args.new_self_only),
         prune_mode=prune_mode,
         score_hist=score_hist,
+        gaze_model=gaze_model,
     ).to(device)
     bundle.rope_time = str(args.rope_time)
     bundle.horizon_sec = float(horizon)
@@ -740,13 +978,24 @@ def main():
     bundle = DDP(bundle, device_ids=[local], find_unused_parameters=True)
     raw = bundle.module
 
-    train_ds = ClipAnticipationDataset(
+    ds_cls = GazeImuClipDataset if int(args.gaze_imu) else ClipAnticipationDataset
+    ds_extra = {}
+    if int(args.gaze_imu):
+        from app.hdepic_lora_action_anticipation.train_stream_mtp_concat_ca import default_gaze_cfg
+
+        ds_extra["gaze_cfg"] = default_gaze_cfg(
+            str(args.gaze_root), str(args.gaze_extract_root), str(args.gaze_sync_root),
+            str(args.pose_slam_root), str(args.pose_mapping_json), args.img_size,
+        )
+    train_ds = ds_cls(
         args.train_csv, args.video_root, horizon_sec=horizon, model_fps=args.fps,
         img_size=args.img_size, n_model=total_frames, max_samples=args.max_train,
+        **ds_extra,
     )
-    val_ds = ClipAnticipationDataset(
+    val_ds = ds_cls(
         args.val_csv, args.video_root, horizon_sec=horizon, model_fps=args.fps,
         img_size=args.img_size, n_model=total_frames, max_samples=args.max_val,
+        **ds_extra,
     )
     train_samp = DistributedSampler(train_ds, num_replicas=world, rank=rank, shuffle=True)
     val_samp = DistributedSampler(val_ds, num_replicas=world, rank=rank, shuffle=False)
@@ -765,15 +1014,20 @@ def main():
             args.num_workers, os.environ.get("DECORD_THREADS", "2"),
         )
 
-    lora_params = [p for n, p in raw.backbone.named_parameters() if p.requires_grad]
+    lora_params = [p for n, p in raw.video_backbone().named_parameters() if p.requires_grad]
     probe_params = [p for p in raw.clf.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(
-        [
-            {"params": probe_params, "lr": args.lr},
-            {"params": lora_params, "lr": args.lr * args.lora_lr_mult},
-        ],
-        weight_decay=1e-4,
-    )
+    opt_groups = [
+        {"params": probe_params, "lr": args.lr},
+        {"params": lora_params, "lr": args.lr * args.lora_lr_mult},
+    ]
+    if raw.gaze_model is not None:
+        adapter_params = [p for p in raw.gaze_model.input_adapter.parameters() if p.requires_grad]
+        fusion_params = [p for p in raw.gaze_model.fusion.parameters() if p.requires_grad]
+        if raw.gaze_model.imu_encoder is not None:
+            fusion_params += [p for p in raw.gaze_model.imu_encoder.parameters() if p.requires_grad]
+        opt_groups.append({"params": adapter_params, "lr": args.lr * args.adapter_lr_mult})
+        opt_groups.append({"params": fusion_params, "lr": args.lr * args.fusion_lr_mult})
+    opt = torch.optim.AdamW(opt_groups, weight_decay=1e-4)
     scaler = torch.cuda.amp.GradScaler(enabled=True)
     crit = nn.CrossEntropyLoss()
 
@@ -804,7 +1058,14 @@ def main():
     if resume_ck is not None:
         ck = torch.load(resume_ck, map_location="cpu", weights_only=False)
         raw.clf.load_state_dict(ck["probe"], strict=False)
-        raw.backbone.load_state_dict(ck["backbone"], strict=False)
+        raw.video_backbone().load_state_dict(ck["backbone"], strict=False)
+        if raw.gaze_model is not None:
+            if ck.get("input_adapter"):
+                raw.gaze_model.input_adapter.load_state_dict(ck["input_adapter"], strict=False)
+            if ck.get("fusion"):
+                raw.gaze_model.fusion.load_state_dict(ck["fusion"], strict=False)
+            if ck.get("imu_encoder") and raw.gaze_model.imu_encoder is not None:
+                raw.gaze_model.imu_encoder.load_state_dict(ck["imu_encoder"], strict=False)
         if ck.get("opt") is not None:
             try:
                 opt.load_state_dict(ck["opt"])
@@ -940,7 +1201,7 @@ def main():
             "n_step": int(n_step_v) if partial else 0,
             "world_size": int(world),
             "probe": _trainable_sd(raw.clf),
-            "backbone": _trainable_sd(raw.backbone),
+            "backbone": _trainable_sd(raw.video_backbone()),
             "opt": opt.state_dict(),
             "scaler": scaler.state_dict(),
             "best_top5": best_top5,
@@ -951,6 +1212,11 @@ def main():
             "only_block0": only_block0,
             "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
         }
+        if raw.gaze_model is not None:
+            payload["input_adapter"] = raw.gaze_model.input_adapter.state_dict()
+            payload["fusion"] = raw.gaze_model.fusion.state_dict()
+            if raw.gaze_model.imu_encoder is not None:
+                payload["imu_encoder"] = raw.gaze_model.imu_encoder.state_dict()
         if partial and ep_indices_by_rank is not None:
             payload["ep_indices_by_rank"] = ep_indices_by_rank
             if ep_indices_by_rank and int(resume_iter) < len(ep_indices_by_rank[0]):
@@ -999,6 +1265,7 @@ def main():
     signal.signal(signal.SIGINT, _on_signal)
 
     early_stop = False
+    max_steps_hit = False
     try:
         for ep in range(start_ep, args.epochs):
             if stop_flag["stop"]:
@@ -1072,9 +1339,10 @@ def main():
             for local_i, batch in enumerate(ep_loader):
                 it = skip + local_i
                 clips = normalize_clip(batch["clip"], device)
+                aux, imu, imu_len = _batch_aux(batch, device)
                 opt.zero_grad(set_to_none=True)
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    out, _frame_ids = bundle(clips)
+                    out, _frame_ids = bundle(clips, aux, imu, imu_len)
                     v_lab, n_lab, a_lab, keep = map_labels(
                         batch["verb"].to(device), batch["noun"].to(device),
                         verb_map, noun_map, action_map, device,
@@ -1132,7 +1400,8 @@ def main():
                 )
                 dist.all_reduce(stop_t, op=dist.ReduceOp.MAX)
                 stopping = int(stop_t.item()) > 0
-                if do_periodic or stopping:
+                hit_max = int(args.max_steps) > 0 and global_step >= int(args.max_steps)
+                if do_periodic or stopping or hit_max:
                     # it+1 is the next clip in the stored order (ep_indices[it+1]).
                     _save_partial_all_ranks(
                         ep, it + 1, float(loss_meter), int(n_step),
@@ -1143,11 +1412,19 @@ def main():
                             ep, it + 1, global_step,
                             ep_indices[it + 1] if it + 1 < len(ep_indices) else "-",
                         )
+                    if hit_max and is_main and not stopping:
+                        logger.info(
+                            "max-steps %d reached @ ep=%d iter=%d",
+                            int(args.max_steps), ep, it,
+                        )
                 if stopping:
                     stop_flag["stop"] = True
                     break
+                if hit_max:
+                    max_steps_hit = True
+                    break
 
-            if stop_flag["stop"]:
+            if stop_flag["stop"] or max_steps_hit:
                 break
 
             stats = torch.tensor([loss_meter, float(n_step)], device=device)
@@ -1200,6 +1477,12 @@ def main():
             loss_steps_f.flush()
             loss_steps_f.close()
 
+    if max_steps_hit and not stop_flag["stop"]:
+        if dist.is_initialized():
+            dist.barrier()
+        cleanup_ddp()
+        return
+
     if stop_flag["stop"]:
         # Non-zero so slurm wrapper resubmits; weights already in latest.pt.
         if dist.is_initialized():
@@ -1242,7 +1525,12 @@ def main():
             "rope_time": args.rope_time if args.rope else "off",
             "backbone": "vit_large / ViT-L/16 @256",
             "checkpoint": str(args.checkpoint),
-            "trainable": "encoder LoRA last-12 (qkv+proj) + full probe",
+            "trainable": (
+                "Gaze+IMU encoder LoRA (all blocks) + adapter 0.25x + fusion 2x + RoPE-all probe"
+                if int(args.gaze_imu)
+                else "encoder LoRA last-12 (qkv+proj) + full probe"
+            ),
+            "gaze_imu": bool(int(args.gaze_imu)),
             "horizon_sec": horizon,
             "world_size": world,
             "best_top5": best_top5,
