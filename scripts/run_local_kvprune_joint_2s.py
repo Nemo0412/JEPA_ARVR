@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -306,11 +307,101 @@ def loader_kwargs(num_workers: int) -> dict:
     kw = {
         "num_workers": int(num_workers),
         "collate_fn": collate,
-        "pin_memory": False,
+        "pin_memory": True,
     }
     if num_workers > 0:
-        kw["prefetch_factor"] = 2
+        kw["prefetch_factor"] = 4
+        kw["persistent_workers"] = True
     return kw
+
+
+def _avail_kb(path: Path) -> int:
+    line = subprocess.check_output(["df", "-Pk", str(path)], text=True).splitlines()[-1]
+    return int(line.split()[3])
+
+
+def _copy_tree(src: Path, dst: Path, marker: Path, need_kb: int) -> bool:
+    """Copy one aux tree onto the node disk. Skip when it does not fit."""
+    import fcntl
+
+    if not src.is_dir():
+        logger.warning("aux stage skip, missing %s", src)
+        return False
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = dst.parent / ".stage.lock"
+    with lock_path.open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if marker.is_file() and dst.is_dir() and any(dst.iterdir()):
+            logger.info("aux stage hit %s", dst)
+            return True
+        avail = _avail_kb(Path("/state/partition1"))
+        if avail < need_kb:
+            logger.warning(
+                "aux stage skip %s: %s has %d KB free, need %d",
+                src, "/state/partition1", avail, need_kb,
+            )
+            return False
+        dst.mkdir(parents=True, exist_ok=True)
+        logger.info("staging %s → %s", src, dst)
+        subprocess.check_call(["rsync", "-a", "--info=stats1", f"{src}/", f"{dst}/"])
+        marker.write_text("ok\n")
+        logger.info("staged %s", dst)
+        return True
+
+
+def _stage_gaze_imu_local(args, rank: int) -> None:
+    """Put SLAM zips and gaze csvs on node-local disk when it has room.
+
+    Video is already staged by the launcher. The remaining per-step stall is
+    opening SLAM zips on scratch while only a couple of workers run.
+    """
+    if not int(args.gaze_imu):
+        return
+    if os.environ.get("KV_SKIP_AUX_STAGE", "") == "1":
+        if rank == 0:
+            logger.info("aux stage skipped (KV_SKIP_AUX_STAGE=1)")
+        return
+    state = Path("/state/partition1")
+    if not state.is_dir():
+        return
+    root = state / os.environ.get("USER", "user") / "hdepic_aux"
+    slam_dst = root / "slam_multi"
+    gaze_dst = root / "gaze_extract"
+    slam_ok = root / ".slam_ok"
+    gaze_ok = root / ".gaze_ok"
+    if rank == 0:
+        # 23GB of session zips, plus a little headroom so the copy cannot fill the disk.
+        try:
+            _copy_tree(Path(args.pose_slam_root), slam_dst, slam_ok, 26 * 1024 * 1024)
+            _copy_tree(Path(args.gaze_extract_root), gaze_dst, gaze_ok, 2 * 1024 * 1024)
+        except Exception:
+            logger.exception("aux stage failed; training continues from scratch paths")
+    if dist.is_initialized():
+        dist.barrier()
+    if slam_ok.is_file() and slam_dst.is_dir():
+        args.pose_slam_root = slam_dst
+        mapping = slam_dst / Path(args.pose_mapping_json).name
+        if mapping.is_file():
+            args.pose_mapping_json = mapping
+    if gaze_ok.is_file() and gaze_dst.is_dir():
+        args.gaze_extract_root = gaze_dst
+    if rank == 0:
+        logger.info(
+            "aux roots slam=%s gaze_extract=%s",
+            args.pose_slam_root, args.gaze_extract_root,
+        )
+
+
+def _loader_workers(requested: int, world: int, gaze_imu: bool) -> int:
+    """Gaze+IMU decode is the GPU stall. Use the spare CPUs on this rank."""
+    if not gaze_imu:
+        return int(requested)
+    cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", "0") or 0)
+    if cpus <= 0:
+        return max(int(requested), 4)
+    per_rank = max(2, (cpus - 2) // max(int(world), 1))
+    per_rank = min(per_rank, 6)
+    return max(int(requested), per_rank)
 
 
 def encode_clip(encoder: nn.Module, clips: torch.Tensor, embed_dim: int) -> torch.Tensor:
@@ -983,6 +1074,19 @@ def main():
     if int(args.gaze_imu):
         from app.hdepic_lora_action_anticipation.train_stream_mtp_concat_ca import default_gaze_cfg
 
+        _stage_gaze_imu_local(args, rank)
+        # Full 256x256 gaze maps are ~40MB each. A large cache per worker
+        # swaps the node and drops GPU util. Keep a short per-worker cache.
+        os.environ["TRI_MODAL_GAZE_MAP_CACHE"] = "24"
+        n_workers = _loader_workers(args.num_workers, world, True)
+        if n_workers != int(args.num_workers) and is_main:
+            logger.info(
+                "gaze-imu loader workers %d → %d (cpus=%s world=%d)",
+                args.num_workers, n_workers, os.environ.get("SLURM_CPUS_PER_TASK", "?"), world,
+            )
+        args.num_workers = n_workers
+        if args.val_num_workers < 0 or args.val_num_workers < n_workers:
+            args.val_num_workers = n_workers
         ds_extra["gaze_cfg"] = default_gaze_cfg(
             str(args.gaze_root), str(args.gaze_extract_root), str(args.gaze_sync_root),
             str(args.pose_slam_root), str(args.pose_mapping_json), args.img_size,
@@ -1010,7 +1114,7 @@ def main():
     )
     if is_main:
         logger.info(
-            "dataloader workers=%d prefetch=2 pin_memory=0 decord_threads=%s",
+            "dataloader workers=%d prefetch=4 pin_memory=1 persistent=1 decord_threads=%s",
             args.num_workers, os.environ.get("DECORD_THREADS", "2"),
         )
 

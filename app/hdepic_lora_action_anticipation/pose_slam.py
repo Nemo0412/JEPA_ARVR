@@ -290,12 +290,21 @@ class SlamPoseLoader:
         clean = _vjepa_video_id(video_id)
         return self._load_session_map().get(clean)
 
-    def _zip_path_for_session(self, session_id: str) -> Path | None:
+    def _zip_path_for_session(self, session_id: str, video_id: str | None = None) -> Path | None:
         if self.slam_root is None:
             return None
+        # Session ids restart at 0 inside each participant, so a bare rglob
+        # can open another person's zip. Prefer that participant's folder.
+        if video_id:
+            participant = str(video_id).split("_")[0]
+            scoped = self.slam_root / participant / "SLAM" / "multi" / f"{session_id}.zip"
+            if scoped.exists():
+                return scoped
         candidate = self.slam_root / f"{session_id}.zip"
         if candidate.exists():
             return candidate
+        if video_id:
+            return None
         return _find_first(self.slam_root, [f"**/{session_id}.zip"])
 
     def _inner_csv_path(self, zip_path: Path, session_id: str) -> str | None:
@@ -320,7 +329,7 @@ class SlamPoseLoader:
         session_id = self.resolve_session_id(video_id)
         if session_id is None:
             return False
-        zip_path = self._zip_path_for_session(session_id)
+        zip_path = self._zip_path_for_session(session_id, video_id)
         if zip_path is None:
             return False
         return self._inner_csv_path(zip_path, session_id) is not None
@@ -456,7 +465,7 @@ class SlamPoseLoader:
         session_id = self.resolve_session_id(video_id)
         if session_id is None:
             return None
-        zip_path = self._zip_path_for_session(session_id)
+        zip_path = self._zip_path_for_session(session_id, video_id)
         if zip_path is None:
             return None
         inner = self._inner_csv_path(zip_path, session_id)

@@ -14,7 +14,7 @@
 
 # RoPE all (2s, probe RoPE on every self-attn block, last-prediction prune)
 # plus Gaze+IMU best (5ch adapter, IMU CA L=3, keep-aux, soft-gate).
-# H100 and H200 only. Two GPUs. Videos staged on the node.
+# A100, H100, and H200. Two GPUs. Videos staged on the node.
 
 set -euo pipefail
 export TMPDIR=/scratch/ll5914/tmp
@@ -44,7 +44,7 @@ DONE_FLAG="${RUN_DIR}/DONE"
 export VJEPA_ROOT PYTHONUNBUFFERED=1
 export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/scripts:${VJEPA_ROOT}:${PYTHONPATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export TRI_MODAL_GAZE_MAP_CACHE=256
+export TRI_MODAL_GAZE_MAP_CACHE=24
 export GAZE_DECODER_CACHE_READER=1
 export GAZE_DECODER_NUM_THREADS=1
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
@@ -106,7 +106,7 @@ request_resubmit() {
     dep=(--dependency="afterany:${SLURM_JOB_ID}")
   fi
   local ok=0
-  for spec in "h100_tandon|gpu:h100:2" "h200_tandon|gpu:h200:2"; do
+  for spec in "a100_tandon|gpu:a100:2" "h100_tandon|gpu:h100:2" "h200_tandon|gpu:h200:2"; do
     IFS='|' read -r part gres <<< "$spec"
     out="$(sbatch --job-name=kv2gi \
       --account=torch_pr_111_tandon_advanced \
@@ -190,8 +190,8 @@ export DECORD_THREADS=2
   --epochs "${EPOCHS}" \
   --patience "${PATIENCE}" \
   --batch-size 1 \
-  --num-workers 2 \
-  --val-num-workers 2 \
+  --num-workers 6 \
+  --val-num-workers 6 \
   --lr 2e-5 \
   --lora-lr-mult 0.5 \
   --ckpt-every 2000 \
