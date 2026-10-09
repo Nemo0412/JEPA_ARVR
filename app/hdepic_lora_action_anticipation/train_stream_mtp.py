@@ -413,7 +413,10 @@ def build_model(
     checkpoint: str,
     *,
     no_predictor: bool = False,
+    vjepa21: bool = False,
 ):
+    if vjepa21:
+        return _build_model_vjepa21(device, max_frames, fps, img_size, checkpoint, no_predictor)
     model_kwargs = {
         "use_v2_1": False,
         "encoder": {
@@ -448,6 +451,75 @@ def build_model(
         checkpoint=checkpoint,
         model_kwargs=model_kwargs,
         wrapper_kwargs=wrapper_kwargs,
+    ).to(device)
+    return model
+
+
+# Official V-JEPA 2.1 EK100 anticipation pretrain_kwargs (vjepa2 configs/eval_2_1/vitl-384/ek100.yaml).
+VJEPA21_MODEL_KWARGS = {
+    "use_v2_1": True,
+    "encoder": {
+        "model_name": "vit_large",
+        "checkpoint_key": "ema_encoder",
+        "img_temporal_dim_size": 1,
+        "tubelet_size": 2,
+        "patch_size": 16,
+        "uniform_power": True,
+        "use_rope": True,
+    },
+    "predictor": {
+        "model_name": "vit_predictor",
+        "checkpoint_key": "predictor",
+        "num_frames": 64,
+        "depth": 12,
+        "num_heads": 12,
+        "predictor_embed_dim": 384,
+        "teacher_embed_dim": 1664,
+        "num_mask_tokens": 8,
+        "n_output_distillation": 1,
+        "return_all_tokens": True,
+        "img_temporal_dim_size": 1,
+        "uniform_power": True,
+        "use_mask_tokens": True,
+        "use_sdpa": True,
+        "use_silu": False,
+        "wide_silu": False,
+        "use_rope": True,
+    },
+}
+
+
+def _enable_vjepa21_imports():
+    """This repo's ``app`` package shadows vjepa2's; add vjepa2/app to its path
+    so ``app.vjepa_2_1`` resolves."""
+    import app
+
+    for root in sys.path:
+        cand = Path(root or ".") / "app"
+        if (cand / "vjepa_2_1").is_dir():
+            if str(cand) not in app.__path__:
+                app.__path__.append(str(cand))
+            return
+    raise ImportError("app/vjepa_2_1 not found on sys.path; put the vjepa2 checkout (VJEPA_ROOT) on it")
+
+
+def _build_model_vjepa21(device, max_frames, fps, img_size, checkpoint, no_predictor):
+    """V-JEPA 2.1 ViT-L (e.g. vjepa2_1_vitl_dist_vitG_384.pt).
+
+    Only the native ``encoder.forward`` is correct for 2.1: it adds the video
+    modality embedding after patch_embed and ends with ``norms_block[-1]``, and
+    its RoPE uses the 2.1 frequency layout. The stream KV encoder in
+    stream_kvcache_attn_prune re-implements 2.0 blocks, so callers must use the
+    full-clip path (``--no-kv 1``).
+    """
+    _enable_vjepa21_imports()
+    model = init_anticipative_module(
+        frames_per_clip=max_frames,
+        frames_per_second=fps,
+        resolution=img_size,
+        checkpoint=checkpoint,
+        model_kwargs=VJEPA21_MODEL_KWARGS,
+        wrapper_kwargs={"no_predictor": bool(no_predictor), "num_output_frames": 2, "num_steps": 1},
     ).to(device)
     return model
 

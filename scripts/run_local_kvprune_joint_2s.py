@@ -762,6 +762,13 @@ def main():
         help="Val DataLoader workers; -1 = same as --num-workers (was num_workers//2)",
     )
     ap.add_argument("--img-size", type=int, default=256)
+    ap.add_argument(
+        "--vjepa21",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="1 = --checkpoint is a V-JEPA 2.1 ViT-L (ema_encoder); requires --no-kv 1",
+    )
     ap.add_argument("--fps", type=int, default=8)
     ap.add_argument("--chunk", type=int, default=256)
     ap.add_argument("--probe-depth", type=int, default=4)
@@ -822,6 +829,10 @@ def main():
             raise SystemExit("--no-kv 1 requires --frames > 0 and a multiple of 2")
         if args.rope:
             raise SystemExit("--no-kv does not combine with --rope 1")
+    if args.vjepa21 and not args.no_kv:
+        # StreamKVAttnPruneEncoder re-implements 2.0 blocks (2.0 RoPE layout, no
+        # modality embedding, encoder.norm); 2.1 would run but give wrong features.
+        raise SystemExit("--vjepa21 1 is supported only with --no-kv 1 (native 2.1 encoder forward)")
     horizon = float(args.horizon)
     only_block0 = bool(args.only_block0)
     if args.out_dir is None:
@@ -897,7 +908,8 @@ def main():
 
     total_frames = int(args.frames) if args.no_kv else CACHE_FRAMES + stream_steps * NEW_FRAMES
     backbone = build_model(
-        device, total_frames, args.fps, args.img_size, str(args.checkpoint), no_predictor=True
+        device, total_frames, args.fps, args.img_size, str(args.checkpoint), no_predictor=True,
+        vjepa21=bool(args.vjepa21),
     )
     # Freeze all, then inject trainable LoRA on last 12 blocks (fits A6000 48GB
     # for 128+34 joint stream encode; early blocks run under no_grad).
@@ -1523,7 +1535,7 @@ def main():
                 )
             ),
             "rope_time": args.rope_time if args.rope else "off",
-            "backbone": "vit_large / ViT-L/16 @256",
+            "backbone": f"{'V-JEPA 2.1' if args.vjepa21 else 'V-JEPA 2.0'} vit_large / ViT-L/16 @{int(args.img_size)}",
             "checkpoint": str(args.checkpoint),
             "trainable": (
                 "Gaze+IMU encoder LoRA (all blocks) + adapter 0.25x + fusion 2x + RoPE-all probe"

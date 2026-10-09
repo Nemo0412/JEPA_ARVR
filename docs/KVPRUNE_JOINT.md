@@ -163,3 +163,38 @@ Tag → out subdir: `joint_{H}s_norope` / `joint_{H}s_rope` / `joint_{H}s_rope_a
 
 6s w/ and w/o all-block RoPE is **cancelled for now**. Placeholder:
 `scripts/run_local_kvprune_joint_6s.sh`.
+
+## Vanilla V-JEPA 2.1 (no KV, 32 frames, 2s) — yh6416
+
+Same as `nokv_f32_h2s` (`--no-kv 1 --frames 32 --rope 0`: full-attention 32-frame
+clip → all tokens → probe; encoder LoRA last 12 + probe; no KV cache, prune, probe
+RoPE or Gaze+IMU) with the backbone switched to **V-JEPA 2.1 ViT-L @384**
+(`vjepa2_1_vitl_dist_vitG_384.pt`, `ema_encoder`, official 2.1 EK100
+`pretrain_kwargs`).
+
+```bash
+# weights: scripts/download_vjepa2_1_vitl384_checkpoint.sh
+sbatch --export=NO_KV=1,FRAMES=32,HORIZON=2,ROPE=0,NGPUS=2,EPOCHS=8,VJEPA21=1 \
+  scripts/submit_kvprune_joint_ll5914.slurm      # out: nokv_f32_h2s_v21_384/
+# or directly: run_local_kvprune_joint_2s.py --no-kv 1 --frames 32 --rope 0 \
+#   --vjepa21 1 --img-size 384 --checkpoint .../vjepa2_1_vitl_dist_vitG_384.pt
+```
+
+`--vjepa21 1` requires `--no-kv 1`. The stream KV encoder
+(`StreamKVAttnPruneEncoder`) re-implements V-JEPA 2.0 blocks: 2.0 RoPE frequency
+layout (`repeat`; 2.1 uses `repeat_interleave`), no 2.1 video modality embedding,
+`encoder.norm` instead of 2.1 `norms_block[-1]`. Running 2.1 weights through it
+does not crash but gives different features (max-rel 0.62 vs native).
+
+Result (NYU Torch, 2×H200, batch 1/GPU, 8 epochs, lr 2e-5 / LoRA ×0.5, seed 0;
+clip_split val n=1331, Top-5 / Top-1 %, verb/noun re-evaluated from best.pt):
+
+| Backbone | Best epoch | Action | Verb | Noun |
+|---|---:|---|---|---|
+| V-JEPA 2.1 @384 | 5 | **38.54** / 13.52 | 76.86 / 25.70 | 65.59 / 29.45 |
+| V-JEPA 2.0 @256 (`nokv_f32_h2s`) | 5 (of 5 run) | 35.54 / 12.02 | 75.21 / 24.87 | 60.86 / 27.95 |
+
+2.1 per-epoch action Top-5: 20.81, 28.17, 34.03, 35.09, 38.54, 36.96, 36.21,
+35.61 (peaks at epoch 5, then overfits). 2.0 verb/noun (and 35.76 action on
+re-eval vs 35.54 logged) come from re-scoring its best.pt with this branch's code.
+Checkpoint: `/scratch/yh6416/share_ll5914/b21_vanilla_vjepa21_384_f32_h2s/`.

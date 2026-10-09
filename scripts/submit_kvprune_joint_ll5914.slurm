@@ -69,6 +69,21 @@ TRAIN_CSV="/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/clip_split/
 VAL_CSV="/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/clip_split/HD_EPIC_val_vjepa.csv"
 VIDEO_ROOT_REMOTE="/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_videos"
 CHECKPOINT="/scratch/ll5914/models/vjepa2/vitl.pt"
+# VJEPA21=1: vanilla V-JEPA 2.1 ViT-L @384 (needs NO_KV=1; 2.1 path not wired
+# into the stream KV encoder). Get the weights with
+# scripts/download_vjepa2_1_vitl384_checkpoint.sh.
+VJEPA21="${VJEPA21:-0}"
+IMG_SIZE=256
+BB_TAG=""
+if [[ "${VJEPA21}" == "1" ]]; then
+  if [[ "${NO_KV}" != "1" ]]; then
+    echo "ERROR: VJEPA21=1 requires NO_KV=1" >&2
+    exit 2
+  fi
+  CHECKPOINT="${VJEPA21_CHECKPOINT:-/scratch/ll5914/models/vjepa2/vjepa2_1_vitl_dist_vitG_384.pt}"
+  IMG_SIZE=384
+  BB_TAG="_v21_384"
+fi
 
 export VJEPA_ROOT PYTHONUNBUFFERED=1
 export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/scripts:${VJEPA_ROOT}:${PYTHONPATH:-}"
@@ -118,7 +133,7 @@ echo "VIDEO_ROOT=${VIDEO_ROOT}"
 ROPE_TIME="${ROPE_TIME:-abs}"
 if [[ "${NO_KV}" == "1" ]]; then
   # Run root is the experiment dir. No joint_ prefix: this is a plain clip encode.
-  OUT_ROOT="/scratch/ll5914/experiments/nokv_f${FRAMES}_h${HORIZON}s"
+  OUT_ROOT="/scratch/ll5914/experiments/nokv_f${FRAMES}_h${HORIZON}s${BB_TAG}"
   ROPE_TAG=""
 elif [[ "${NEW_SELF_ONLY}" == "1" ]]; then
   OUT_ROOT="/scratch/ll5914/experiments/kv_self34_h${HORIZON}s"
@@ -194,7 +209,7 @@ request_resubmit() {
       --cpus-per-task="${cpus}" \
       --time="${SLURM_TIMELIMIT:-1-00:00:00}" \
       "${dep[@]}" \
-      --export=HORIZON="${HORIZON}",ROPE="${ROPE}",ONLY_BLOCK0="${ONLY_BLOCK0}",ROPE_TIME="${ROPE_TIME:-abs}",NO_KV="${NO_KV:-0}",FRAMES="${FRAMES:-32}",NEW_SELF_ONLY="${NEW_SELF_ONLY:-0}",STAGE_LOCAL=1,NGPUS="${ng}",CKPT_EVERY="${CKPT_EVERY:-2000}",EPOCHS="${EPOCHS:-10}",PATIENCE="${PATIENCE:-0}" \
+      --export=HORIZON="${HORIZON}",ROPE="${ROPE}",ONLY_BLOCK0="${ONLY_BLOCK0}",ROPE_TIME="${ROPE_TIME:-abs}",NO_KV="${NO_KV:-0}",FRAMES="${FRAMES:-32}",NEW_SELF_ONLY="${NEW_SELF_ONLY:-0}",VJEPA21="${VJEPA21:-0}",VJEPA21_CHECKPOINT="${VJEPA21_CHECKPOINT:-}",STAGE_LOCAL=1,NGPUS="${ng}",CKPT_EVERY="${CKPT_EVERY:-2000}",EPOCHS="${EPOCHS:-10}",PATIENCE="${PATIENCE:-0}" \
       "${SCRIPT_PATH}" 2>&1)" || true
     echo "$part => ${out}"
     if grep -q 'Submitted batch job' <<<"${out}"; then
@@ -265,6 +280,8 @@ echo "dataloader workers/rank=${_nw} DECORD_THREADS=${DECORD_THREADS} cpus=${_cp
   --val-csv "${VAL_CSV}" \
   --video-root "${VIDEO_ROOT}" \
   --checkpoint "${CHECKPOINT}" \
+  --vjepa21 "${VJEPA21}" \
+  --img-size "${IMG_SIZE}" \
   --out-dir "${OUT_ROOT}" \
   --horizon "${HORIZON}" \
   --rope "${ROPE}" \
