@@ -65,8 +65,21 @@ PYTHON="/scratch/ll5914/conda_envs/SVD/bin/python"
 PROJECT_ROOT="/home/ll5914/Jepa/JEPA_ARVR"
 VJEPA_ROOT="/home/ll5914/ARVR_Video/vjepa2"
 SCRIPT_PATH="${PROJECT_ROOT}/scripts/submit_kvprune_joint_ll5914.slurm"
-TRAIN_CSV="/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/clip_split/HD_EPIC_train_vjepa.csv"
-VAL_CSV="/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/clip_split/HD_EPIC_val_vjepa.csv"
+# SPLIT=p01 (default): P01 clip_split. SPLIT=matched: 9-participant clip_split_matched
+# (64 videos listed in stage_videos.txt, staged instead of P01).
+SPLIT="${SPLIT:-p01}"
+case "${SPLIT}" in
+  p01) ANN_DIR="/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/clip_split"; SPLIT_TAG="" ;;
+  matched) ANN_DIR="/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/clip_split_matched"; SPLIT_TAG="_matched" ;;
+  *) echo "ERROR: SPLIT must be p01 or matched" >&2; exit 2 ;;
+esac
+if [[ "${SPLIT}" == "matched" && "${NO_KV}" != "1" ]]; then
+  # Only the nokv out dir carries the split tag; stream runs would reuse P01 dirs.
+  echo "ERROR: SPLIT=matched is wired for NO_KV=1 only" >&2
+  exit 2
+fi
+TRAIN_CSV="${ANN_DIR}/HD_EPIC_train_vjepa.csv"
+VAL_CSV="${ANN_DIR}/HD_EPIC_val_vjepa.csv"
 VIDEO_ROOT_REMOTE="/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_videos"
 CHECKPOINT="/scratch/ll5914/models/vjepa2/vitl.pt"
 # VJEPA21=1: vanilla V-JEPA 2.1 ViT-L @384 (needs NO_KV=1; 2.1 path not wired
@@ -93,7 +106,15 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 # Stage P01 (~19GB) to node-local disk (scratch decode was ~20s/fetch).
 STAGE_LOCAL="${STAGE_LOCAL:-1}"
 VIDEO_ROOT="${VIDEO_ROOT_REMOTE}"
-if [[ "${STAGE_LOCAL}" == "1" ]]; then
+if [[ "${STAGE_LOCAL}" == "1" && "${SPLIT}" == "matched" ]]; then
+  # Same flow as submit_kvprune_joint_gaze_imu_rope_all_allp_ll5914.slurm.
+  STAGE_DIR="/state/partition1/${USER}/hdepic_vjepa_videos_allp"
+  mkdir -p "${STAGE_DIR}"
+  (
+    flock -w 1800 9 || exit 1
+    rsync -aL --info=stats1 --files-from="${ANN_DIR}/stage_videos.txt" "${VIDEO_ROOT_REMOTE}/" "${STAGE_DIR}/"
+  ) 9>"${STAGE_DIR}/.stage.lock" && VIDEO_ROOT="${STAGE_DIR}" || echo "WARN: stage failed; using scratch"
+elif [[ "${STAGE_LOCAL}" == "1" ]]; then
   remote_p01="${VIDEO_ROOT_REMOTE}/P01"
   STAGE_DIR=""
   need_kb=$((25 * 1024 * 1024))
@@ -133,7 +154,7 @@ echo "VIDEO_ROOT=${VIDEO_ROOT}"
 ROPE_TIME="${ROPE_TIME:-abs}"
 if [[ "${NO_KV}" == "1" ]]; then
   # Run root is the experiment dir. No joint_ prefix: this is a plain clip encode.
-  OUT_ROOT="/scratch/ll5914/experiments/nokv_f${FRAMES}_h${HORIZON}s${BB_TAG}"
+  OUT_ROOT="/scratch/ll5914/experiments/nokv_f${FRAMES}_h${HORIZON}s${BB_TAG}${SPLIT_TAG}"
   ROPE_TAG=""
 elif [[ "${NEW_SELF_ONLY}" == "1" ]]; then
   OUT_ROOT="/scratch/ll5914/experiments/kv_self34_h${HORIZON}s"
@@ -209,7 +230,7 @@ request_resubmit() {
       --cpus-per-task="${cpus}" \
       --time="${SLURM_TIMELIMIT:-1-00:00:00}" \
       "${dep[@]}" \
-      --export=HORIZON="${HORIZON}",ROPE="${ROPE}",ONLY_BLOCK0="${ONLY_BLOCK0}",ROPE_TIME="${ROPE_TIME:-abs}",NO_KV="${NO_KV:-0}",FRAMES="${FRAMES:-32}",NEW_SELF_ONLY="${NEW_SELF_ONLY:-0}",VJEPA21="${VJEPA21:-0}",VJEPA21_CHECKPOINT="${VJEPA21_CHECKPOINT:-}",STAGE_LOCAL=1,NGPUS="${ng}",CKPT_EVERY="${CKPT_EVERY:-2000}",EPOCHS="${EPOCHS:-10}",PATIENCE="${PATIENCE:-0}" \
+      --export=HORIZON="${HORIZON}",ROPE="${ROPE}",ONLY_BLOCK0="${ONLY_BLOCK0}",ROPE_TIME="${ROPE_TIME:-abs}",NO_KV="${NO_KV:-0}",FRAMES="${FRAMES:-32}",NEW_SELF_ONLY="${NEW_SELF_ONLY:-0}",VJEPA21="${VJEPA21:-0}",VJEPA21_CHECKPOINT="${VJEPA21_CHECKPOINT:-}",SPLIT="${SPLIT}",STAGE_LOCAL=1,NGPUS="${ng}",CKPT_EVERY="${CKPT_EVERY:-2000}",EPOCHS="${EPOCHS:-10}",PATIENCE="${PATIENCE:-0}" \
       "${SCRIPT_PATH}" 2>&1)" || true
     echo "$part => ${out}"
     if grep -q 'Submitted batch job' <<<"${out}"; then

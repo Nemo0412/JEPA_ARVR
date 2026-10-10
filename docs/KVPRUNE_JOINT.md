@@ -198,3 +198,34 @@ clip_split val n=1331, Top-5 / Top-1 %, verb/noun re-evaluated from best.pt):
 35.61 (peaks at epoch 5, then overfits). 2.0 verb/noun (and 35.76 action on
 re-eval vs 35.54 logged) come from re-scoring its best.pt with this branch's code.
 Checkpoint: `/scratch/yh6416/share_ll5914/b21_vanilla_vjepa21_384_f32_h2s/`.
+
+### Vanilla V-JEPA 2.1 on `clip_split_matched` (9 participants) + metric script
+
+Same recipe on the P01-sized 9-participant split (`clip_split_matched`, train 5537 / val 1400
+rows, 64 videos):
+
+```bash
+sbatch --export=NO_KV=1,FRAMES=32,HORIZON=2,ROPE=0,NGPUS=2,EPOCHS=8,VJEPA21=1,SPLIT=matched \
+  scripts/submit_kvprune_joint_ll5914.slurm      # out: nokv_f32_h2s_v21_384_matched/
+```
+
+`SPLIT=matched` stages the 64 videos in `stage_videos.txt` (as the all-P Gaze+IMU launcher)
+and is wired for `NO_KV=1` only.
+
+`scripts/eval_kvprune_nokv_vna.py --ckpt RUN/best.pt --video-root VIDEOS [--val-csv CSV]`
+rebuilds a `--no-kv` checkpoint (2.0 or 2.1) from its saved args and reports, per verb / noun /
+action: micro Top-1/3/5, class-mean recall@1/@5, and verb/noun derived from the action head
+(single GPU, no sampler padding, trainer's `map_labels` filter).
+
+Results (best.pt, val, %; micro Top-5 / Top-3 / Top-1):
+
+| Run | split (val n) | Action | Verb | Noun |
+|---|---|---|---|---|
+| V-JEPA 2.1 @384, ep5 | matched (1215) | 30.54 / 23.29 / 11.03 | 72.18 / 59.01 / 27.49 | 62.80 / 49.96 / 27.65 |
+| V-JEPA 2.1 @384, ep5 | P01 clip_split (1330) | 38.57 / 29.40 / 13.53 | 76.84 / 61.28 / 25.71 | 65.64 / 54.59 / 29.47 |
+| V-JEPA 2.0 @256 `nokv_f32_h2s`, ep5 | P01 clip_split (1330) | 35.71 / 28.12 / 12.03 | 75.19 / 61.28 / 24.89 | 60.90 / 50.23 / 27.97 |
+
+Matched per-epoch action Top-5 (2.1): 17.45, 23.95, 27.08, 30.21, 30.54, 30.12, 30.04, 30.12.
+Class-mean recall@5 (verb / noun / action): matched 2.1 26.77 / 45.92 / 19.04; P01 2.1
+35.89 / 52.09 / 23.43; P01 2.0 34.81 / 52.56 / 22.33. Checkpoint:
+`/scratch/yh6416/share_ll5914/b21_vanilla_vjepa21_384_f32_h2s_matched/`.
