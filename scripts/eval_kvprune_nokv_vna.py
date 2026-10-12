@@ -10,7 +10,7 @@ and label filter (``map_labels``), single GPU, batch 1, no sampler padding.
 Reported per head (verb / noun / action), in %:
   * micro Top-1/3/5 accuracy (Top-1/5 action = trainer's logged metric, up to
     DistributedSampler padding);
-  * class-mean recall@1/@5 (mean over ground-truth classes present in val);
+  * class-mean recall@1/@3/@5 (mean over ground-truth classes present in val);
   * verb/noun Top-1/5 derived from the action head (softmax over actions,
     marginalised onto verb / noun).
 
@@ -89,7 +89,7 @@ def main():
     an = torch.tensor([act_n[a] for a in range(len(action_map))], device=device)
 
     hits = defaultdict(float)
-    per_class = {h: defaultdict(lambda: [0, 0, 0]) for h in ("verb", "noun", "action")}
+    per_class = {h: defaultdict(lambda: [0, 0, 0, 0]) for h in ("verb", "noun", "action")}
     n = 0
     for batch in loader:
         clips = T.normalize_clip(batch["clip"], device)
@@ -106,11 +106,11 @@ def main():
             for k in (1, 3, 5):
                 hit = (order[:, :k] == lab[:, None]).any(-1)
                 hits[f"{head}_top{k}"] += float(hit.sum())
-                if k in (1, 5):
-                    for c, h in zip(lab.tolist(), hit.tolist()):
-                        per_class[head][c][0 if k == 1 else 1] += int(h)
+                slot = {1: 0, 3: 1, 5: 2}[k]
+                for c, h in zip(lab.tolist(), hit.tolist()):
+                    per_class[head][c][slot] += int(h)
             for c in lab.tolist():
-                per_class[head][c][2] += 1
+                per_class[head][c][3] += 1
         # verb / noun derived from the action head.
         pa = out["action"][keep].float().softmax(-1)
         pv = torch.zeros(pa.size(0), len(verb_map), device=device).index_add_(1, av, pa)
@@ -125,8 +125,9 @@ def main():
     for key, val in sorted(hits.items()):
         res[key] = round(100.0 * val / n, 4)
     for head, pc in per_class.items():
-        res[f"{head}_classmean_recall1"] = round(100.0 * sum(c[0] / c[2] for c in pc.values()) / len(pc), 4)
-        res[f"{head}_classmean_recall5"] = round(100.0 * sum(c[1] / c[2] for c in pc.values()) / len(pc), 4)
+        for slot, k in ((0, 1), (1, 3), (2, 5)):
+            res[f"{head}_classmean_recall{k}"] = round(
+                100.0 * sum(c[slot] / c[3] for c in pc.values()) / len(pc), 4)
         res[f"{head}_n_classes_in_val"] = len(pc)
     result = {"ckpt": str(args.ckpt), "ckpt_meta": meta, "val_csv": str(val_csv),
               "val_items": len(ds), "metrics": res,
