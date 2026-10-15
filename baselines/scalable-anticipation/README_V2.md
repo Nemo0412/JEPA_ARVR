@@ -122,6 +122,26 @@ environment must provide `mamba-ssm`.
   that an epoch takes about 10 s (train 7 s, val 1 s), so 50 epochs take about
   15 minutes.
 
-### EK100 / EGTEA
+### EK100 / EGTEA (2026-10-15)
 
-See below (filled from the conversion audit, tests and smokes).
+- Feature conversion matched every key exactly, with no substitution: EK100
+  633 videos / 1,266,053 steps; EGTEA 86 videos / 387,177 steps per split.
+- Tests (10/10): EK100 train 66,987 (230 dropped) / val 9,668 (76
+  unobservable, scored as misses); EGTEA official sizes exact with 0 dropped;
+  class mapping reproduces the RU-LSTM action ids; per-window labels equal
+  whole-video labels.
+- Runtime: EGTEA about 15 minutes per 50-epoch run; EK100 about 1.6 h
+  (steady epoch about 97 s train + 10 s val; about 52% GPU utilization).
+
+### First formal results (validation; checkpoint = best val action mt5r)
+
+| Dataset | Best epoch | Action CMR@5 | Verb CMR@5 (head) | Noun CMR@5 (head) |
+|---|---:|---:|---:|---:|
+| EGTEA split 1 | 29 | 54.41 | 68.78 | 63.30 |
+| EGTEA split 2 | 16 | 54.94 | 70.11 | 65.65 |
+| EGTEA split 3 | 46 | 50.02 | 68.33 | 59.68 |
+| HD-EPIC P01 (clip split) | 25 | 45.30 | 51.56 | 68.46 |
+| EK100 | 37 | 11.11 | 17.92 | 22.63 |
+
+HD-EPIC caveat: the clip split draws train and val clips from the same videos,
+so the 28s memory can cover neighbouring training clips.
