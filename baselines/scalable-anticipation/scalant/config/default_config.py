@@ -77,6 +77,9 @@ class ModelConfig:
 
     # Uniformly sample from the past instead of last tokens
     SAMPLE_UNIFORM: bool = False
+    # Frequency-equalized action loss for non-EpicKitchens datasets that expose
+    # `action_frequency` (EpicKitchens always uses it, as upstream).
+    EQUALIZED_LOSS: bool = False
 
 
 @dataclass

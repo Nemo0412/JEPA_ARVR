@@ -8,6 +8,21 @@ from scalant.datasets import EpicKitchens, action2verbnoun, verbnoun2action
 from scalant.criterion.loss import *
 
 
+def _scored_labels(last_target: Tensor, scored: Tensor, ignore_index: int) -> Tensor:
+    """Labels for mean top-5 recall in the notice (non-ignored) class space.
+
+    Without `scored`, keep upstream behavior: argmax of the multi-hot target
+    (the lowest class id when actions overlap). With `scored` (annotated
+    full-space ids), score the annotated action instance instead.
+    """
+    if scored is None:
+        return last_target.argmax(dim=-1)
+    scored = scored.to(last_target.device).long()
+    if ignore_index >= 0:
+        scored = scored - (scored > ignore_index).long()
+    return scored
+
+
 @Criterion_REGISTRY.register()
 class Criterion_LSTR:
     def __init__(self, cfg: Config, dataset: EpicKitchens):
@@ -15,6 +30,10 @@ class Criterion_LSTR:
 
         if isinstance(dataset, EpicKitchens):
             self.action_cls = MultipCrossEntropyEqualizedLoss(ignore_index=ignore_index)
+        elif getattr(cfg.MODEL, "EQUALIZED_LOSS", False) and getattr(dataset, "action_frequency", None) is not None:
+            # Same equalized loss, with this dataset's training frequencies.
+            self.action_cls = MultipCrossEntropyEqualizedLoss(
+                ignore_index=ignore_index, freq_info=dataset.action_frequency)
         else:
             self.action_cls = MultipCrossEntropyLoss(ignore_index=ignore_index)
         self.verb_noun_cls = MultipCrossEntropyLoss(ignore_index=ignore_index)
@@ -39,7 +58,8 @@ class Criterion_LSTR:
         # Mean top 5
         mt5r_dict = {
             "logits": pred.future_actions[:, -1, notice_index],
-            "labels": target.future_actions[:, -1, notice_index].argmax(dim=-1),
+            "labels": _scored_labels(target.future_actions[:, -1, notice_index],
+                                     target.scored_actions, self.ignore_index),
         }
 
         loss_dict = {
@@ -70,12 +90,13 @@ class Criterion_LSTR:
             # Mean top 5
             verb_mt5r_dict = {
                 "logits": pred.future_verbs[:, -1, verb_notice_index],
-                "labels": target.future_verbs[:, -1, verb_notice_index].argmax(dim=-1),
+                "labels": _scored_labels(target.future_verbs[:, -1, verb_notice_index],
+                                         target.scored_verbs, self.ignore_index),
             }
             noun_mt5r_dict = {
                 "logits": pred.future_nouns[:, -1, noun_notice_index],
-                "labels": target.future_nouns[:, -1, noun_notice_index].argmax(
-                    dim=-1),
+                "labels": _scored_labels(target.future_nouns[:, -1, noun_notice_index],
+                                         target.scored_nouns, self.ignore_index),
             }
             loss_dict.update({
                 "verb_mt5r_cls": ["MeanTopKRecallMeter", verb_mt5r_dict, None],
@@ -89,11 +110,13 @@ class Criterion_LSTR:
         # Mean top 5
         verb_mt5r_dict = {
             "logits": future_verbs[:, -1, verb_notice_index],
-            "labels": target.future_verbs[:, -1, verb_notice_index].argmax(dim=-1),
+            "labels": _scored_labels(target.future_verbs[:, -1, verb_notice_index],
+                                         target.scored_verbs, self.ignore_index),
         }
         noun_mt5r_dict = {
             "logits": future_nouns[:, -1, noun_notice_index],
-            "labels": target.future_nouns[:, -1, noun_notice_index].argmax(dim=-1),
+            "labels": _scored_labels(target.future_nouns[:, -1, noun_notice_index],
+                                         target.scored_nouns, self.ignore_index),
         }
         loss_dict.update({
             "verb_mt5r": ["MeanTopKRecallMeter", verb_mt5r_dict, None],

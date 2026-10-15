@@ -90,6 +90,9 @@ class HDEPICClip(torch.utils.data.Dataset):
         logger.info("Discarded %d HD-EPIC clips in anticipate conversion", len(self.discarded_df))
 
         self.segments_by_video = self._load_segments(label_csvs)
+        # Training-set action frequencies (index = action id without background),
+        # used by the optional equalized loss (MODEL.EQUALIZED_LOSS).
+        self.action_frequency = self._action_frequency(train_csv)
         self.feat_len = self._load_feat_lengths()
         logger.info(
             "Created HD-EPIC clip dataset (%s) with %d samples, "
@@ -142,6 +145,14 @@ class HDEPICClip(torch.utils.data.Dataset):
                     self.action_map[(v, n)] + 1,
                 ))
         return by_video
+
+    def _action_frequency(self, train_csv: Path) -> np.ndarray:
+        counts = np.zeros(len(self.action_map), dtype=np.float64)
+        for _, row in pd.read_csv(train_csv).iterrows():
+            key = (int(row.verb_class), int(row.noun_class))
+            if key in self.action_map:
+                counts[self.action_map[key]] += 1.0
+        return counts
 
     def _load_feat_lengths(self) -> dict[str, int]:
         lengths = {}
@@ -216,22 +227,21 @@ class HDEPICClip(torch.utils.data.Dataset):
             return items
 
         video, acts, verbs, nouns = adjust(*tensors)
-
-        # Guarantee the last future frame carries this clip's upcoming action.
-        a = int(df_row["action_class"]) + 1
-        v = self.verb_map[int(df_row["verb_class"])] + 1
-        n = self.noun_map[int(df_row["noun_class"])] + 1
-        acts[-1].zero_()
-        verbs[-1].zero_()
-        nouns[-1].zero_()
-        acts[-1, a] = 1.0
-        verbs[-1, v] = 1.0
-        nouns[-1, n] = 1.0
+        # Training targets keep the upstream dense multi-hot labels (union of all
+        # covering actions). Only the scored label is the clip's own action;
+        # see scored_labels().
         return video, acts, verbs, nouns
+
+    def scored_labels(self, df_row):
+        """Annotated action/verb/noun of this clip, in full (background = 0) space."""
+        return (int(df_row["action_class"]) + 1,
+                self.verb_map[int(df_row["verb_class"])] + 1,
+                self.noun_map[int(df_row["noun_class"])] + 1)
 
     def __getitem__(self, idx):
         df_row = self.df.iloc[idx]
         video, action_label, verb_label, noun_label = self._get_video(df_row)
+        scored = self.scored_labels(df_row)
 
         past_len = int(self.tau_o // self.past_step_in_sec)
         sample_rate = int(self.future_step_in_sec / self.past_step_in_sec)
@@ -263,4 +273,9 @@ class HDEPICClip(torch.utils.data.Dataset):
             "future_act": future_act,
             "future_verb": future_verb,
             "future_noun": future_noun,
+            # Evaluation scores the annotated action instance, as RU-LSTM/InAViT do,
+            # instead of the argmax of a multi-hot target (lowest overlapping ID).
+            "scored_act": torch.tensor(scored[0]),
+            "scored_verb": torch.tensor(scored[1]),
+            "scored_noun": torch.tensor(scored[2]),
         }

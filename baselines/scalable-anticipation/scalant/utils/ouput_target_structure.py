@@ -31,3 +31,7 @@ class Target:
     vid_name: Optional[str] = None
     work_indices: Optional[Tensor] = None
     num_frames: Optional[int] = None
+    # Optional annotated labels used only for scoring (full class space).
+    scored_actions: Optional[Tensor] = None
+    scored_verbs: Optional[Tensor] = None
+    scored_nouns: Optional[Tensor] = None

@@ -1,0 +1,57 @@
+# HD-EPIC P01 clip protocol, ScalAnt default history and encoder:
+#   32s history = 28s long memory + 4s working memory (4s working window matches
+#   the 4s per-step input of the other methods), predict the action 2s ahead.
+#   Encoder MAMBA v1 with D_STATE 16 (upstream EK100 default), one future query
+#   at t0 (FUTURE_STEP = TAU_A, as upstream), equalized action loss with HD-EPIC train
+#   frequencies. Scoring uses each clip's annotated action (see README_V2).
+# Features: TSN-RGB @ 4 fps (same as rulstm_hdepic).
+USE_WANDB: False
+NOTE: hdepic-p01-32s2s-mamba
+DTYPE: bfloat16
+TRAIN:
+  USE_MIXUP: True
+  NUM_WORKERS: 4
+  EPOCHS: 50
+  OPTIMIZER: adamw
+  BATCH_SIZE: 128
+  LR: 0.0005
+  WEIGHT_DECAY: 0.
+VAL:
+  NUM_WORKERS: 4
+  BATCH_SIZE: 128
+DATA:
+  DATASET_CLASS: HDEPICClip
+  DATA_ROOT_PATH: /scratch/ll5914/datasets/HD-EPIC
+  FEAT_DIR: rulstm_features/rgb_p01
+  TRAIN_CSV: /scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/clip_split/HD_EPIC_train_vjepa.csv
+  VAL_CSV: /scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/clip_split/HD_EPIC_val_vjepa.csv
+  FULL_CSV: /scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/HD_EPIC_full_vjepa.csv
+  TAU_A: 2.
+  TAU_O: 32.
+  PAST_STEP_IN_SEC: 0.25
+  FUTURE_STEP_IN_SEC: 2.
+  LONG_MEMORY_LENGTH: 28.
+CLUSTERING:
+  ENABLE: True
+MODEL:
+  ENCODER_CLASS: MAMBA
+  MAMBA_VERSION: 1
+  D_STATE: 16
+  EQUALIZED_LOSS: True
+  CRITERION_CLASS: Criterion_LSTR
+  IGNORE_INDEX: 0
+  ACTION_CLS: True
+  VERB_CLS: True
+  NOUN_CLS: True
+  N_LAYER: 4
+  N_DEC_LAYER: 4
+  D_MODEL: 1024
+  D_FFN: 4096
+  SHARE_CLASSIFIER: True
+  N_QUERIES: 1
+  DROPOUT: 0.1
+  DROP_CLS: 0.2
+  PRENORM: False
+  CLS_WORK: False
+  CLS_LAST: False
+  CLS_ALL: True

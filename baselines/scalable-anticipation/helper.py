@@ -107,6 +107,9 @@ def train_one_epoch(
             vid_name=data.get("vid_name", None),
             work_indices=data.get("work_indices", None),
             num_frames=data.get("num_frames", None),
+            scored_actions=data.get("scored_act", None),
+            scored_verbs=data.get("scored_verb", None),
+            scored_nouns=data.get("scored_noun", None),
         )
 
         # Mixup in place
@@ -207,6 +210,9 @@ def evaluate(
             vid_name=data.get("vid_name", None),
             work_indices=data.get("work_indices", None),
             num_frames=data.get("num_frames", None),
+            scored_actions=data.get("scored_act", None),
+            scored_verbs=data.get("scored_verb", None),
+            scored_nouns=data.get("scored_noun", None),
         )
 
         with context:
