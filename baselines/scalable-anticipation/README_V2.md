@@ -135,6 +135,14 @@ environment must provide `mamba-ssm`.
 
 ### First formal results (validation; checkpoint = best val action mt5r)
 
+All metrics are **mean top-5 recall (CMR@5)** from upstream `MeanTopKRecallMeter`:
+per-class top-5 hit rate averaged over classes present in validation, against
+the clip's annotated action / verb / noun. Verb and noun use the **direct
+verb/noun heads** (`val/verb_mt5r_cls`, `val/noun_mt5r_cls`). The upstream
+alternative `val/verb_mt5r` / `val/noun_mt5r` sums raw action logits through
+the action-to-verb/noun map without a softmax; it is logged but not reported
+here. Unobservable EK100 clips count as misses in every metric.
+
 | Dataset | Best epoch | Action CMR@5 | Verb CMR@5 (head) | Noun CMR@5 (head) |
 |---|---:|---:|---:|---:|
 | EGTEA split 1 | 29 | 54.41 | 68.78 | 63.30 |
