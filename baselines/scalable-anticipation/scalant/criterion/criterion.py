@@ -1,3 +1,4 @@
+import torch
 from torch import Tensor
 
 from scalant.config import Config
@@ -21,6 +22,20 @@ def _scored_labels(last_target: Tensor, scored: Tensor, ignore_index: int) -> Te
     if ignore_index >= 0:
         scored = scored - (scored > ignore_index).long()
     return scored
+
+
+def _mt5r_inputs(logits: Tensor, last_target: Tensor, scored: Tensor, observable: Tensor,
+                 ignore_index: int) -> dict:
+    """Logits/labels for MeanTopKRecallMeter. Unobservable clips (no feature
+    before the cutoff) get scores that rank their label last: a counted miss."""
+    labels = _scored_labels(last_target, scored, ignore_index)
+    if observable is not None:
+        keep = observable.to(logits.device).bool()
+        if not keep.all():
+            miss = torch.zeros_like(logits)
+            miss.scatter_(1, labels.view(-1, 1), -1.0)
+            logits = torch.where(keep[:, None], logits, miss)
+    return {"logits": logits, "labels": labels}
 
 
 @Criterion_REGISTRY.register()
@@ -56,11 +71,9 @@ class Criterion_LSTR:
             pred.future_actions[..., notice_index], target.future_actions[..., notice_index])
 
         # Mean top 5
-        mt5r_dict = {
-            "logits": pred.future_actions[:, -1, notice_index],
-            "labels": _scored_labels(target.future_actions[:, -1, notice_index],
-                                     target.scored_actions, self.ignore_index),
-        }
+        mt5r_dict = _mt5r_inputs(pred.future_actions[:, -1, notice_index],
+                                 target.future_actions[:, -1, notice_index],
+                                 target.scored_actions, target.observable, self.ignore_index)
 
         loss_dict = {
             "past_cls_loss": past_cls.item(),
@@ -88,16 +101,12 @@ class Criterion_LSTR:
             verb_notice_index = [i for i in range(target.future_verbs.shape[-1]) if i != self.ignore_index]
             noun_notice_index = [i for i in range(target.future_nouns.shape[-1]) if i != self.ignore_index]
             # Mean top 5
-            verb_mt5r_dict = {
-                "logits": pred.future_verbs[:, -1, verb_notice_index],
-                "labels": _scored_labels(target.future_verbs[:, -1, verb_notice_index],
-                                         target.scored_verbs, self.ignore_index),
-            }
-            noun_mt5r_dict = {
-                "logits": pred.future_nouns[:, -1, noun_notice_index],
-                "labels": _scored_labels(target.future_nouns[:, -1, noun_notice_index],
-                                         target.scored_nouns, self.ignore_index),
-            }
+            verb_mt5r_dict = _mt5r_inputs(pred.future_verbs[:, -1, verb_notice_index],
+                                          target.future_verbs[:, -1, verb_notice_index],
+                                          target.scored_verbs, target.observable, self.ignore_index)
+            noun_mt5r_dict = _mt5r_inputs(pred.future_nouns[:, -1, noun_notice_index],
+                                          target.future_nouns[:, -1, noun_notice_index],
+                                          target.scored_nouns, target.observable, self.ignore_index)
             loss_dict.update({
                 "verb_mt5r_cls": ["MeanTopKRecallMeter", verb_mt5r_dict, None],
                 "noun_mt5r_cls": ["MeanTopKRecallMeter", noun_mt5r_dict, None],
@@ -108,16 +117,12 @@ class Criterion_LSTR:
         verb_notice_index = [i for i in range(target.future_verbs.shape[-1]) if i != self.ignore_index]
         noun_notice_index = [i for i in range(target.future_nouns.shape[-1]) if i != self.ignore_index]
         # Mean top 5
-        verb_mt5r_dict = {
-            "logits": future_verbs[:, -1, verb_notice_index],
-            "labels": _scored_labels(target.future_verbs[:, -1, verb_notice_index],
-                                         target.scored_verbs, self.ignore_index),
-        }
-        noun_mt5r_dict = {
-            "logits": future_nouns[:, -1, noun_notice_index],
-            "labels": _scored_labels(target.future_nouns[:, -1, noun_notice_index],
-                                         target.scored_nouns, self.ignore_index),
-        }
+        verb_mt5r_dict = _mt5r_inputs(future_verbs[:, -1, verb_notice_index],
+                                      target.future_verbs[:, -1, verb_notice_index],
+                                      target.scored_verbs, target.observable, self.ignore_index)
+        noun_mt5r_dict = _mt5r_inputs(future_nouns[:, -1, noun_notice_index],
+                                      target.future_nouns[:, -1, noun_notice_index],
+                                      target.scored_nouns, target.observable, self.ignore_index)
         loss_dict.update({
             "verb_mt5r": ["MeanTopKRecallMeter", verb_mt5r_dict, None],
             "noun_mt5r": ["MeanTopKRecallMeter", noun_mt5r_dict, None],

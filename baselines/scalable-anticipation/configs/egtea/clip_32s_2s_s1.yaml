@@ -1,0 +1,58 @@
+# EGTEA Gaze+ official split 1 (RU-LSTM CSVs), ScalAnt v2 (see README_V2.md):
+#   32s history (28s long + 4s working memory), MAMBA (D_STATE 16), +2s,
+#   equalized action loss with this dataset's training frequencies,
+#   scored on each clip's annotated action; eval keeps clips without any
+#   observation (action starts < ~2s into the video) and scores them as misses.
+# Features: RU-LSTM EGTEA split-1 TSN LMDB converted to 4 Hz npy (tools/rulstm_lmdb_to_npy.py).
+USE_WANDB: False
+NOTE: egtea-s1-32s2s-mamba
+DTYPE: bfloat16
+TRAIN:
+  USE_MIXUP: True
+  NUM_WORKERS: 4
+  EPOCHS: 50
+  OPTIMIZER: adamw
+  BATCH_SIZE: 128
+  LR: 0.0005
+  WEIGHT_DECAY: 0.
+VAL:
+  NUM_WORKERS: 4
+  BATCH_SIZE: 128
+DATA:
+  DATASET_CLASS: ClipAnticipation
+  ANNOTATION_FORMAT: rulstm
+  DATA_ROOT_PATH: /scratch/yh6416/VJEPA2-EXP/data   # override for your machine
+  FEAT_DIR: egtea/scalant_features/s1_rgb_4hz
+  TRAIN_CSV: annotations/egtea_rulstm/training1.csv
+  VAL_CSV: annotations/egtea_rulstm/validation1.csv
+  ACTIONS_CSV: annotations/egtea_rulstm/actions.csv
+  SCORE_ALL_EVAL: True
+  TAU_A: 2.
+  TAU_O: 32.
+  PAST_STEP_IN_SEC: 0.25
+  FUTURE_STEP_IN_SEC: 2.
+  LONG_MEMORY_LENGTH: 28.
+CLUSTERING:
+  ENABLE: True
+MODEL:
+  ENCODER_CLASS: MAMBA
+  MAMBA_VERSION: 1
+  D_STATE: 16
+  EQUALIZED_LOSS: True
+  CRITERION_CLASS: Criterion_LSTR
+  IGNORE_INDEX: 0
+  ACTION_CLS: True
+  VERB_CLS: True
+  NOUN_CLS: True
+  N_LAYER: 4
+  N_DEC_LAYER: 4
+  D_MODEL: 1024
+  D_FFN: 4096
+  SHARE_CLASSIFIER: True
+  N_QUERIES: 1
+  DROPOUT: 0.1
+  DROP_CLS: 0.2
+  PRENORM: False
+  CLS_WORK: False
+  CLS_LAST: False
+  CLS_ALL: True

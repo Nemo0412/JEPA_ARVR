@@ -35,3 +35,5 @@ class Target:
     scored_actions: Optional[Tensor] = None
     scored_verbs: Optional[Tensor] = None
     scored_nouns: Optional[Tensor] = None
+    # 0 for evaluation clips without any observation (scored as misses).
+    observable: Optional[Tensor] = None

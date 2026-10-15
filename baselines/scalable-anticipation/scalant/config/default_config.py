@@ -14,6 +14,12 @@ class DataConfig:
     TRAIN_CSV: str = ""
     VAL_CSV: str = ""
     FULL_CSV: str = ""
+    # ClipAnticipation: "rulstm" (EK100/EGTEA CSVs, 30 fps frames) or "hdepic".
+    ANNOTATION_FORMAT: str = "hdepic"
+    # Official RU-LSTM actions.csv; "" = closed vocabulary over train+val pairs.
+    ACTIONS_CSV: str = ""
+    # Keep eval clips dropped by the anticipation window, scored as misses.
+    SCORE_ALL_EVAL: bool = True
 
     # Short-term specific
     TAU_A: float = 1.  # ahead of true action, in seconds

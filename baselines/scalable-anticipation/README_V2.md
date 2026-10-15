@@ -1,113 +1,127 @@
-# ScalAnt HD-EPIC baseline, v2 (32s history, MAMBA, annotated-action scoring)
+# ScalAnt baseline v2: one code path for EK100, EGTEA and HD-EPIC
 
-This revision builds on the `Baseline_ScalAnt` HD-EPIC P01 code (`8c3b146`,
-config `configs/hdepic/clip_4s_2s.yaml`). It moves the baseline to ScalAnt's
-default history and encoder, and it scores every method on the same target.
-The old 4s/LSTM config is unchanged and still runs.
+This revision builds on the `Baseline_ScalAnt` HD-EPIC P01 code (`8c3b146`).
+It moves the baseline to ScalAnt's default history and encoder, scores every
+method on the same target, and runs the **same action-instance pipeline on
+all three datasets** through one dataset class (`ClipAnticipation`). The old
+4s/LSTM HD-EPIC config (`configs/hdepic/clip_4s_2s.yaml`) still runs.
 
-New config: `configs/hdepic/clip_32s_2s.yaml`.
+| Dataset | Config | Annotations | Class space | Features (4 Hz npy) |
+|---|---|---|---|---|
+| EK100 | `configs/ek100/clip_32s_2s.yaml` | RU-LSTM `annotations/ek100_rulstm/{training,validation}.csv` | official `actions.csv`, 3,806 | RU-LSTM EK100 TSN LMDB, converted |
+| EGTEA split k | `configs/egtea/clip_32s_2s_s{1,2,3}.yaml` | RU-LSTM `annotations/egtea_rulstm/{training,validation}{k}.csv` | official `actions.csv`, 106 | RU-LSTM split-k TSN LMDB, converted |
+| HD-EPIC P01 | `configs/hdepic/clip_32s_2s.yaml` | clip-split V-JEPA CSVs | closed train+val vocabulary (no official list) | `rulstm_features/rgb_p01` |
 
-## Decisions (agreed 2026-10-15)
+## Agreed decisions (2026-10-15)
 
-1. **Encoder: upstream default.** MAMBA v1 with `D_STATE: 16`, as in upstream
-   `configs/ek100/default.yaml`. The old HD-EPIC config used LSTM and did not
-   set `D_STATE`; the code default is 64. MAMBA needs `mamba-ssm` and
-   `causal-conv1d`. `fla` is optional because the PyTorch fallback for
-   RMSNorm/SwiGLU is kept.
-2. **History: 32s = 28s long memory + 4s working memory**
-   (`TAU_O: 32`, `LONG_MEMORY_LENGTH: 28`). ScalAnt's contribution is
-   long-memory compression, so a 4s-only window would remove its mechanism.
-   The 4s working window matches the 4s per-step input of the other compared
-   methods; the extra 28s is ScalAnt's own memory. Report this row as
-   "ScalAnt (28s memory)", which sees more history than the 4s-input methods.
-   Upstream's own default split is 31s + 1s; 28+4 is chosen to keep the shared
-   4s working window.
-3. **Scored target: the annotated action of each clip.** Upstream computes
-   mean top-5 recall against `argmax` of the multi-hot future target. When
-   actions overlap, that returns the *lowest class id* among them. This is an
-   implementation artifact: on EK100 validation, only 82.7% of action-start
-   targets are the annotated action. RU-LSTM, InAViT and our method score the
-   annotated action, so evaluation is aligned here. **Training targets are
-   unchanged from upstream**: dense multi-hot union of covering actions, with
-   background 0. The old code's training-time overwrite of the last future
-   frame is removed.
-4. **Loss: equalized action loss on HD-EPIC.** Upstream applies
-   `MultipCrossEntropyEqualizedLoss` only to its `EpicKitchens` dataset class,
-   with EK100 frequencies hard-coded. It suppresses negative gradients for rare
-   classes (frequency < 1.76e-3), the long-tail EK100 recipe. HD-EPIC is
-   similarly long-tail, so v2 enables it via `MODEL.EQUALIZED_LOSS: True`, with
-   frequencies from the HD-EPIC **training** CSV. Upstream ships no EGTEA
-   config, and its EQL cannot run on EGTEA's 106 classes as written; EGTEA
-   keeps its existing setting.
-5. **One future query at t0: `FUTURE_STEP_IN_SEC: 2` (= `TAU_A`).** The model
-   has `N_QUERIES: 1` future slot. Upstream uses `TAU_A = FUTURE_STEP = 1`, so
-   its single query sits at the action start; with `TAU_A = 2` the same design
-   needs a step of 2. The old config already did this. A step of 1 would
-   create two target slots for one query and fail in the loss.
+1. **Encoder: upstream default.** MAMBA v1 with `D_STATE: 16`. The old
+   HD-EPIC config used LSTM and did not set `D_STATE`, so it would have
+   defaulted to 64. MAMBA requires `mamba-ssm` and `causal-conv1d`; `fla` is
+   optional because a PyTorch fallback is kept.
+2. **History: 32s = 28s long memory + 4s working memory.** ScalAnt's
+   contribution is long-memory compression, so a 4s-only window would remove
+   its mechanism. The 4s working window matches the 4s per-step input of the
+   other compared methods. Report this row as "ScalAnt (28s memory)": it sees
+   more history than the 4s-input methods. Upstream itself splits 31s + 1s;
+   28+4 keeps the shared 4s working window.
+3. **Scored target: each clip's annotated action.** Upstream computes mean
+   top-5 recall against the `argmax` of the multi-hot future target, which
+   picks the *lowest class id* among overlapping actions. That is an
+   implementation artifact. It differs from the annotated action for 17.3% of
+   EK100 validation action starts and for 20% of HD-EPIC validation clips.
+   RU-LSTM, InAViT and our method score the annotated action. **Training
+   targets are unchanged** (upstream multi-hot union, background 0); the old
+   code's training-time overwrite of the last future frame was removed.
+4. **Equalized action loss on all three datasets**, each with its own
+   training frequencies. Upstream enables `MultipCrossEntropyEqualizedLoss`
+   only for its EK100 dataset class, with EK100 frequencies hard-coded, so it
+   cannot run on EGTEA. v2 computes the frequencies per dataset. EK100 values
+   equal upstream's, which come from the same RU-LSTM `training.csv`.
+5. **Early actions.** Training drops clips whose window ends before the
+   first feature, as upstream does. Evaluation keeps them, with zero features
+   and `observable = 0`, and scores them as **misses** on the full official
+   population (EK100 val 9,668 rows). Precedent: AVT/S-GEAR add dropped
+   segments back with zero scores in challenge submissions; RU-LSTM counts
+   them as zeros in EK100 validation; and the challenge needs every segment.
+   In all of these, such segments earn no credit.
+6. **One future query at t0** (`FUTURE_STEP_IN_SEC = TAU_A = 2`). The model
+   has `N_QUERIES: 1`. Upstream's `TAU_A = FUTURE_STEP = 1` puts that query at
+   the action start; with `TAU_A = 2` the step must be 2 (this is not a
+   difference from upstream).
+
+## Comparison with the upstream ScalAnt default
+
+| # | Item | Upstream default | v2 | Reason |
+|---|---|---|---|---|
+| 1 | `TAU_A` | 1s | **2s** | Task horizon |
+| 2 | Long / working memory | 31s + 1s | **28s + 4s** (same 32s total) | Shared 4s working window |
+| 3 | Scored target | argmax of multi-hot (lowest overlapping id) | **Annotated action** | Same target as other methods |
+| 4 | Equalized loss | EK100 only, hard-coded EK100 frequencies | **All three datasets, own training frequencies** | Aligned code |
+| 5 | Early actions at evaluation | Dropped from scoring | **Kept, scored as misses** | Same population for every method |
+| 6 | Class space | Fixed EK100 `actions.csv` | EK100 3,806 and EGTEA 106 (official); HD-EPIC closed vocabulary | No official HD-EPIC list |
+| 7 | Per-frame label source | TeSTra files | Rebuilt from each dataset's CSVs, same union semantics | One pipeline for three datasets |
+| 8 | Features | TeSTra/RU-LSTM TSN (EK100-finetuned), 4 Hz | EK100: our RU-LSTM LMDB to 4 Hz; EGTEA: split-specific TSN; HD-EPIC: `rgb_p01` | Dataset-dependent; EK100 features equal the RU-LSTM baseline's |
+| 9 | `fla` kernels | Required | PyTorch fallback when missing | Environment; functionally the same |
+
+**Unchanged from upstream:** MAMBA v1 `D_STATE 16`; CLAM clustering; 4+4
+layers, D 1024, FFN 4096, dropout 0.1/0.2, shared classifier, one query at
+t0; multi-hot targets with `CLS_ALL` and `IGNORE_INDEX 0` (background-only
+frames excluded from the loss); AdamW 5e-4, wd 0, batch 128, 50 epochs,
+cosine with 5 warmup epochs, mixup, bf16, seed 42; `val/mt5r` checkpoint
+selection; training-time early-action drop with first-frame padding.
+
+**Changed from the collaborator's previous version:** 4s to 32s history;
+LSTM to MAMBA with explicit `D_STATE 16`; the last-future-frame overwrite
+moved from training targets to scoring only; HD-EPIC-only code extended to
+three datasets.
 
 ## Code changes
 
 | File | Change |
 |---|---|
-| `scalant/datasets/hdepic.py` | Removed the last-future-frame overwrite. Returns `scored_act/verb/noun`, the clip's annotated labels in full class space (background = 0). Computes `action_frequency` from the train CSV. |
-| `scalant/utils/ouput_target_structure.py` | Optional `Target.scored_actions/verbs/nouns`. |
-| `helper.py` | Passes `scored_*` from the batch into `Target` (train and eval). |
-| `scalant/criterion/criterion.py` | `_scored_labels()`: when `scored_*` is present, the mt5r labels for action, direct verb/noun heads and marginalized verb/noun use the annotated ids; otherwise upstream argmax. With `MODEL.EQUALIZED_LOSS` and a dataset `action_frequency`, the action loss is EQL with those frequencies. `EpicKitchens` behavior is unchanged. |
-| `scalant/config/default_config.py` | `MODEL.EQUALIZED_LOSS: bool = False` (default off, so upstream behavior is unchanged). |
-| `configs/hdepic/clip_32s_2s.yaml` | New v2 config (above). |
-| `tests/test_v2_changes.py` | Unit tests for label mapping and loss selection; real-data check of the HD-EPIC items. |
-
-## Remaining differences from the upstream ScalAnt default
-
-| Item | Upstream default | v2 | Note |
-|---|---|---|---|
-| `TAU_A` | 1s | 2s | Task horizon |
-| Long / working memory | 31s + 1s | 28s + 4s | Decision 2 |
-| Scored target | argmax of multi-hot (lowest overlapping id) | Annotated action | Decision 3 |
-| Class space | Fixed RU-LSTM `actions.csv` (EK100) | Closed over train+val (verb, noun) pairs in the HD-EPIC CSVs | HD-EPIC-specific |
-| Equalized-loss frequencies | EK100 training counts | HD-EPIC training counts | Decision 4 |
-| Per-frame label source | TeSTra `target_perframe` | Rebuilt from CSVs with the same union semantics | Same semantics |
-| Features | RU-LSTM/TeSTra TSN, EK100-finetuned, 4 Hz | HD-EPIC TSN-RGB at 4 Hz (`rulstm_features/rgb_p01`) | Dataset-dependent |
-| `fla` kernels | Required | PyTorch fallback if missing | Functionally the same |
-
-Everything else matches upstream: CLAM clustering, 4+4 layers, D 1024, FFN
-4096, dropout, `CLS_ALL`, `IGNORE_INDEX 0`, AdamW 5e-4, batch 128, 50 epochs,
-cosine with 5 warmup epochs, mixup, bf16, seed 42 and `val/mt5r` checkpoint
-selection. Early-action handling is upstream's `convert_to_anticipation`:
-clips whose window ends before the first feature are dropped, and windows that
-start before the video are padded with the first frame.
+| `scalant/datasets/clip_anticipation.py` | New `ClipAnticipation`: RU-LSTM or HD-EPIC CSVs, official or closed class space, dense multi-hot labels from CSVs, `action_frequency`, `scored_act/verb/noun`, `observable` (early clips kept at evaluation). |
+| `scalant/datasets/hdepic.py` | `HDEPICClip` is now a thin `ClipAnticipation` alias (HD-EPIC format, closed vocabulary). |
+| `scalant/criterion/criterion.py` | `_scored_labels` and `_mt5r_inputs`: mt5r for action, direct verb/noun and marginalized verb/noun uses annotated labels, and unobservable clips are forced to misses. Optional equalized loss with dataset frequencies (`MODEL.EQUALIZED_LOSS`). `EpicKitchens` behavior unchanged. |
+| `scalant/utils/ouput_target_structure.py`, `helper.py` | `Target.scored_*` and `Target.observable`, passed from the batch. |
+| `scalant/config/default_config.py` | `DATA.ANNOTATION_FORMAT`, `DATA.ACTIONS_CSV`, `DATA.SCORE_ALL_EVAL`, `MODEL.EQUALIZED_LOSS` (defaults keep upstream and old-config behavior). |
+| `tools/rulstm_lmdb_to_npy.py` | RU-LSTM 30 fps-keyed LMDB to per-video 4 Hz npy (key `max(1, floor(t*7.5))`, nearest earlier key if missing) plus coverage JSON. |
+| `configs/{ek100,egtea,hdepic}/clip_32s_2s*.yaml`, `annotations/egtea_rulstm/` | v2 configs and RU-LSTM EGTEA CSVs. |
+| `tests/test_v2_changes.py` | Unit tests (label mapping, miss forcing, loss selection) and real-data checks for all datasets. |
 
 ## Run
 
 ```bash
 cd baselines/scalable-anticipation
+# 1) features for EK100 / EGTEA (once), e.g. EK100:
+python tools/rulstm_lmdb_to_npy.py --lmdb <rulstm ek100 rgb lmdb dir> \
+  --out <DATA_ROOT>/ek100/scalant_features/rgb_4hz \
+  --csv annotations/ek100_rulstm/training.csv --csv annotations/ek100_rulstm/validation.csv
+# 2) train + validate
 export SCALANT_CKPT_DIR=<output dir>
-python main.py --cfg configs/hdepic/clip_32s_2s.yaml --opts USE_WANDB False
-python -m unittest tests.test_v2_changes -v   # checks
+python main.py --cfg configs/ek100/clip_32s_2s.yaml --opts USE_WANDB False DATA.DATA_ROOT_PATH <DATA_ROOT>
+python -m unittest tests.test_v2_changes -v
 ```
 
-See `expts/submit_scalant_p01_32s2s.slurm`. The environment must provide
-`mamba-ssm`.
+`expts/submit_scalant_p01_32s2s.slurm` gives an HD-EPIC example. The Python
+environment must provide `mamba-ssm`.
 
-## Verification (2026-10-15, NYU Torch HPC)
+## Verification
 
-- **Unit and data tests** (`tests/test_v2_changes.py`): 7/7 pass. Real HD-EPIC
-  P01 split: train 5,907 / val 1,477 clips, 0 discarded; vocab
-  verb/noun/action = 87/153/1228 including background. Every val item has
-  128 past features (32s at 4 Hz), one future slot and 128 past labels
-  (`CLS_ALL`). The annotated action is present in the last-slot multi-hot
-  target for 1,477/1,477 val clips.
-- **Effect of the scoring fix on HD-EPIC.** The last future slot is
-  multi-hot (overlapping actions) for 512/1,477 val clips. Upstream `argmax`
-  scoring would use a different action than the annotated one for **295/1,477
-  val clips (19.97%)**; on train, 1,168/5,907 (19.77%).
-- **End-to-end GPU smoke** (H200, 2 epochs, MAMBA, bf16): training and
-  validation run, every mt5r metric is reported, and `checkpoint_best.pth` is
-  written. Validation after 2 warmup epochs: action mt5r 1.83, as a pipeline
-  check only. About 3 to 4 minutes per epoch.
-- **Open issue: GPU utilization.** Average GPU utilization in the smoke was
-  about 5%, because the run is dominated by data loading and CPU work on a
-  small model. 50 epochs take roughly 2.5 to 3h in one job. On clusters that
-  enforce a utilization rule for jobs over 2h, split the run into shorter jobs
-  or speed up loading (more `NUM_WORKERS` or a feature cache). `main.py` can
-  reload weights (`TRAIN.CKPT_PATH`) but not optimizer or scheduler state.
+### HD-EPIC (2026-10-15)
+
+- Unit and data tests pass. Train 5,907 / val 1,477 clips, 0 dropped; vocab
+  verb/noun/action = 87/153/1228 including background. Each item has 128 past
+  features, one future slot and 128 past labels. The annotated action is in
+  the last-slot multi-hot target for 1,477/1,477 val clips.
+- Effect of the scoring fix: the last slot is multi-hot for 512/1,477 val
+  clips. Upstream argmax would score a different action for **295/1,477 val
+  clips (19.97%)**; on train, 1,168/5,907 (19.77%).
+- GPU smoke (H200, 2 epochs, MAMBA, bf16): training and validation run, all
+  mt5r metrics are reported and the checkpoint is written. Epoch 1 includes
+  about 5 minutes of one-time MAMBA/triton compilation and autotuning. After
+  that an epoch takes about 10 s (train 7 s, val 1 s), so 50 epochs take about
+  15 minutes.
+
+### EK100 / EGTEA
+
+See below (filled from the conversion audit, tests and smokes).
