@@ -1,0 +1,1 @@
+from scalant.models.querypredictor import QueryPredictor

@@ -1,0 +1,44 @@
+USE_WANDB: True
+DTYPE:
+  bfloat16
+TRAIN:
+  USE_MIXUP: True
+  NUM_WORKERS: 4
+  EPOCHS: 50
+  OPTIMIZER: adamw
+  BATCH_SIZE: 128
+  LR: 0.0005
+  WEIGHT_DECAY: 0.
+VAL:
+  NUM_WORKERS: 4
+  BATCH_SIZE: 128
+DATA:
+  DATA_ROOT_PATH: /mnt/ssd/datasets
+  FEAT_DIR: epickitchens100/features/rgb_kinetics_bninception
+  FUTURE_STEP_IN_SEC: 2.
+  TAU_A: 2.
+  TAU_O: 4.
+  LONG_MEMORY_LENGTH: 3.
+CLUSTERING:
+  ENABLE: True
+MODEL:
+  ENCODER_CLASS: MAMBA
+  CRITERION_CLASS: Criterion_LSTR
+  IGNORE_INDEX: 0
+  ACTION_CLS: True
+  VERB_CLS: True
+  NOUN_CLS: True
+  N_LAYER: 4
+  N_DEC_LAYER: 4
+  D_MODEL: 1024
+  D_FFN: 4096
+  SHARE_CLASSIFIER: True
+  N_QUERIES: 1
+  DROPOUT: 0.1
+  DROP_CLS: 0.2
+  PRENORM: False
+  MAMBA_VERSION: 1
+  D_STATE: 16
+  CLS_WORK: False
+  CLS_LAST: False
+  CLS_ALL: True
