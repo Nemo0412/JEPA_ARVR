@@ -134,6 +134,10 @@ flowchart TB
 |------|------|
 | [`rulstm/`](rulstm/) | Upstream [RU-LSTM](https://github.com/fpv-iplab/rulstm) (vendor) |
 | [`rulstm_hdepic/`](rulstm_hdepic/) | Streaming RU-LSTM on HD-EPIC P01 |
+| [`lstm_hdepic/`](lstm_hdepic/) | Streaming LSTM on HD-EPIC P01 (last 4s TSN-RGB → +2s) |
+| [`scalable-anticipation/`](scalable-anticipation/) | ScalAnt HD-EPIC P01 clip baseline (4s → +2s) |
+| [`InAViT/`](InAViT/) | Upstream [InAViT](https://github.com/LAHAproject/InAViT) (vendor; MotionFormer+HoIViT) |
+| [`inavit_hdepic/`](inavit_hdepic/) | Streaming InAViT on HD-EPIC P01 (last 4s RGB, dummy boxes → +2s) |
 | [`AGA/`](AGA/) | Upstream [AGA](https://github.com/CorcovadoMing/AGA) (vendor) |
 | [`aga_hdepic/`](aga_hdepic/) | Streaming AGA on HD-EPIC P01 (+2/+4/+6s) |
 | [`jepa_tiny_18m/`](jepa_tiny_18m/) | From-scratch V-JEPA `vit_tiny` ≈18–20M vs RU-LSTM |
@@ -226,6 +230,9 @@ Primary metric: **val action Top-5 @ +2s** (unless noted). Paths under `/scratch
 sbatch baselines/rulstm_hdepic/submit_rulstm_p01_stream.slurm
 sbatch baselines/rulstm_hdepic/submit_rulstm_vitl_aligned_v3_residual.slurm
 sbatch baselines/rulstm_hdepic/submit_rulstm_vjepa_vitl_feat.slurm
+sbatch baselines/lstm_hdepic/submit_lstm_p01_stream_4s2s.slurm
+sbatch baselines/scalable-anticipation/expts/submit_scalant_p01_4s2s.slurm
+sbatch baselines/inavit_hdepic/submit_inavit_p01_stream_4s2s.slurm
 sbatch baselines/aga_hdepic/submit_aga_p01_stream.slurm
 sbatch baselines/jepa_tiny_18m/submit_stream_tiny_18m.slurm
 sbatch baselines/qwen_vl_stream/submit_qwen_stream.slurm
@@ -241,6 +248,7 @@ Absolute paths in `.slurm` / scripts point at NYU Torch scratch; edit for other 
 
 ## GitHub notes
 
-- Nested vendor `.git` dirs under `rulstm/`, `vlesa/`, and `AGA/` are **not** pushed
-  (copied as plain trees). Prefer submodules later if needed.
+- Nested vendor `.git` dirs under `rulstm/`, `vlesa/`, `AGA/`, `InAViT/`, and
+  `scalable-anticipation/` are **not** pushed (copied as plain trees). Prefer
+  submodules later if needed.
 - Checkpoints / experiment dumps are gitignored; results live on scratch.
