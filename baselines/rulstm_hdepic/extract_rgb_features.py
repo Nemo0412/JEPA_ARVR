@@ -105,7 +105,16 @@ def main():
     print(f"device={device}", flush=True)
     model = build_model(args.tsn_ckpt, device)
 
-    videos = sorted(args.video_root.glob("*.MP4")) + sorted(args.video_root.glob("*.mp4"))
+    videos = sorted(args.video_root.rglob("*.MP4")) + sorted(args.video_root.rglob("*.mp4"))
+    # Dedup by stem in case both .MP4 and .mp4 exist.
+    seen = set()
+    uniq = []
+    for path in videos:
+        if path.stem in seen:
+            continue
+        seen.add(path.stem)
+        uniq.append(path)
+    videos = uniq
     print(f"videos={len(videos)} → {args.out}", flush=True)
 
     for path in tqdm(videos, desc="extract"):

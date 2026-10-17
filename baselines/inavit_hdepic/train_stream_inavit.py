@@ -141,21 +141,26 @@ class StreamVideoDataset(Dataset):
 
 
 class InAViTStream(nn.Module):
+    """Original MotionFormer+HoIViT. Only the classification-layer width
+    changes to the HD-EPIC vocab; backbone params stay as InAViT."""
+
     def __init__(self, backbone: nn.Module, num_verb: int, num_noun: int, num_action: int):
         super().__init__()
         self.backbone = backbone
         dim = int(backbone.embed_dim)
-        self.verb_clf = nn.Linear(dim, num_verb)
-        self.noun_clf = nn.Linear(dim, num_noun)
-        self.action_clf = nn.Linear(dim, num_action)
+        # Replace EK 97/300 heads with the same Linear head type, HD-EPIC sizes.
+        backbone.num_classes = [int(num_verb), int(num_noun), int(num_action)]
+        for idx, n_cls in enumerate(backbone.num_classes):
+            setattr(backbone, f"head{idx}", nn.Linear(dim, n_cls))
+        if hasattr(backbone, "head"):
+            backbone.head = nn.Identity()
 
     def forward(self, frames: torch.Tensor, metadata: dict):
-        feat = self.backbone.forward_features([frames], metadata)
-        feat = self.backbone.head_drop(feat)
+        _verb, extra = self.backbone([frames], metadata)
         return {
-            "verb": self.verb_clf(feat),
-            "noun": self.noun_clf(feat),
-            "action": self.action_clf(feat),
+            "verb": extra["verb"],
+            "noun": extra["noun"],
+            "action": extra["action"],
         }
 
 
@@ -167,6 +172,8 @@ def build_inavit(cfg_file: Path, device: torch.device) -> nn.Module:
     cfg.merge_from_file(str(cfg_file))
     cfg.NUM_GPUS = 1
     cfg.TRAIN.ENABLE = True
+    # Three Linear heads (verb/noun/action), same as EGTEA InAViT layout.
+    cfg.TRAIN.DATASET = "egtea"
     model = Motionformer(cfg)
     return model.to(device)
 
@@ -234,25 +241,25 @@ def main():
         "--train-csv",
         type=Path,
         default=Path(
-            "/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/stream_half_split/HD_EPIC_train_stream_mtp.csv"
+            "/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/stream_4s2s_all/HD_EPIC_train_stream_mtp.csv"
         ),
     )
     ap.add_argument(
         "--val-csv",
         type=Path,
         default=Path(
-            "/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/stream_half_split/HD_EPIC_val_stream_mtp.csv"
+            "/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_annotations/stream_4s2s_all/HD_EPIC_val_stream_mtp.csv"
         ),
     )
     ap.add_argument(
         "--video-root",
         type=Path,
-        default=Path("/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_videos/P01"),
+        default=Path("/scratch/ll5914/datasets/HD-EPIC/hdepic_vjepa_videos"),
     )
     ap.add_argument(
         "--out-dir",
         type=Path,
-        default=Path("/scratch/ll5914/experiments/inavit_hdepic_p01_stream_4s2s"),
+        default=Path("/scratch/ll5914/experiments/inavit_hdepic_stream_4s2s"),
     )
     ap.add_argument("--obs-sec", type=float, default=4.0)
     ap.add_argument("--num-frames", type=int, default=16)
@@ -291,7 +298,12 @@ def main():
     backbone = build_inavit(args.cfg, device)
     model = InAViTStream(backbone, len(verb_map), len(noun_map), len(action_map)).to(device)
     nparam = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"InAViT MotionFormer+HoIViT {nparam:.1f}M params", flush=True)
+    n_bb = sum(p.numel() for n, p in model.named_parameters() if not n.split(".")[-2].startswith("head")) / 1e6
+    print(
+        f"InAViT MotionFormer+HoIViT {nparam:.1f}M params "
+        f"(backbone≈{n_bb:.1f}M; heads resized to HD-EPIC vocab)",
+        flush=True,
+    )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
