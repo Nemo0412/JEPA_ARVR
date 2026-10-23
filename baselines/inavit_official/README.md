@@ -8,6 +8,12 @@ its predictions did not depend on the input and it scored the class prior
 Agreed setup (2026-10-22): the InAViT authors' configuration and pretrained
 weights, real hand/object boxes, and our horizon and input length.
 
+## Principle
+
+This is a faithful reproduction of the released InAViT code. Only the input
+length and the horizon change. Released behaviour is kept even where it looks
+questionable (decision 2026-10-23).
+
 ## Taken unchanged from the released InAViT (`baselines/InAViT`)
 
 | Part | Released source |
@@ -16,33 +22,59 @@ weights, real hand/object boxes, and our horizon and input length.
 | Initialization | `CP/ek_motionformer_224_16x4.pyth` (MotionFormer trained for EK100 recognition) through `slowfast.utils.checkpoint.load_checkpoint` with epoch reset: shape-matched tensors load, HoIViT modules without a counterpart stay fresh |
 | Optimizer | `construct_optimizer`: AdamW, wd 0.05. Backbone and heads `BASE_LR` 1e-5, HoIViT parameters `HOIVIT_BASE_LR` 1e-4. `steps_with_relative_lrs` (x1 / x0.1 / x0.01 at epochs 0 / 29 / 60 of 100), set every iteration |
 | Loss | `EKLoss` label smoothing 0.1, verb + noun |
-| Precision / batch | FP16 autocast + GradScaler, no gradient clipping, global batch 20 (`--accum` keeps 20 if memory is short) |
-| Augmentation | box-aware RandAugment `rand-m7-n4-mstd0.5-inc1` (bicubic), short-side jitter 256-320, random 224 crop, horizontal flip, mean/std 0.5. Eval: short side 224, centre crop, one view |
-| Boxes | author h5 (Zenodo 14004926 `epickitchens.h5`): `video -> 1-based frame -> {obj, hand}`, rows `[x1, y1, x2, y2, track]`; `sort_boxes_sorted` slots; `prepare_boxes` (clamp, xyxy -> cxcywh, drop w or h <= 0.05) |
+| Precision / batch | FP16 autocast + GradScaler, no gradient clipping, global batch 20 (the released 4 GPUs x 5; the model has no BatchNorm). Train loader `drop_last=True` |
+| Frame decoding | `utils.retry_load_images` (cv2: **BGR** channel order, as the released model and its MotionFormer init were trained) |
+| Train augmentation | `Epickitchens_dataset._aug_frame` called as released: box-aware RandAugment `rand-m7-n4-mstd0.5-inc1`, short-side jitter 256-320, random 224 crop, flip, mean/std 0.5 |
+| Eval view | released test-mode path (`tensor_normalize` + `utils.spatial_sampling`, short side 224, centre crop) |
+| Boxes | author h5 (Zenodo 14004926 `epickitchens.h5`): `video -> 1-based frame -> {obj, hand}`, rows `[x1, y1, x2, y2, track]`. Read as `EKBoxes.get_boxes` (`sort_boxes_sorted`), then `EKBoxes.prepare_boxes` |
 
-## Changed for our protocol
+### Released box behaviour, kept as is (consequence measured)
 
-1. **Window.** 16 frames uniform over the 4s that end at action start - 2s,
-   on the native frame clock, the same window as every compared baseline.
-   The released EK loader observes 16x4 frames ending one frame before an
-   offset *inside* the action segment, so it cannot be reused for a +2s
-   horizon.
-2. **Selection and scoring.** Select by validation action class-mean
-   Recall@5 (first maximum). Verb/noun use the direct heads. Action =
-   log p(verb) + log p(noun) over `actions.csv` (3,806 actions). Every
-   validation row is scored; rows with no observation before the cutoff
-   (B19 rule, 76 on EK100) are misses. Those rows are also dropped from
-   training.
+- The released transforms apply geometric changes to **object boxes only**.
+  Hand boxes keep their original-frame coordinates through crop and flip.
+- The h5 boxes are normalized, but the released transforms treat them as
+  pixels: they scale them by the resize ratio and subtract a pixel crop
+  offset. They then clip, and `prepare_boxes` drops anything with width or
+  height <= 0.05.
+- Measured on 400 random train / 400 val rows (`box_survival.py`):
+  - **Object boxes after the released loader: 0% non-empty** in training and
+    in evaluation, versus 13% / 12% of object slots non-empty in the raw h5.
+  - **Hand boxes: unchanged**, 73% / 75% of slots non-empty.
+- So the faithful model receives hand boxes (unaugmented) and no object boxes.
 
-## Two loader fixes (deviations from the released code)
+## Changes (intended or protocol-level)
 
-- **Hand boxes are augmented with the frames.** The released loader applies
-  RandAugment, crop and flip to object boxes only, so hand boxes drift from
-  the hands in training.
-- **Pixel/normalized handling is explicit.** The released transforms work in
-  pixels while the h5 boxes are normalized (checked by `audit_boxes.py`).
-  Boxes are scaled to pixels first, transformed together with the frames, and
-  divided by the crop size afterwards.
+1. **Window and horizon (intended).** 16 frames uniform over the 4s that end
+   at action start - 2s, on the native frame clock. This replaces the released
+   EK window, which observes 16x4 frames ending one frame before an offset
+   inside the action segment. Boxes are read for the same instants on the
+   authors' clock (next section).
+2. **Shared comparison protocol.** These are the same for every baseline in
+   our table:
+   - Selection by validation action class-mean Recall@5 (first maximum). The
+     released code trains 100 epochs with no selection; its in-training val
+     uses random crops.
+   - Single deterministic view. The released test averages 10 temporal x 3
+     spatial views; with a fixed window only one temporal position exists.
+   - Action score = log p(verb) + log p(noun) over `actions.csv` (3,806). This
+     matches how the EK100 server ranks actions from the verb/noun scores in
+     the released challenge JSON. The released local `MT5R` counts an action
+     as hit when the verb is in the verb top-5 and the noun is in the noun
+     top-5 (up to 25 pairs). That number is reported too
+     (`action_released_mt5r_rule`), but it is not used for selection.
+   - Rows with no observation before the cutoff: dropped from training (230)
+     and scored as misses in validation (76). The released loader would clamp
+     the window to the video start.
+3. **Engineering only.**
+   - A failing sample raises. The released `__getitem__` silently substitutes
+     the next index.
+   - Per-sample seeded augmentation and exact resume. Same distributions,
+     different random streams.
+   - Frames come from the MD5-verified original MP4s, decoded at the native
+     rate and stored as 456x256 JPEG (q90). The released code reads the EPIC
+     `rgb_frames` JPEGs of the authors' re-encoded 60/50 fps videos. The
+     sampled instants are the same; pixels differ only by decoding and JPEG
+     re-encoding.
 
 ## Box frame clock (important)
 
@@ -72,8 +104,8 @@ augmentations. A segment checks that the uids it sees are the expected ones.
 
 - `train_inavit_official.py`: trainer and evaluator (`--eval-only` replays `best.pt`).
 - `audit_boxes.py`: h5 schema, coordinate range, frame-key clock, and per-row coverage of the requested frames.
-- `test_inavit_official.py`: CPU tests for the window formula, box/frame alignment under eval and train
-  geometry, the released box-aware RandAugment geometric ops, deterministic augmentation, and unobservable rows.
+- `test_inavit_official.py`: CPU tests for the window formula, the box clock, BGR decoding as released,
+  the released eval box path, deterministic augmentation, and unobservable rows.
 
 Inputs: frames as `<frames>/<video>/frame_{i+1:010d}.jpg` plus
 `_meta.json` (`n_frames`). Rows CSV columns:
@@ -83,7 +115,7 @@ Inputs: frames as `<frames>/<video>/frame_{i+1:010d}.jpg` plus
 ```bash
 python baselines/inavit_official/train_inavit_official.py \
   --train-csv EK100_train.csv --val-csv EK100_val.csv --actions-csv actions.csv \
-  --frames FRAMES --boxes-h5 epickitchens.h5 --box-coords normalized \
+  --frames FRAMES --boxes-h5 epickitchens.h5 \
   --checkpoint CP/ek_motionformer_224_16x4.pyth --out OUT [--epochs N --lr-steps 0 a b]
 ```
 
@@ -97,7 +129,10 @@ python baselines/inavit_official/train_inavit_official.py \
   - Coordinates are normalized (-0.16..1.16).
 - **Initialization.** 205 backbone tensors load from the MotionFormer
   checkpoint (108.6M of 177.8M parameters). 138 HoIViT tensors are fresh.
-- **CPU tests.** 7/7 pass.
+- **CPU tests.** 6/6 pass (released-loader version).
+- Smokes A-C below ran on an earlier revision of the trainer (RGB decoding,
+  with hand-box augmentation and pixel conversion). Model, optimizer and speed
+  are unchanged; smoke D re-checks the released-loader revision.
 - **Smoke A** (600 train / 400 val rows, batch 20, 2 x 15 steps): finite
   losses. GradScaler skipped one step at warm-up (normal for FP16). Peak
   memory 73.4 GB.

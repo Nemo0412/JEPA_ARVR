@@ -10,27 +10,31 @@ EK100 config `configs/INAVIT/EK_INAVIT_MF_ant.yaml`:
   - `construct_optimizer` (AdamW, wd 0.05, backbone/heads BASE_LR 1e-5, HoIViT params 1e-4),
     `steps_with_relative_lrs` evaluated per iteration, label-smoothed CE (0.1) on verb + noun,
     FP16 autocast + GradScaler, no gradient clipping, global batch 20.
-  - Train augmentation: RandAugment rand-m7-n4-mstd0.5-inc1 (bicubic, box-aware), short-side
-    jitter 256-320, random 224 crop, horizontal flip; mean/std 0.5. Eval: short side 224,
-    center 224 crop, single view.
+  - Spatial pipeline: the released loader code itself. Training calls
+    `Epickitchens_dataset._aug_frame` (box-aware RandAugment rand-m7-n4-mstd0.5-inc1, short-side
+    jitter 256-320, random 224 crop, flip; mean/std 0.5); evaluation calls the released test-mode
+    path (`tensor_normalize` + `utils.spatial_sampling`, short side 224, centre crop, one view).
+    Its behaviour is kept as released, including that only object boxes follow the geometric
+    transforms (hand boxes are left untouched) and that the normalized h5 boxes enter the
+    pixel-space transforms without conversion.
   - Boxes: author-released per-frame detections (h5: video -> 1-based frame on the authors'
-    nominal 60 / 50 fps clock -> {obj, hand},
-    rows [x1, y1, x2, y2, track_id]), slotted by the released `sort_boxes_sorted`, then the
-    released `prepare_boxes` steps (clamp [0, 1], xyxy -> cxcywh, drop boxes with w or h <= 0.05).
+    nominal 60 / 50 fps clock -> {obj, hand}, rows [x1, y1, x2, y2, track_id]), read as
+    `EKBoxes.get_boxes` does (`sort_boxes_sorted`), then `EKBoxes.prepare_boxes` (clamp [0, 1],
+    xyxy -> cxcywh, drop boxes with w or h <= 0.05).
 
 Our protocol replaces only the temporal window and the evaluation/selection:
   - 16 frames uniform over the 4s ending at tick = action start - horizon (native frame clock),
     the window used by every baseline in our comparison. (The released EK frame loader observes
-    16 x 4 frames ending one frame before an offset inside the action segment.)
+    16 x 4 frames ending one frame before an offset inside the action segment.) The h5 is read on
+    the authors' nominal clock for those same instants.
   - Selection on validation action class-mean Recall@5 (first max); verb/noun direct heads;
-    action score log p(v) + log p(n) over the actions list. Every validation row is scored;
-    rows without observation (mask 0) count as misses.
+    action score log p(v) + log p(n) over the actions list. Every validation row is scored, with
+    the deterministic test-mode view; rows without observation (mask 0) count as misses.
+  - A failing sample raises instead of being silently replaced by the next one.
+  - Training rows with no observation before the cutoff are dropped (shared protocol).
 
-Two implementation deviations from the released loader, both bug fixes:
-  - Hand boxes receive the same geometric augmentation as frames and object boxes (the released
-    loader transforms only object boxes).
-  - Boxes are converted to pixel coordinates before the pixel-space crop/scale/flip and
-    normalized by the crop size afterwards (see --box-coords).
+Frames are read with the released `retry_load_images` (cv2, BGR order, as the released model and
+its MotionFormer initialization were trained); the train loader drops the last partial batch.
 
 Exact resume: per-epoch seeded permutation + batch cursor; each sample's augmentation RNG is
 seeded from (seed, epoch, row), so restarts reproduce the same batches and augmentations.
@@ -50,7 +54,6 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Subset
 
 HERE = Path(__file__).resolve().parent
@@ -58,7 +61,8 @@ INAVIT_ROOT = HERE.parent / "InAViT"
 sys.path.insert(0, str(INAVIT_ROOT))
 
 from slowfast.config.defaults import get_cfg  # noqa: E402
-from slowfast.datasets import transform as sf_transform  # noqa: E402
+from slowfast.datasets import utils as sf_utils  # noqa: E402
+from slowfast.datasets.epickitchens import Epickitchens_dataset  # noqa: E402
 from slowfast.models import losses as sf_losses  # noqa: E402
 from slowfast.models import optimizer as sf_optim  # noqa: E402
 from slowfast.models.video_model_builder import Motionformer  # noqa: E402
@@ -114,15 +118,22 @@ class BoxReader:
         return obj.astype(np.float32), hand.astype(np.float32)
 
 
+class _ReleasedAugmentation(Epickitchens_dataset):
+    """Access to the released `_aug_frame` without building the released annotation loader."""
+
+    def __init__(self, cfg):  # noqa: super().__init__ deliberately not called
+        self.cfg, self.mode = cfg, "train"
+        self.aug, self.rand_erase = True, cfg.AUG.RE_PROB > 0
+
+
 class WindowDataset(Dataset):
     """One row per annotated action; frames from <frames>/<video>/frame_{i+1:010d}.jpg."""
 
-    def __init__(self, df, frames_root, boxes, cfg, train, seed, box_coords, obs_sec, num_frames,
-                 box_clock="nominal"):
+    def __init__(self, df, frames_root, boxes, cfg, train, seed, obs_sec, num_frames, box_clock="nominal"):
         self.df = df.reset_index(drop=True)
         self.frames_root, self.boxes, self.cfg, self.train = Path(frames_root), boxes, cfg, train
-        self.seed, self.box_coords, self.obs_sec, self.num_frames = seed, box_coords, obs_sec, num_frames
-        self.box_clock = box_clock
+        self.seed, self.obs_sec, self.num_frames, self.box_clock = seed, obs_sec, num_frames, box_clock
+        self.released = _ReleasedAugmentation(cfg)
         self.epoch, self._meta = 0, {}
 
     def __len__(self):
@@ -145,59 +156,41 @@ class WindowDataset(Dataset):
         r = self.df.iloc[index]
         item = {"uid": str(r.uid), "verb": int(r.verb), "noun": int(r.noun), "action": int(r.action),
                 "mask": float(r["mask"])}
-        crop = self.cfg.DATA.TRAIN_CROP_SIZE if self.train else self.cfg.DATA.TEST_CROP_SIZE
+        cfg = self.cfg
+        crop = cfg.DATA.TRAIN_CROP_SIZE if self.train else cfg.DATA.TEST_CROP_SIZE
         if item["mask"] <= 0:  # unobservable: scored as a miss, no frames read
             item["frames"] = torch.zeros(3, self.num_frames, crop, crop)
-            item["obj"] = torch.zeros(self.num_frames, self.cfg.HOIVIT.O, 4)
-            item["hand"] = torch.zeros(self.num_frames, self.cfg.HOIVIT.U, 4)
+            item["obj"] = torch.zeros(self.num_frames, cfg.HOIVIT.O, 4)
+            item["hand"] = torch.zeros(self.num_frames, cfg.HOIVIT.U, 4)
             return item
         self._seed(index)
         idx = window_indices(int(r.tick_frame), float(r.vfps), self._n_frames(r.video_id),
                              self.obs_sec, self.num_frames)
-        frames = np.stack([np.asarray(Image.open(self.frames_root / r.video_id / f"frame_{i + 1:010d}.jpg")
-                                      .convert("RGB")) for i in idx])  # T,H,W,C uint8
-        height, width = frames.shape[1:3]
+        # Released `retry_load_images`: cv2.imdecode, i.e. BGR channel order, uint8 T,H,W,C.
+        frames = sf_utils.retry_load_images(
+            [str(self.frames_root / r.video_id / f"frame_{i + 1:010d}.jpg") for i in idx], cfg)
         obj, hand = self.boxes(r.video_id, box_keys(r.video_id, idx, float(r.vfps), self.box_clock))
-        n_obj = obj.shape[0]
-        boxes = np.concatenate([obj, hand], axis=0).astype(np.float64)  # [O+U, T, 4]
-        empty = (boxes == 0).all(-1)
-        if self.box_coords == "normalized":
-            boxes = boxes * np.array([width, height, width, height])
-        item["frames"], boxes = self._transform(torch.from_numpy(frames), boxes, crop)
-        boxes = boxes / crop
-        boxes[empty] = 0
-        boxes = torch.from_numpy(boxes).float()
-        item["obj"] = self._prepare(boxes[:n_obj])
-        item["hand"] = self._prepare(boxes[n_obj:])
+        boxes = {"obj": obj, "hand": hand}  # [O, T, 4] / [U, T, 4], as EKBoxes.get_boxes returns
+        if self.train:  # released Epickitchens_dataset.getitem, train mode
+            lo, hi = cfg.DATA.TRAIN_JITTER_SCALES
+            frames, boxes = self.released._aug_frame(frames, -1, lo, hi, crop, boxes=boxes)
+        else:  # released Epickitchens_dataset.getitem, test mode, centre view
+            frames = sf_utils.tensor_normalize(frames, cfg.DATA.MEAN, cfg.DATA.STD).permute(3, 0, 1, 2)
+            frames, boxes = sf_utils.spatial_sampling(
+                frames, boxes=boxes, spatial_idx=1, min_scale=crop, max_scale=crop, crop_size=crop,
+                random_horizontal_flip=cfg.DATA.RANDOM_FLIP, inverse_uniform_sampling=cfg.DATA.INV_UNIFORM_SAMPLE)
+        item["frames"] = frames
+        item["obj"] = self._prepare(torch.from_numpy(np.asarray(boxes["obj"], dtype=np.float32)))
+        item["hand"] = self._prepare(torch.from_numpy(np.asarray(boxes["hand"], dtype=np.float32)))
         return item
 
-    def _transform(self, frames, boxes, crop):
-        shape = boxes.shape
-        if self.train:
-            aug = sf_transform.create_random_augment(
-                input_size=(frames.size(1), frames.size(2)), auto_augment=self.cfg.AUG.AA_TYPE,
-                interpolation=self.cfg.AUG.INTERPOLATION, with_boxes=True)
-            images = [Image.fromarray(f.numpy()) for f in frames]
-            images, boxes = aug(images, boxes=boxes)  # same op for every frame and box
-            frames = torch.stack([torch.from_numpy(np.array(im)) for im in images])
-        x = frames.float() / 255.0
-        x = (x - torch.tensor(self.cfg.DATA.MEAN)) / torch.tensor(self.cfg.DATA.STD)
-        x = x.permute(0, 3, 1, 2)  # T,C,H,W for the slowfast transforms
-        flat = boxes.reshape(-1, 4)
-        if self.train:
-            lo, hi = self.cfg.DATA.TRAIN_JITTER_SCALES
-            x, flat = sf_transform.random_short_side_scale_jitter(x, lo, hi, boxes=flat)
-            x, flat = sf_transform.random_crop(x, crop, boxes=flat)
-            x, flat = sf_transform.horizontal_flip(0.5, x, boxes=flat)
-        else:
-            x, flat = sf_transform.random_short_side_scale_jitter(x, crop, crop, boxes=flat)
-            x, flat = sf_transform.uniform_crop(x, crop, 1, boxes=flat)
-        return x.permute(1, 0, 2, 3).contiguous(), np.asarray(flat).reshape(shape)
-
     @staticmethod
-    def _prepare(boxes):  # released EKBoxes.prepare_boxes on [O, T, 4] xyxy in [0, 1]
-        boxes = boxes.clamp(0, 1).permute(1, 0, 2)  # T, O, 4
-        return zero_empty_boxes(box_xyxy_to_cxcywh(boxes), mode="cxcywh", eps=0.05)
+    def _prepare(boxes):  # released EKBoxes.prepare_boxes on [O, T, 4] xyxy
+        boxes = boxes.clone()
+        boxes[boxes < 0] = 0
+        boxes[boxes > 1] = 1
+        boxes = box_xyxy_to_cxcywh(boxes.permute(1, 0, 2))  # T, O, 4
+        return zero_empty_boxes(boxes, mode="cxcywh", eps=0.05)
 
 
 def collate(items):
@@ -297,6 +290,13 @@ def evaluate(model, ds, actions, workers, batch_size, device, out_path):
                        "top1_micro": float(((top5[key][:, 0] == targets[key]) & observable).mean() * 100),
                        "supported_classes": int(len(present)),
                        "unique_top1": int(len(np.unique(top5[key][observable, 0]))) if observable.any() else 0}
+    # Released `slowfast.utils.metrics.MT5R` action rule, reported alongside (not used for selection).
+    a_v, a_n = actions.verb.to_numpy()[targets["action"]], actions.noun.to_numpy()[targets["action"]]
+    hit = (top5["verb"] == a_v[:, None]).any(1) & (top5["noun"] == a_n[:, None]).any(1) & observable
+    present, inverse = np.unique(targets["action"], return_inverse=True)
+    result["action_released_mt5r_rule"] = {
+        "cmr5": float((np.bincount(inverse, weights=hit) / np.bincount(inverse)).mean() * 100),
+        "note": "verb in verb top-5 AND noun in noun top-5 (released local MT5R); primary action uses top-5 actions"}
     np.savez_compressed(out_path, uid=ds.df.uid.to_numpy(dtype=str), observable=observable,
                         **{f"{k}_top5": top5[k] for k in HEADS}, **{f"{k}_target": targets[k] for k in HEADS})
     return result
@@ -338,8 +338,6 @@ def main():
     ap.add_argument("--actions-csv", type=Path, required=True, help="id,verb,noun[,...] action list")
     ap.add_argument("--frames", type=Path, required=True)
     ap.add_argument("--boxes-h5", type=Path, required=True)
-    ap.add_argument("--box-coords", choices=("normalized", "pixel"), required=True,
-                    help="coordinate system of the h5 boxes relative to the stored frames")
     ap.add_argument("--box-clock", choices=("nominal", "native"), default="nominal",
                     help="h5 frame keys: nominal 60/50 fps clock of the author detections (EK100), or native index")
     ap.add_argument("--checkpoint", type=Path, required=True, help="ek_motionformer_224_16x4.pyth")
@@ -381,20 +379,20 @@ def main():
     actions = pd.read_csv(args.actions_csv)
     assert (actions.id.to_numpy() == np.arange(len(actions))).all()
     boxes = BoxReader(args.boxes_h5, cfg.HOIVIT.O, cfg.HOIVIT.U)
-    common = dict(frames_root=args.frames, boxes=boxes, cfg=cfg, seed=args.seed, box_coords=args.box_coords,
+    common = dict(frames_root=args.frames, boxes=boxes, cfg=cfg, seed=args.seed,
                   obs_sec=args.obs_sec, num_frames=args.num_frames, box_clock=args.box_clock)
     train_ds, val_ds = WindowDataset(train_df, train=True, **common), WindowDataset(val_df, train=False, **common)
 
     contract = {
-        "recipe": "inavit-official-ek-config/pretrained-motionformer/real-boxes/window-obs{}s".format(args.obs_sec),
+        "recipe": "inavit-official-ek-config/pretrained-motionformer/real-boxes/released-loader/window-obs{}s".format(args.obs_sec),
         "cfg": str(args.cfg), "cfg_sha256": sha256(args.cfg), "checkpoint_sha256": sha256(args.checkpoint),
         "script_sha256": sha256(__file__), "train_csv_sha256": sha256(args.train_csv),
         "val_csv_sha256": sha256(args.val_csv), "actions_sha256": sha256(args.actions_csv),
-        "boxes_h5": str(args.boxes_h5), "box_coords": args.box_coords, "box_clock": args.box_clock, "frames": str(args.frames.resolve()),
+        "boxes_h5": str(args.boxes_h5), "box_clock": args.box_clock, "frames": str(args.frames.resolve()),
         "train_rows": len(train_df), "val_rows": len(val_df), "batch": args.batch_size, "accum": args.accum,
         "max_epoch": cfg.SOLVER.MAX_EPOCH, "lr_steps": list(cfg.SOLVER.STEPS), "lrs": list(cfg.SOLVER.LRS),
         "base_lr": cfg.SOLVER.BASE_LR, "hoivit_lr": cfg.SOLVER.HOIVIT_BASE_LR, "seed": args.seed,
-        "obs_sec": args.obs_sec, "num_frames": args.num_frames, "selection": "val_action_cmr5_first_max",
+        "obs_sec": args.obs_sec, "num_frames": args.num_frames, "selection": "val_action_cmr5_first_max", "channel_order": "bgr_released", "drop_last": True,
         "smoke": bool(args.train_limit or args.val_limit or args.smoke_epoch_steps),
     }
     model, init_report = build_model(cfg, args.checkpoint, device)
@@ -434,7 +432,7 @@ def main():
                       "init": {k: v for k, v in init_report.items() if k != "fresh"},
                       "train_rows": len(train_df), "val_rows": len(val_df)}), flush=True)
 
-    steps_per_epoch = math.ceil(len(train_ds) / args.batch_size)
+    steps_per_epoch = len(train_ds) // args.batch_size  # released train loader: drop_last=True
     if args.smoke_epoch_steps:
         steps_per_epoch = min(steps_per_epoch, args.smoke_epoch_steps)
     started, segment_steps = time.monotonic(), 0
