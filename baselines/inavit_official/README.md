@@ -104,6 +104,12 @@ python baselines/inavit_official/train_inavit_official.py \
 - **Smoke B** (same with `--accum 2`; stopped at step 8, then `--resume`):
   resumed at cursor 8 and passed the uid-order check through step 30. Peak
   memory 38 GB.
+- **Throughput smoke C** (1,000 steps x batch 20, 14 workers): steady 0.58 s
+  per step (about 35 clips/s). Mean GPU utilisation 83% over the whole job.
+  Train loss 7.97 -> 6.82. GradScaler skipped 2 of 1,000 steps for overflow.
+  - Projection for a full EK100 epoch: 3,350 steps, about 32 min of training
+    plus validation, roughly 36 min.
+  - So 100 epochs come to about 60 H100-hours.
 - **Zero-shot reference** (MotionFormer checkpoint alone, no training or
   boxes, same window): action CMR@5 4.96, verb 16.5, noun 23.1 on the full
   validation set.
