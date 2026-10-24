@@ -146,5 +146,7 @@ python baselines/inavit_official/train_inavit_official.py \
     plus validation, roughly 36 min.
   - So 100 epochs come to about 60 H100-hours.
 - **Zero-shot reference** (MotionFormer checkpoint alone, no training or
-  boxes, same window): action CMR@5 4.96, verb 16.5, noun 23.1 on the full
-  validation set.
+  boxes, same window, full validation set):
+  - In the released BGR order: action CMR@5 **6.96**, verb 19.2, noun 27.4.
+  - Fed RGB, the same checkpoint scores 4.96 / 16.5 / 23.1, which confirms
+    the checkpoint expects BGR.
