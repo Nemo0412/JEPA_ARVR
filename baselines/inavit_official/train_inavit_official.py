@@ -351,6 +351,7 @@ def main():
     ap.add_argument("--lr-steps", type=int, nargs="+", default=None, help="override SOLVER.STEPS")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--eval-batch-size", type=int, default=32)
+    ap.add_argument("--eval-workers", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-steps", type=int, default=0, help="optimizer steps per allocation (0 = all)")
     ap.add_argument("--max-minutes", type=float, default=0, help="stop and checkpoint after this wall time")
@@ -407,7 +408,7 @@ def main():
         state = torch.load(best_path, map_location="cpu", weights_only=False)
         assert state["contract"] == contract, "contract changed since the checkpoint"
         model.load_state_dict(state["model"], strict=True)
-        metrics = evaluate(model, val_ds, actions, args.workers, args.eval_batch_size, device,
+        metrics = evaluate(model, val_ds, actions, args.eval_workers, args.eval_batch_size, device,
                            args.out / "replay_predictions.npz")
         metrics["epoch"] = state["epoch"]
         (args.out / "replay_metrics.json").write_text(json.dumps(metrics, indent=2))
@@ -501,7 +502,8 @@ def main():
                 if out_of_budget:
                     finish(False)
                     return
-        metrics = evaluate(model, val_ds, actions, args.workers, args.eval_batch_size, device,
+        del micro_batches, loader  # shut down training workers before validation spawns its own (host memory)
+        metrics = evaluate(model, val_ds, actions, args.eval_workers, args.eval_batch_size, device,
                            args.out / f"val_epoch{epoch + 1:03d}.npz")
         history.append({"epoch": epoch + 1, "train_loss": run_loss / max(1, run_n),
                         "skipped_steps": nonfinite_steps, "val": metrics})
