@@ -8,6 +8,71 @@ its predictions did not depend on the input and it scored the class prior
 Agreed setup (2026-10-22): the InAViT authors' configuration and pretrained
 weights, real hand/object boxes, and our horizon and input length.
 
+## Result (EK100 validation, reported)
+
+**Protocol.** Our baseline standard:
+- Window: 16 frames uniform over the 4s ending at action start - 2s.
+- Scoring: all 9,668 RU-LSTM validation rows; the 76 rows with no observation count as misses.
+- Metric: class-mean Recall@5 over classes present in validation. Action = log p(v) + log p(n) top-5 over 3,806 actions.
+- Selection: validation action CMR@5, first maximum.
+
+| Model | Selected epoch | Action CMR@5 | Verb CMR@5 | Noun CMR@5 | Action micro top-5 |
+|---|---:|---:|---:|---:|---:|
+| InAViT (official recipe, real boxes, 4s / +2s) | 27 | **9.51** | 22.75 | 29.21 | 22.33 |
+
+For reference only (not the reported metric), the same checkpoint under the released local MT5R rule (verb top-5 AND noun top-5) scores 18.95.
+
+**Schedule.**
+- The run followed the released schedule (100 epochs, LR x0.1 at 29) and was stopped by decision at epoch 39 because it had plateaued:
+  - epochs 13-28: action 8.5-9.5;
+  - after the LR drop at 29: epochs 30-38 at about 9.0 (8.86-9.16).
+- The next drop at epoch 60 was not reached; this is the one deviation from the released 100-epoch schedule.
+- Per-epoch history: `history.json` of the run.
+
+**LR exploration** (not adopted).
+- Scaling both learning rates x3 or x10 from the epoch-8 checkpoint did not speed up action CMR@5 on matched epochs:
+  - x3: 7.76 / 8.27 / 7.49 vs official 8.01 / 8.46 / 7.83;
+  - x10: about 6.3.
+- The released learning rates were kept.
+
+## Why this is far below the paper's 25.89 (EK100 val, "τa = 1s")
+
+In the released `ek_MF/frame_loader.py`, `temporal_sampling` clamps the sampled offsets to `[0, num_frames - 1]` relative to the action's start frame (`num_frames` = action length).
+- The anticipation shift moves the window before the start, but every pre-action offset is clamped back to the action's first frame. So the released loader never samples a frame before the action begins:
+  - view 0 is about 16 copies of the action's first frame or two;
+  - the other views are frames inside the action.
+- Training uses the same function.
+- The released `test_net` averages 10 temporal x 3 spatial views and scores action with the local MT5R rule above.
+
+**Check** (`released_window/`). Setup:
+- Frames re-extracted for these windows from the MD5-verified MP4s, using the official `EPIC_100_validation.csv` timestamps and the released record's nominal clock.
+- Same 8,423-row subset in every cell (3 damaged MP4s, P22_01, P29_05 and P30_08, excluded); one view each; released loading (BGR, test-mode crop).
+- `mf` = the pretrained EK100 MotionFormer zero-shot (a recognition model). `inavit` = the trained model above.
+
+| Window | Model | Action CMR@5 | Verb | Noun | Action, released MT5R rule |
+|---|---|---:|---:|---:|---:|
+| W: ours, 4s ending 2s before start | mf | 7.23 | 19.12 | 27.34 | 15.35 |
+| W | inavit | 9.75 | 22.55 | 29.10 | 19.24 |
+| A1: honest 1s, 128 nominal frames ending 1s before start | mf | 8.43 | 21.43 | 29.29 | 17.67 |
+| A1 | inavit | 9.71 | 22.71 | 30.73 | 20.34 |
+| R0: released window, view 0 | mf | 6.96 | 25.90 | 27.26 | 14.25 |
+| R0 | inavit | 4.69 | 17.36 | 21.39 | 12.69 |
+| R5: released window, view 5 (inside the action) | mf | **15.91** | 37.41 | 37.76 | **27.12** |
+| R5 | inavit | 8.95 | 25.97 | 29.43 | 19.59 |
+
+What this shows:
+- A recognition model with no anticipation training, fed the released in-action frames and scored with the released rule, reaches 27.1, about the paper's number.
+- With honest 1s anticipation, the same model drops to 17.7 on that rule (8.4 action CMR@5).
+- The trained model scores the same at honest 1s and at our 2s (9.71 vs 9.75), so the horizon is not why it trails the paper.
+
+Caveats:
+- Single views were used, not the 10x3 ensemble.
+- The authors' own annotation pickle cannot be checked. The README points to the standard EK100 annotations, which are not shifted.
+
+## Runtime note
+
+Run with `MALLOC_MMAP_THRESHOLD_=1048576`. glibc's dynamic mmap threshold fragments the DataLoader workers' heaps on the evaluation path (full-size float clip buffers): worker memory grows about 0.8 GB per validation batch and killed two runs at the first epoch end, even with 128 GB of host memory. With the fixed threshold, worker memory stays flat. This is an environment variable only; nothing is computed differently.
+
 ## Principle
 
 This is a faithful reproduction of the released InAViT code. Only the input
@@ -104,6 +169,7 @@ augmentations. A segment checks that the uids it sees are the expected ones.
 
 - `train_inavit_official.py`: trainer and evaluator (`--eval-only` replays `best.pt`).
 - `audit_boxes.py`: h5 schema, coordinate range, frame-key clock, and per-row coverage of the requested frames.
+- `released_window/`: the check above. `extract_released_windows.py` writes the window plans and frames from the original MP4s; `eval_released_windows.py` evaluates a window/model pair; `summarize_released_windows.py` builds the table. Paths are those of our cluster; adjust the constants at the top of each file.
 - `test_inavit_official.py`: CPU tests for the window formula, the box clock, BGR decoding as released,
   the released eval box path, deterministic augmentation, and unobservable rows.
 
