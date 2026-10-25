@@ -20,7 +20,7 @@ import torch
 from torch.utils.data import Dataset
 
 ROOT = Path("/scratch/yh6416/VJEPA2-EXP")
-sys.path.insert(0, str(ROOT / ".worktrees/jepa-arvr-inavit-official/baselines/inavit_official"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # baselines/inavit_official
 import train_inavit_official as T  # noqa: E402
 
 RW = ROOT / "outputs/inavit_official_ek100/released_window"
