@@ -37,6 +37,8 @@ For reference only (not the reported metric), the same checkpoint under the rele
 
 ## Why this is far below the paper's 25.89 (EK100 val, "τa = 1s")
 
+Full standalone report, including which metric we report and why: [`released_window/VERIFICATION.md`](released_window/VERIFICATION.md).
+
 In the released `ek_MF/frame_loader.py`, `temporal_sampling` clamps the sampled offsets to `[0, num_frames - 1]` relative to the action's start frame (`num_frames` = action length).
 - The anticipation shift moves the window before the start, but every pre-action offset is clamped back to the action's first frame. So the released loader never samples a frame before the action begins:
   - view 0 is about 16 copies of the action's first frame or two;
